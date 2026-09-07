@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Lector
+GenericName=Document Viewer
+Comment=PDF viewer for Omarchy
+Exec=lector %F
+Icon=org.omarchy.Lector
+Terminal=false
+Type=Application
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupWMClass=org.omarchy.Lector

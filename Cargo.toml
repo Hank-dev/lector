@@ -1,0 +1,23 @@
+[package]
+name = "lector"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Native PDF viewer for Omarchy — Evince-class features, live theme follow"
+repository = "https://github.com/omarchy/lector"
+authors = ["hanky"]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+poppler = { package = "poppler-rs", version = "0.26" }
+cairo-rs = { version = "0.22", features = ["png"] }
+glib = "0.22"
+gio = "0.22"
+gdk = { package = "gdk4", version = "0.11" }
+pango = "0.22"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
