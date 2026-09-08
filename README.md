@@ -28,6 +28,7 @@ reloads when you switch themes.
 - Fit width / page / height, explicit zoom, Ctrl+scroll
 - Thumbnails and outline in the side pane (F9)
 - Find (Ctrl+F), text selection and copy
+- Clickable internal and external links
 - Inverted colors, rotate, fullscreen, presentation (F5)
 - Print and save a copy
 - Encrypted PDFs

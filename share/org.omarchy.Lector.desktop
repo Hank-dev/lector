@@ -2,7 +2,9 @@
 Name=Lector
 GenericName=Document Viewer
 Comment=PDF viewer for Omarchy
-Exec=lector %F
+# GTK 4.22.4 has a Wayland DMA-BUF feedback lifetime bug that can crash on resume.
+# Remove GDK_DISABLE=dmabuf after GTK includes upstream fix a8a5692.
+Exec=env GDK_DISABLE=dmabuf lector %F
 Icon=org.omarchy.Lector
 Terminal=false
 Type=Application

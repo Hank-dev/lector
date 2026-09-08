@@ -11,12 +11,12 @@ use gtk::{
     StackSwitcher, ToggleButton,
 };
 
-use crate::doc::{OpenDoc, OpenError};
+use crate::doc::{DocumentLink, OpenDoc, OpenError};
 use crate::session::{self, Session};
 use crate::theme::{self, Theme};
 use crate::view::{
-    draw_one_page, selected_text, thumbnail, Layout, LayoutMode, PageDrawing, Selection, Zoom,
-    MAX_ZOOM,
+    display_point_to_document, draw_one_page, selected_text, thumbnail, Layout, LayoutMode,
+    PageDrawing, Selection, Zoom, MAX_ZOOM,
 };
 
 const ZOOM_LABELS: [&str; 16] = [
@@ -662,12 +662,20 @@ impl Lector {
 
         let click = GestureClick::new();
         click.set_button(1);
-        click.connect_pressed({
+        let first_was_link = std::rc::Rc::new(std::cell::Cell::new(false));
+        click.connect_released({
             let h = h.clone();
-            move |_, n, _, _| {
-                if n == 2 {
-                    if let Some(ui) = h.get() {
-                        ui.toggle_fit();
+            let first_was_link = first_was_link.clone();
+            move |_, n, x, y| {
+                if let Some(ui) = h.get() {
+                    if n == 1 {
+                        first_was_link.set(ui.activate_link_at(x, y));
+                    } else {
+                        let has_link = ui.link_at_view(x, y).is_some();
+                        if should_toggle_fit(n, has_link, first_was_link.get()) {
+                            ui.toggle_fit();
+                        }
+                        first_was_link.set(false);
                     }
                 }
             }
@@ -1851,6 +1859,44 @@ impl Lector {
         self.search_entry.grab_focus();
     }
 
+    fn link_at_view(&self, x: f64, y: f64) -> Option<DocumentLink> {
+        let (page, display_x, display_y) = self.hit_at(x, y)?;
+        let st = self.inner.borrow();
+        let doc = st.doc.as_ref()?;
+        let (doc_x, doc_y) =
+            display_point_to_document(doc, page, st.rotation, display_x, display_y);
+        doc.link_at(page, doc_x, doc_y)
+    }
+
+    fn activate_link_at(&self, x: f64, y: f64) -> bool {
+        if let Some(link) = self.link_at_view(x, y) {
+            self.follow_link(link);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn follow_link(&self, link: DocumentLink) {
+        match link {
+            DocumentLink::GotoPage(page) => self.goto_page(page),
+            DocumentLink::Uri(uri) => {
+                if !external_uri_allowed(&uri) {
+                    self.alert(
+                        "Link blocked",
+                        "Only web (HTTP/HTTPS) and email links can be opened.",
+                    );
+                    return;
+                }
+                if let Err(error) =
+                    gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>)
+                {
+                    self.alert("Could not open link", &error.to_string());
+                }
+            }
+        }
+    }
+
     fn drag_begin(&self, x: f64, y: f64) {
         if let Some((page, px, py)) = self.hit_at(x, y) {
             self.inner.borrow_mut().selection = Some(Selection {
@@ -2270,6 +2316,29 @@ Ctrl+I  Invert        Ctrl+R  Rotate          n / p  Next / previous page";
     }
 }
 
+fn should_toggle_fit(click_count: i32, has_link: bool, first_was_link: bool) -> bool {
+    click_count == 2 && !has_link && !first_was_link
+}
+
+fn external_uri_allowed(uri: &str) -> bool {
+    if uri.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    let Some((scheme, _)) = uri.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return false;
+    }
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "mailto"
+    )
+}
+
 fn icon_pill(icon: &str, tip: &str) -> Button {
     let b = Button::from_icon_name(icon);
     b.set_tooltip_text(Some(tip));
@@ -2439,6 +2508,34 @@ mod ui_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_click_fit_is_suppressed_over_document_links() {
+        assert!(should_toggle_fit(2, false, false));
+        assert!(!should_toggle_fit(2, true, false));
+        assert!(!should_toggle_fit(2, false, true));
+        assert!(!should_toggle_fit(1, false, false));
+    }
+
+    #[test]
+    fn external_link_policy_allows_web_and_mail_but_rejects_local_handlers() {
+        for uri in [
+            "https://omarchy.org/docs",
+            "HTTP://example.com",
+            "mailto:hello@example.com",
+        ] {
+            assert!(external_uri_allowed(uri), "{uri}");
+        }
+        for uri in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ssh://host",
+            "custom-handler:payload",
+            "not a uri",
+        ] {
+            assert!(!external_uri_allowed(uri), "{uri}");
+        }
+    }
 
     #[test]
     fn image_surface_can_be_copied_into_a_texture() {

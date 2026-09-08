@@ -2,7 +2,8 @@ use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
 use poppler::ffi::{
-    PopplerActionAny, PopplerActionGotoDest, PopplerDest, POPPLER_ACTION_GOTO_DEST,
+    PopplerActionAny, PopplerActionGotoDest, PopplerActionUri, PopplerDest,
+    POPPLER_ACTION_GOTO_DEST, POPPLER_ACTION_URI,
 };
 use poppler::{Document, IndexIter, Page};
 
@@ -19,6 +20,12 @@ pub struct OutlineItem {
 pub struct PageSize {
     pub w: f64,
     pub h: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentLink {
+    GotoPage(i32),
+    Uri(String),
 }
 
 pub struct OpenDoc {
@@ -137,6 +144,43 @@ impl OpenDoc {
             .into_iter()
             .map(|rect| (index, rect))
             .collect()
+    }
+
+    pub fn link_at(&self, index: i32, x: f64, y: f64) -> Option<DocumentLink> {
+        use glib::translate::ToGlibPtr;
+
+        let page = self.page(index)?;
+        let (_, height) = self.size(index, 0);
+        let pdf_y = height - y;
+        for mapping in page.link_mapping() {
+            unsafe {
+                let raw_ptr: *mut poppler::ffi::PopplerLinkMapping = mapping.to_glib_none().0;
+                let raw = &*raw_ptr;
+                let x1 = raw.area.x1.min(raw.area.x2);
+                let x2 = raw.area.x1.max(raw.area.x2);
+                let y1 = raw.area.y1.min(raw.area.y2);
+                let y2 = raw.area.y1.max(raw.area.y2);
+                if x < x1 || x > x2 || pdf_y < y1 || pdf_y > y2 || raw.action.is_null() {
+                    continue;
+                }
+                match (*raw.action).type_ {
+                    POPPLER_ACTION_GOTO_DEST => {
+                        let action = &*(raw.action as *const PopplerActionGotoDest);
+                        return dest_page(&self.document, action.dest).map(DocumentLink::GotoPage);
+                    }
+                    POPPLER_ACTION_URI => {
+                        let action = &*(raw.action as *const PopplerActionUri);
+                        if !action.uri.is_null() {
+                            return Some(DocumentLink::Uri(
+                                CStr::from_ptr(action.uri).to_string_lossy().into_owned(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
     }
 }
 
@@ -278,4 +322,62 @@ pub(crate) fn write_test_pdf(name: &str, page_contents: &[&str]) -> PathBuf {
     .expect("write PDF trailer");
     std::fs::write(&path, pdf).expect("write test PDF");
     path
+}
+
+#[cfg(test)]
+pub(crate) fn write_link_test_pdf() -> PathBuf {
+    use std::io::Write as _;
+
+    let path = std::env::temp_dir().join(format!(
+        "lector-links-{}-{}.pdf",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R 6 0 R] >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        "<< /Type /Annot /Subtype /Link /Rect [72 680 180 720] /Border [0 0 0] /A << /S /URI /URI (https://omarchy.org) >> >>",
+        "<< /Type /Annot /Subtype /Link /Rect [200 680 300 720] /Border [0 0 0] /Dest [4 0 R /Fit] >>",
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0];
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        write!(&mut pdf, "{} 0 obj\n{object}\nendobj\n", i + 1).unwrap();
+    }
+    let xref = pdf.len();
+    write!(&mut pdf, "xref\n0 {}\n0000000000 65535 f \n", offsets.len()).unwrap();
+    for offset in offsets.iter().skip(1) {
+        writeln!(&mut pdf, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        &mut pdf,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        offsets.len()
+    )
+    .unwrap();
+    std::fs::write(&path, pdf).unwrap();
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_links_resolve_external_uris_and_internal_destinations() {
+        let path = write_link_test_pdf();
+        let doc = OpenDoc::open(&path, None).unwrap();
+
+        assert_eq!(
+            doc.link_at(0, 100.0, 90.0),
+            Some(DocumentLink::Uri("https://omarchy.org".into()))
+        );
+        assert_eq!(doc.link_at(0, 240.0, 90.0), Some(DocumentLink::GotoPage(1)));
+        assert_eq!(doc.link_at(0, 400.0, 400.0), None);
+
+        std::fs::remove_file(path).unwrap();
+    }
 }

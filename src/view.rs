@@ -305,6 +305,22 @@ fn apply_page_transform(cr: &Context, geom: &PageGeom, rotation: i32, doc: &Open
     let _ = (pw, ph);
 }
 
+pub fn display_point_to_document(
+    doc: &OpenDoc,
+    page: i32,
+    rotation: i32,
+    x: f64,
+    y: f64,
+) -> (f64, f64) {
+    let (width, height) = doc.size(page, 0);
+    match rotation.rem_euclid(360) {
+        90 => (y, height - x),
+        180 => (width - x, height - y),
+        270 => (width - y, x),
+        _ => (x, y),
+    }
+}
+
 pub fn selection_rect(doc: &OpenDoc, page: i32, rotation: i32, sel: Selection) -> Rectangle {
     let (pw, ph) = doc.size(page, rotation);
     // Selection coordinates are in the displayed page's top-origin space.
@@ -398,6 +414,28 @@ pub fn thumbnail(doc: &OpenDoc, index: i32, max_w: f64, invert: bool) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displayed_link_points_follow_page_rotation() {
+        let path = crate::doc::write_link_test_pdf();
+        let doc = OpenDoc::open(&path, None).unwrap();
+        for (rotation, point) in [
+            (0, (100.0, 90.0)),
+            (90, (702.0, 100.0)),
+            (180, (512.0, 702.0)),
+            (270, (90.0, 512.0)),
+        ] {
+            let actual = display_point_to_document(&doc, 0, rotation, point.0, point.1);
+            assert!((actual.0 - 100.0).abs() < 0.01, "rotation {rotation}");
+            assert!((actual.1 - 90.0).abs() < 0.01, "rotation {rotation}");
+            assert_eq!(
+                doc.link_at(0, actual.0, actual.1),
+                Some(crate::doc::DocumentLink::Uri("https://omarchy.org".into())),
+                "rotation {rotation}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn selection_uses_top_origin_after_each_rotation() {

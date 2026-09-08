@@ -59,6 +59,9 @@ fn actual_window_navigation_presentation_search_and_reload() {
     );
     ui.open_path(&long, None);
     assert_eq!(ui.inner.borrow().doc.as_ref().unwrap().n_pages, 8);
+    ui.follow_link(DocumentLink::GotoPage(3));
+    assert_eq!(ui.inner.borrow().page, 3);
+    ui.goto_page(0);
     assert!(ui.cont_item.is_active());
     assert!(!ui.dual_item.is_active());
     assert!(!ui.single_item.is_active());
