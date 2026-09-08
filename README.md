@@ -11,15 +11,15 @@ reloads when you switch themes.
 ## Layout
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ [side pane]  [page] / N          title     [zoom] [find] [☰] │
-├────────────┬─────────────────────────────────────────────────┤
-│            │  Find: [        ]   2 of 14   [↑] [↓] [x]       │
-│ thumbnails ├─────────────────────────────────────────────────┤
-│            │                                                 │
-│ [Thumbs]   │              PDF pages                          │
-│ [Outline]  │                                                 │
-└────────────┴─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│ [side] [open] [‹] page / N [›]  title  [−] [zoom▾] [+] [find] [☰]       │
+├────────────┬─────────────────────────────────────────────────────────────┤
+│            │  Find: [        ]   2 of 14   [↑] [↓] [x]                  │
+│ thumbnails ├─────────────────────────────────────────────────────────────┤
+│            │                                                             │
+│ [Thumbs]   │              PDF pages                                      │
+│ [Outline]  │                                                             │
+└────────────┴─────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
@@ -85,4 +85,6 @@ stale snapshots, reading-order retention, preference merging, and private file m
 | F5 / F11 | Presentation / Fullscreen |
 | Ctrl+P | Print |
 
-Menu: Open, Save a Copy, Print, Side Pane, Continuous, Dual, Inverted Colors, Rotate, Fullscreen, Presentation, Properties.
+Menu: Open, Save a Copy, Print, Side Pane, Continuous, Dual, Single page,
+Inverted Colors, Rotate, Fullscreen, Presentation, Reload, Properties,
+Keyboard shortcuts, and About Lector.

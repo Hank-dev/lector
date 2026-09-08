@@ -36,6 +36,20 @@ fn actual_window_navigation_presentation_search_and_reload() {
         !widget_tree_has_label(ui.toolbar.upcast_ref(), "lector"),
         "the document toolbar must not display the application name"
     );
+    for control in [
+        ui.prev_btn.upcast_ref::<gtk::Widget>(),
+        ui.next_btn.upcast_ref(),
+        ui.page_entry.upcast_ref(),
+        ui.zoom_out_btn.upcast_ref(),
+        ui.zoom_in_btn.upcast_ref(),
+        ui.zoom_drop.upcast_ref(),
+        ui.find_btn.upcast_ref(),
+    ] {
+        assert!(
+            !control.is_sensitive(),
+            "document controls must start disabled"
+        );
+    }
     ui.inner.borrow_mut().session = Session::default();
     let long =
         crate::doc::write_test_pdf("window-long", &["BT /F1 20 Tf 72 700 Td (needle) Tj ET"; 8]);
@@ -45,7 +59,21 @@ fn actual_window_navigation_presentation_search_and_reload() {
     );
     ui.open_path(&long, None);
     assert_eq!(ui.inner.borrow().doc.as_ref().unwrap().n_pages, 8);
+    assert!(ui.cont_item.is_active());
+    assert!(!ui.dual_item.is_active());
+    assert!(!ui.single_item.is_active());
+    assert_eq!(
+        ui.invert_item.is_active(),
+        ui.inner.borrow().invert,
+        "inversion menu state must reflect the active preference"
+    );
+    ui.dual_item.set_active(true);
+    assert_eq!(ui.inner.borrow().layout_mode, LayoutMode::Dual);
+    ui.invert_item.set_active(!ui.invert_item.is_active());
+    assert_eq!(ui.inner.borrow().invert, ui.invert_item.is_active());
     ui.set_layout(LayoutMode::Single);
+    assert!(ui.single_item.is_active());
+    assert!(!ui.cont_item.is_active());
     ui.goto_page(1);
     assert_eq!(ui.page_widgets.borrow()[0].0, 1);
     ui.set_layout(LayoutMode::Dual);

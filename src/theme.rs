@@ -119,56 +119,127 @@ window.lector-window {{
 .lector-toolbar {{
   background-color: {bg};
   color: {fg};
-  border-bottom: 1px solid alpha({accent}, 0.28);
-  padding: 6px 10px;
-  min-height: 40px;
+  border-bottom: 1px solid alpha({fg}, 0.10);
+  padding: 3px 6px;
 }}
 .lector-doc-title {{
   color: {fg};
-  opacity: 0.72;
+  opacity: 0.6;
   padding: 0 8px;
 }}
-.lector-cluster {{
-  background: alpha({fg}, 0.04);
-  border: 1px solid alpha({fg}, 0.18);
-  border-radius: {rplus}px;
-  padding: 2px;
+.dim-label {{
+  opacity: 0.6;
 }}
-.lector-pill, .lector-pill.flat, button.lector-pill {{
+/* Flat bar controls: idle transparent, 0.08 hover fill, 0.18 selected
+   fill — the same state tokens the Omarchy shell uses. */
+button.lector-pill,
+menubutton.lector-pill > button {{
   background: transparent;
   color: {fg};
-  border: none;
+  border: 1px solid transparent;
   border-radius: {r}px;
   min-height: 26px;
-  min-width: 28px;
-  padding: 2px 8px;
+  min-width: 26px;
+  padding: 1px 6px;
   box-shadow: none;
 }}
-.lector-pill:hover {{
-  background: alpha({fg}, 0.10);
+button.lector-pill:hover,
+button.lector-pill:focus-visible,
+menubutton.lector-pill > button:hover,
+menubutton.lector-pill > button:focus-visible {{
+  background: alpha({fg}, 0.08);
 }}
-.lector-pill:active, togglebutton.lector-pill:checked {{
+button.lector-pill:active,
+menubutton.lector-pill > button:active {{
   background: alpha({accent}, 0.22);
-  color: {accent};
+}}
+togglebutton.lector-pill:checked,
+menubutton.lector-pill > button:checked {{
+  background: alpha({accent}, 0.18);
+  color: {bright};
+}}
+button.lector-pill:disabled,
+menubutton.lector-pill > button:disabled {{
+  background: transparent;
+  opacity: 0.35;
 }}
 .lector-page-entry {{
   background: transparent;
-  border: none;
+  border: 1px solid transparent;
+  border-radius: {r}px;
   box-shadow: none;
-  min-width: 2.5em;
+  min-height: 26px;
+  min-width: 3em;
   padding: 0 4px;
 }}
-.lector-zoom {{
-  min-width: 110px;
-  padding: 0 4px;
+.lector-page-entry:focus {{
+  background: alpha({fg}, 0.04);
+  border-color: alpha({accent}, 0.55);
+}}
+.lector-page-entry:disabled {{
+  opacity: 0.35;
+}}
+.lector-toolbar button:focus-visible,
+.lector-toolbar togglebutton:focus-visible {{
+  border-color: alpha({accent}, 0.74);
+}}
+dropdown.lector-zoom {{
+  min-width: 96px;
+}}
+dropdown.lector-zoom button {{
+  background: transparent;
+  color: {fg};
+  border: 1px solid transparent;
+  border-radius: {r}px;
+  min-height: 26px;
+  padding: 1px 6px;
+  box-shadow: none;
+}}
+dropdown.lector-zoom button:hover,
+dropdown.lector-zoom button:focus-visible {{
+  background: alpha({fg}, 0.08);
+}}
+dropdown.lector-zoom:disabled button {{
+  background: transparent;
+  opacity: 0.35;
+}}
+dropdown popover contents {{
+  background-color: alpha({menu_bg}, {menu_a});
+  background-image: none;
+  color: {menu_fg};
+  padding: 4px;
+  border: 2px solid alpha({accent}, 0.76);
+  /* Hyprland rounds the popup surface; a GTK radius punches black corners. */
+  border-radius: 0;
+}}
+dropdown popover listview {{
+  background: transparent;
+}}
+dropdown popover row {{
+  color: {menu_fg};
+  border-radius: {r}px;
+  padding: 3px 6px;
+}}
+dropdown popover row label {{
+  color: {menu_fg};
+}}
+dropdown popover row:hover {{
+  background: alpha({menu_sel}, 0.10);
+}}
+dropdown popover row:selected {{
+  background: alpha({menu_sel}, {menu_sel_a});
+  color: {menu_hi};
+}}
+dropdown popover row:selected label {{
+  color: {menu_hi};
 }}
 .lector-search, .lector-sidebar, .lector-find {{
   background-color: {dark};
   color: {fg};
 }}
 .lector-find {{
-  padding: 6px 12px;
-  border-bottom: 1px solid alpha({accent}, 0.22);
+  padding: 5px 10px;
+  border-bottom: 1px solid alpha({fg}, 0.10);
 }}
 .lector-sidebar {{
   background-color: {dark};
@@ -209,6 +280,9 @@ button:active, button:checked, togglebutton:checked {{
 button.flat {{
   background: transparent;
   border-color: transparent;
+}}
+button.flat:focus-visible {{
+  background: alpha({fg}, 0.08);
 }}
 popover.lector-menu button.lector-menu-item,
 button.lector-menu-item {{
@@ -265,6 +339,33 @@ popover.lector-menu button.lector-menu-item:hover .lector-menu-icon,
 popover.lector-menu button.lector-menu-item:focus .lector-menu-icon {{
   color: {menu_hi};
   opacity: 1;
+}}
+popover.lector-menu checkbutton.lector-menu-item {{
+  color: {menu_fg};
+  border-radius: {r}px;
+  padding: 4px 8px;
+  min-height: 28px;
+}}
+popover.lector-menu checkbutton.lector-menu-item:hover,
+popover.lector-menu checkbutton.lector-menu-item:focus {{
+  background: alpha({menu_sel}, {menu_sel_a});
+}}
+popover.lector-menu checkbutton.lector-menu-item .lector-menu-label,
+popover.lector-menu checkbutton.lector-menu-item .lector-menu-key {{
+  color: {menu_fg};
+}}
+popover.lector-menu checkbutton.lector-menu-item:checked .lector-menu-label,
+popover.lector-menu checkbutton.lector-menu-item:hover .lector-menu-label,
+popover.lector-menu checkbutton.lector-menu-item:focus .lector-menu-label {{
+  color: {menu_hi};
+}}
+popover.lector-menu checkbutton.lector-menu-item .lector-menu-key {{
+  opacity: 0.48;
+  font-size: 10pt;
+}}
+popover.lector-menu checkbutton.lector-menu-item check,
+popover.lector-menu checkbutton.lector-menu-item radio {{
+  color: {accent};
 }}
 .lector-menu-sep {{
   background: alpha({menu_fg}, 0.22);
@@ -396,7 +497,6 @@ tooltip {{
             menu_hi = self.menu_sel_text,
             px = self.font_px.max(10),
             r = r,
-            rplus = (r + 2).min(14),
             font = font,
         )
     }

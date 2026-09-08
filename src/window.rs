@@ -5,10 +5,10 @@ use std::rc::{Rc, Weak};
 use gtk::gdk::Key;
 use gtk::prelude::*;
 use gtk::{
-    gdk, gio, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider,
-    DrawingArea, DropDown, Entry, GestureClick, GestureDrag, Image, Label, ListBox, MenuButton,
-    Orientation, PasswordEntry, Popover, Revealer, ScrolledWindow, Separator, Stack, StackSwitcher,
-    ToggleButton,
+    gdk, gio, glib, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton,
+    CssProvider, DrawingArea, DropDown, Entry, GestureClick, GestureDrag, Image, Label, ListBox,
+    MenuButton, Orientation, PasswordEntry, Popover, Revealer, ScrolledWindow, Separator, Stack,
+    StackSwitcher, ToggleButton,
 };
 
 use crate::doc::{OpenDoc, OpenError};
@@ -149,7 +149,7 @@ struct Inner {
     view_h: f64,
     ignore_zoom_dropdown: bool,
     ignore_scroll: bool,
-    ignore_toggles: bool,
+    ignore_menu_checks: bool,
     search_gen: u64,
     thumb_gen: u64,
     search_query: String,
@@ -173,10 +173,15 @@ pub struct Lector {
     outline: ListBox,
     zoom_drop: DropDown,
     title_label: Label,
-    cont_btn: ToggleButton,
-    dual_btn: ToggleButton,
-    single_btn: ToggleButton,
-    invert_btn: ToggleButton,
+    prev_btn: Button,
+    next_btn: Button,
+    zoom_out_btn: Button,
+    zoom_in_btn: Button,
+    find_btn: Button,
+    cont_item: CheckButton,
+    dual_item: CheckButton,
+    single_item: CheckButton,
+    invert_item: CheckButton,
     thumbs_sw: ScrolledWindow,
     page_widgets: RefCell<Vec<(i32, DrawingArea)>>,
     rendered_structure: RefCell<Option<PageStructure>>,
@@ -234,7 +239,7 @@ impl Lector {
             view_h: 700.0,
             ignore_zoom_dropdown: false,
             ignore_scroll: false,
-            ignore_toggles: false,
+            ignore_menu_checks: false,
             search_gen: 0,
             thumb_gen: 0,
             search_query: String::new(),
@@ -251,16 +256,16 @@ impl Lector {
             };
         }
 
+        // Slim Omarchy-native bar: one flat surface, no boxed clusters.
         let title_label = Label::new(Some("Open a document"));
         title_label.add_css_class("lector-doc-title");
-        title_label.set_xalign(0.0);
         title_label.set_hexpand(true);
         title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
 
         let sidebar_btn = toggle_pill("view-list-symbolic", "Side pane (F9)");
         let open_btn = icon_pill("document-open-symbolic", "Open (Ctrl+O)");
-        let prev_btn = icon_pill("go-previous-symbolic", "Previous page");
-        let next_btn = icon_pill("go-next-symbolic", "Next page");
+        let prev_btn = icon_pill("go-previous-symbolic", "Previous page (p)");
+        let next_btn = icon_pill("go-next-symbolic", "Next page (n)");
 
         let page_entry = Entry::new();
         page_entry.set_width_chars(3);
@@ -268,69 +273,58 @@ impl Lector {
         page_entry.set_placeholder_text(Some("1"));
         page_entry.set_tooltip_text(Some("Go to page"));
         page_entry.add_css_class("lector-page-entry");
+        page_entry.set_valign(gtk::Align::Center);
         let page_total = Label::new(Some("/ 0"));
         page_total.add_css_class("dim-label");
+        page_total.set_valign(gtk::Align::Center);
 
-        let nav = cluster();
-        nav.append(&prev_btn);
-        nav.append(&page_entry);
-        nav.append(&page_total);
-        nav.append(&next_btn);
-
-        let zoom_out = icon_pill("zoom-out-symbolic", "Zoom out");
-        let zoom_in = icon_pill("zoom-in-symbolic", "Zoom in");
+        let zoom_out_btn = icon_pill("zoom-out-symbolic", "Zoom out (Ctrl+-)");
+        let zoom_in_btn = icon_pill("zoom-in-symbolic", "Zoom in (Ctrl++)");
         let zoom_drop = DropDown::from_strings(&ZOOM_LABELS);
         zoom_drop.set_tooltip_text(Some("Zoom"));
         zoom_drop.set_selected(2);
         zoom_drop.set_valign(gtk::Align::Center);
         zoom_drop.add_css_class("lector-zoom");
-        let fit_w = icon_pill("zoom-fit-best-symbolic", "Fit width (w)");
-        let zoom = cluster();
-        zoom.append(&fit_w);
-        zoom.append(&zoom_out);
-        zoom.append(&zoom_drop);
-        zoom.append(&zoom_in);
-
-        let cont_btn = ToggleButton::with_label("Cont");
-        cont_btn.set_tooltip_text(Some("Continuous (c)"));
-        cont_btn.add_css_class("lector-pill");
-        let dual_btn = ToggleButton::with_label("Dual");
-        dual_btn.set_tooltip_text(Some("Dual (d)"));
-        dual_btn.add_css_class("lector-pill");
-        let single_btn = ToggleButton::with_label("Single");
-        single_btn.set_tooltip_text(Some("Single page (s)"));
-        single_btn.add_css_class("lector-pill");
-        dual_btn.set_group(Some(&cont_btn));
-        single_btn.set_group(Some(&cont_btn));
-        let layout_cluster = cluster();
-        layout_cluster.append(&cont_btn);
-        layout_cluster.append(&dual_btn);
-        layout_cluster.append(&single_btn);
 
         let find_btn = icon_pill("edit-find-symbolic", "Find (Ctrl+F)");
-        let invert_btn = toggle_pill("weather-clear-night-symbolic", "Inverted colors (Ctrl+I)");
-        let tools = cluster();
-        tools.append(&find_btn);
-        tools.append(&invert_btn);
 
         let menu_btn = MenuButton::new();
         menu_btn.set_icon_name("open-menu-symbolic");
         menu_btn.set_tooltip_text(Some("More"));
         menu_btn.add_css_class("lector-pill");
 
-        let start = cluster();
-        start.append(&sidebar_btn);
-        start.append(&open_btn);
+        let cont_item = menu_check_row("Continuous", "c");
+        let dual_item = menu_check_row("Dual", "d");
+        let single_item = menu_check_row("Single page", "s");
+        dual_item.set_group(Some(&cont_item));
+        single_item.set_group(Some(&cont_item));
+        let invert_item = menu_check_row("Inverted colors", "Ctrl+I");
+        {
+            let st = inner.borrow();
+            cont_item.set_active(st.layout_mode == LayoutMode::Continuous);
+            dual_item.set_active(st.layout_mode == LayoutMode::Dual);
+            single_item.set_active(st.layout_mode == LayoutMode::Single);
+            invert_item.set_active(st.invert);
+        }
 
-        let toolbar = GtkBox::new(Orientation::Horizontal, 8);
+        prev_btn.set_margin_start(8);
+        zoom_out_btn.set_margin_start(8);
+        find_btn.set_margin_start(8);
+
+        let toolbar = GtkBox::new(Orientation::Horizontal, 2);
         toolbar.add_css_class("lector-toolbar");
         toolbar.set_valign(gtk::Align::Center);
-        toolbar.append(&start);
-        toolbar.append(&nav);
+        toolbar.append(&sidebar_btn);
+        toolbar.append(&open_btn);
+        toolbar.append(&prev_btn);
+        toolbar.append(&page_entry);
+        toolbar.append(&page_total);
+        toolbar.append(&next_btn);
         toolbar.append(&title_label);
-        toolbar.append(&zoom);
-        toolbar.append(&layout_cluster);
-        toolbar.append(&tools);
+        toolbar.append(&zoom_out_btn);
+        toolbar.append(&zoom_drop);
+        toolbar.append(&zoom_in_btn);
+        toolbar.append(&find_btn);
         toolbar.append(&menu_btn);
 
         // --- find bar (reveals under header) ---
@@ -438,10 +432,15 @@ impl Lector {
             outline: outline.clone(),
             zoom_drop: zoom_drop.clone(),
             title_label: title_label.clone(),
-            cont_btn: cont_btn.clone(),
-            dual_btn: dual_btn.clone(),
-            single_btn: single_btn.clone(),
-            invert_btn: invert_btn.clone(),
+            prev_btn: prev_btn.clone(),
+            next_btn: next_btn.clone(),
+            zoom_out_btn: zoom_out_btn.clone(),
+            zoom_in_btn: zoom_in_btn.clone(),
+            find_btn: find_btn.clone(),
+            cont_item: cont_item.clone(),
+            dual_item: dual_item.clone(),
+            single_item: single_item.clone(),
+            invert_item: invert_item.clone(),
             thumbs_sw: thumbs_sw.clone(),
             page_widgets: RefCell::new(Vec::new()),
             rendered_structure: RefCell::new(None),
@@ -491,29 +490,37 @@ impl Lector {
             &h,
         );
         menu_col.append(&menu_sep());
-        append_menu_section(
-            &menu_col,
-            "VIEW",
-            &[
-                ("sidebar-show-symbolic", "Side pane", "F9", menu_sidebar),
-                (
-                    "object-rotate-left-symbolic",
-                    "Rotate left",
-                    "Ctrl+L",
-                    menu_rot_l,
-                ),
-                (
-                    "object-rotate-right-symbolic",
-                    "Rotate right",
-                    "Ctrl+R",
-                    menu_rot_r,
-                ),
-                ("view-fullscreen-symbolic", "Fullscreen", "F11", menu_fs),
-                ("video-display-symbolic", "Presentation", "F5", menu_pres),
-            ],
+        menu_col.append(&menu_heading("VIEW"));
+        menu_col.append(&menu_row(
+            "sidebar-show-symbolic",
+            "Side pane",
+            "F9",
             &menu_pop,
             &h,
-        );
+            menu_sidebar,
+        ));
+        menu_col.append(&cont_item);
+        menu_col.append(&dual_item);
+        menu_col.append(&single_item);
+        menu_col.append(&invert_item);
+        for (icon, label, shortcut, action) in [
+            (
+                "object-rotate-left-symbolic",
+                "Rotate left",
+                "Ctrl+L",
+                menu_rot_l as fn(&Lector),
+            ),
+            (
+                "object-rotate-right-symbolic",
+                "Rotate right",
+                "Ctrl+R",
+                menu_rot_r,
+            ),
+            ("view-fullscreen-symbolic", "Fullscreen", "F11", menu_fs),
+            ("video-display-symbolic", "Presentation", "F5", menu_pres),
+        ] {
+            menu_col.append(&menu_row(icon, label, shortcut, &menu_pop, &h, action));
+        }
         menu_col.append(&menu_sep());
         append_menu_section(
             &menu_col,
@@ -540,6 +547,35 @@ impl Lector {
         menu_col.set_overflow(gtk::Overflow::Hidden);
         menu_pop.set_child(Some(&menu_col));
         menu_btn.set_popover(Some(&menu_pop));
+
+        for (item, mode) in [
+            (cont_item.clone(), LayoutMode::Continuous),
+            (dual_item.clone(), LayoutMode::Dual),
+            (single_item.clone(), LayoutMode::Single),
+        ] {
+            let h = h.clone();
+            let pop = menu_pop.clone();
+            item.connect_toggled(move |item| {
+                let Some(ui) = h.get() else { return };
+                if !item.is_active() || ui.inner.borrow().ignore_menu_checks {
+                    return;
+                }
+                pop.popdown();
+                ui.set_layout(mode);
+            });
+        }
+        invert_item.connect_toggled({
+            let h = h.clone();
+            let pop = menu_pop.clone();
+            move |item| {
+                let Some(ui) = h.get() else { return };
+                if ui.inner.borrow().ignore_menu_checks {
+                    return;
+                }
+                pop.popdown();
+                ui.set_invert(item.is_active());
+            }
+        });
         if std::env::var_os("LECTOR_DEBUG_MENU").is_some() {
             let btn = menu_btn.clone();
             let pop = menu_pop.clone();
@@ -718,7 +754,7 @@ impl Lector {
                 }
             }
         });
-        zoom_out.connect_clicked({
+        zoom_out_btn.connect_clicked({
             let h = h.clone();
             move |_| {
                 if let Some(ui) = h.get() {
@@ -726,74 +762,12 @@ impl Lector {
                 }
             }
         });
-        zoom_in.connect_clicked({
+        zoom_in_btn.connect_clicked({
             let h = h.clone();
             move |_| {
                 if let Some(ui) = h.get() {
                     ui.zoom_by(1.15);
                 }
-            }
-        });
-        fit_w.connect_clicked({
-            let h = h.clone();
-            move |_| {
-                if let Some(ui) = h.get() {
-                    ui.set_zoom(Zoom::FitWidth);
-                }
-            }
-        });
-        {
-            let mode = ui.inner.borrow().layout_mode;
-            let invert = ui.inner.borrow().invert;
-            cont_btn.set_active(mode == LayoutMode::Continuous);
-            dual_btn.set_active(mode == LayoutMode::Dual);
-            single_btn.set_active(mode == LayoutMode::Single);
-            invert_btn.set_active(invert);
-        }
-        cont_btn.connect_toggled({
-            let h = h.clone();
-            move |btn| {
-                let Some(ui) = h.get() else { return };
-                if ui.inner.borrow().ignore_toggles {
-                    return;
-                }
-                if btn.is_active() {
-                    ui.set_layout(LayoutMode::Continuous);
-                }
-            }
-        });
-        dual_btn.connect_toggled({
-            let h = h.clone();
-            move |btn| {
-                let Some(ui) = h.get() else { return };
-                if ui.inner.borrow().ignore_toggles {
-                    return;
-                }
-                if btn.is_active() {
-                    ui.set_layout(LayoutMode::Dual);
-                }
-            }
-        });
-        single_btn.connect_toggled({
-            let h = h.clone();
-            move |btn| {
-                let Some(ui) = h.get() else { return };
-                if ui.inner.borrow().ignore_toggles {
-                    return;
-                }
-                if btn.is_active() {
-                    ui.set_layout(LayoutMode::Single);
-                }
-            }
-        });
-        invert_btn.connect_toggled({
-            let h = h.clone();
-            move |btn| {
-                let Some(ui) = h.get() else { return };
-                if ui.inner.borrow().ignore_toggles {
-                    return;
-                }
-                ui.set_invert(btn.is_active());
             }
         });
         find_btn.connect_clicked({
@@ -921,6 +895,7 @@ impl Lector {
         *ui._monitor.borrow_mut() = monitor;
 
         ui.sync_sidebar();
+        ui.update_chrome();
         *ui.hold.borrow_mut() = Some(ui.clone());
         ui
     }
@@ -1436,33 +1411,25 @@ impl Lector {
         let page = {
             let mut st = self.inner.borrow_mut();
             st.layout_mode = mode;
+            st.ignore_menu_checks = true;
             st.page
         };
-        let cont = mode == LayoutMode::Continuous;
-        let dual = mode == LayoutMode::Dual;
-        let single = mode == LayoutMode::Single;
-        self.inner.borrow_mut().ignore_toggles = true;
-        if self.cont_btn.is_active() != cont {
-            self.cont_btn.set_active(cont);
-        }
-        if self.dual_btn.is_active() != dual {
-            self.dual_btn.set_active(dual);
-        }
-        if self.single_btn.is_active() != single {
-            self.single_btn.set_active(single);
-        }
-        self.inner.borrow_mut().ignore_toggles = false;
+        self.cont_item.set_active(mode == LayoutMode::Continuous);
+        self.dual_item.set_active(mode == LayoutMode::Dual);
+        self.single_item.set_active(mode == LayoutMode::Single);
+        self.inner.borrow_mut().ignore_menu_checks = false;
         self.reflow();
         self.goto_page(page);
     }
 
     fn set_invert(&self, on: bool) {
-        self.inner.borrow_mut().invert = on;
-        self.inner.borrow_mut().ignore_toggles = true;
-        if self.invert_btn.is_active() != on {
-            self.invert_btn.set_active(on);
+        {
+            let mut st = self.inner.borrow_mut();
+            st.invert = on;
+            st.ignore_menu_checks = true;
         }
-        self.inner.borrow_mut().ignore_toggles = false;
+        self.invert_item.set_active(on);
+        self.inner.borrow_mut().ignore_menu_checks = false;
         self.rebuild_sidebar();
         self.queue_pages_draw();
     }
@@ -2096,6 +2063,14 @@ Ctrl+I  Invert        Ctrl+R  Rotate          n / p  Next / previous page";
 
     fn update_chrome(&self) {
         let st = self.inner.borrow();
+        let has_doc = st.doc.is_some();
+        self.prev_btn.set_sensitive(has_doc);
+        self.next_btn.set_sensitive(has_doc);
+        self.page_entry.set_sensitive(has_doc);
+        self.zoom_out_btn.set_sensitive(has_doc);
+        self.zoom_in_btn.set_sensitive(has_doc);
+        self.zoom_drop.set_sensitive(has_doc);
+        self.find_btn.set_sensitive(has_doc);
         if let Some(doc) = st.doc.as_ref() {
             self.window.set_title(Some(&doc.title));
             self.title_label.set_text(&doc.title);
@@ -2295,13 +2270,6 @@ Ctrl+I  Invert        Ctrl+R  Rotate          n / p  Next / previous page";
     }
 }
 
-fn cluster() -> GtkBox {
-    let b = GtkBox::new(Orientation::Horizontal, 2);
-    b.add_css_class("lector-cluster");
-    b.set_valign(gtk::Align::Center);
-    b
-}
-
 fn icon_pill(icon: &str, tip: &str) -> Button {
     let b = Button::from_icon_name(icon);
     b.set_tooltip_text(Some(tip));
@@ -2329,6 +2297,30 @@ fn menu_heading(text: &str) -> Label {
     l.set_halign(gtk::Align::Start);
     l.set_xalign(0.0);
     l
+}
+
+fn menu_check_row(label: &str, shortcut: &str) -> CheckButton {
+    let item = CheckButton::new();
+    item.update_property(&[gtk::accessible::Property::Label(label)]);
+    item.add_css_class("lector-menu-item");
+    item.set_halign(gtk::Align::Fill);
+    item.set_hexpand(true);
+
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+    let name = Label::new(Some(label));
+    name.add_css_class("lector-menu-label");
+    name.set_halign(gtk::Align::Start);
+    name.set_hexpand(true);
+    name.set_xalign(0.0);
+    row.append(&name);
+    if !shortcut.is_empty() {
+        let key = Label::new(Some(shortcut));
+        key.add_css_class("lector-menu-key");
+        key.set_halign(gtk::Align::End);
+        row.append(&key);
+    }
+    item.set_child(Some(&row));
+    item
 }
 
 fn menu_row(
