@@ -194,6 +194,27 @@ fn continuous_scroll_page_changed(current: i32, visible: i32) -> Option<i32> {
     (visible != current).then_some(visible)
 }
 
+const ARROW_SCROLL_STEP: f64 = 64.0;
+
+fn continuous_arrow_scroll_target(
+    mode: LayoutMode,
+    key: Key,
+    value: f64,
+    lower: f64,
+    upper: f64,
+    page_size: f64,
+) -> Option<f64> {
+    if mode != LayoutMode::Continuous {
+        return None;
+    }
+    let delta = match key {
+        Key::Up | Key::KP_Up => -ARROW_SCROLL_STEP,
+        Key::Down | Key::KP_Down => ARROW_SCROLL_STEP,
+        _ => return None,
+    };
+    Some(clamp_adjustment(value + delta, lower, upper, page_size))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ShortcutRow {
     action: &'static str,
@@ -386,6 +407,10 @@ fn shortcut_sections() -> &'static [ShortcutSection] {
                 ShortcutRow {
                     action: "Previous page",
                     keys: "p",
+                },
+                ShortcutRow {
+                    action: "Scroll continuously",
+                    keys: "↑ / ↓",
                 },
                 ShortcutRow {
                     action: "First / last page",
@@ -3369,6 +3394,21 @@ impl Lector {
             }
         }
 
+        if !ctrl && !shift {
+            let adjustment = self.scrolled.vadjustment();
+            if let Some(target) = continuous_arrow_scroll_target(
+                self.inner.borrow().layout_mode,
+                key,
+                adjustment.value(),
+                adjustment.lower(),
+                adjustment.upper(),
+                adjustment.page_size(),
+            ) {
+                adjustment.set_value(target);
+                return glib::Propagation::Stop;
+            }
+        }
+
         match key {
             Key::Escape => {
                 if self.inner.borrow().presentation {
@@ -3904,6 +3944,22 @@ mod tests {
         assert_eq!(continuous_scroll_page_changed(0, 0), None);
         assert_eq!(continuous_scroll_page_changed(2, 2), None);
         assert_eq!(continuous_scroll_page_changed(0, 4), Some(4));
+    }
+
+    #[test]
+    fn arrow_keys_scroll_and_clamp_only_in_continuous_view() {
+        for (mode, key, value, expected) in [
+            (LayoutMode::Continuous, Key::Down, 100.0, Some(164.0)),
+            (LayoutMode::Continuous, Key::Up, 20.0, Some(0.0)),
+            (LayoutMode::Continuous, Key::Down, 680.0, Some(700.0)),
+            (LayoutMode::Single, Key::Down, 100.0, None),
+            (LayoutMode::Continuous, Key::Right, 100.0, None),
+        ] {
+            assert_eq!(
+                continuous_arrow_scroll_target(mode, key, value, 0.0, 1000.0, 300.0),
+                expected
+            );
+        }
     }
 
     #[test]

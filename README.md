@@ -90,6 +90,7 @@ atomic/private persistence, stale-writer merging, deletion, and all page rotatio
 | w / a | Fit width / Fit page |
 | Ctrl++ − 0 | Zoom in / out / 100% |
 | n p | Next / previous page |
+| ↑ / ↓ | Scroll up / down in continuous view |
 | Ctrl+I | Invert |
 | F5 / F11 | Presentation / Fullscreen |
 | Ctrl+P | Print |

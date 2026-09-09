@@ -76,6 +76,18 @@ fn actual_window_navigation_presentation_search_and_reload() {
         &["BT /F1 20 Tf 72 700 Td (needle) Tj ET"; 2],
     );
     ui.open_path(&long, None);
+    let scroll = ui.scrolled.vadjustment();
+    scroll.configure(100.0, 0.0, 1000.0, 64.0, 270.0, 300.0);
+    assert_eq!(
+        ui.key(Key::Down, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert_eq!(scroll.value(), 164.0);
+    assert_eq!(
+        ui.key(Key::Up, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert_eq!(scroll.value(), 100.0);
     ui.inner.borrow_mut().annotations = Some(AnnotationStore::default());
     ui.inner.borrow_mut().selection = Some(Selection {
         page: 0,
