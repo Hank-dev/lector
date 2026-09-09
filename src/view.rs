@@ -1,8 +1,10 @@
+use std::collections::{HashMap, VecDeque};
 use std::f64::consts::PI;
 
 use cairo::{Context, Format, ImageSurface, Operator};
 use poppler::{Color, Rectangle, SelectionStyle};
 
+use crate::annotations::{document_rect_to_display, Annotation, AnnotationKind, DocumentRect};
 use crate::doc::OpenDoc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,6 +52,16 @@ pub struct PageDrawing<'a> {
     pub current_hit: Option<usize>,
 }
 
+pub struct AnnotationDrawing<'a> {
+    pub annotations: &'a [Annotation],
+    pub page: i32,
+    pub page_width: f64,
+    pub page_height: f64,
+    pub rotation: i32,
+    pub scale: f64,
+    pub targeted: Option<&'a str>,
+}
+
 pub struct Layout {
     pub pages: Vec<PageGeom>,
     pub scale: f64,
@@ -58,6 +70,237 @@ pub struct Layout {
 pub const PAGE_GAP: f64 = 16.0;
 pub const PAGE_PAD: f64 = 16.0;
 pub const MAX_ZOOM: f64 = 16.0;
+pub const VIEW_PAGE_PAD: f64 = 400.0;
+pub const THUMB_CSS_WIDTH: f64 = 180.0;
+
+pub fn pages_intersecting_view(
+    pages: &[PageGeom],
+    view_top: f64,
+    view_h: f64,
+    pad: f64,
+) -> Vec<i32> {
+    let top = view_top - pad;
+    let bottom = view_top + view_h.max(0.0) + pad;
+    pages
+        .iter()
+        .filter(|page| page.y + page.h >= top && page.y <= bottom)
+        .map(|page| page.index)
+        .collect()
+}
+
+pub fn page_at_content_y(pages: &[PageGeom], y: f64) -> i32 {
+    for page in pages {
+        if y < page.y + page.h {
+            return page.index;
+        }
+    }
+    pages.last().map(|page| page.index).unwrap_or(0)
+}
+
+pub fn page_scroll_y(pages: &[PageGeom], page: i32) -> f64 {
+    pages
+        .iter()
+        .find(|geom| geom.index == page)
+        .map(|geom| (geom.y - 8.0).max(0.0))
+        .unwrap_or(0.0)
+}
+
+pub fn raster_idle_is_stale(job_gen: u64, live_gen: u64) -> bool {
+    job_gen != live_gen
+}
+
+pub fn raster_cache_needs_reset(
+    old_scale: f64,
+    new_scale: f64,
+    old_rotation: i32,
+    new_rotation: i32,
+    old_invert: bool,
+    new_invert: bool,
+) -> bool {
+    old_rotation != new_rotation
+        || old_invert != new_invert
+        || (old_scale - new_scale).abs() > 0.001
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RasterKey {
+    pub index: i32,
+    pub width: i32,
+    pub height: i32,
+    pub rotation: i32,
+    pub invert: bool,
+}
+
+impl RasterKey {
+    pub fn from_geom(geom: &PageGeom, rotation: i32, invert: bool, dpr: f64) -> Self {
+        let dpr = dpr.max(1.0);
+        Self {
+            index: geom.index,
+            width: (geom.w * dpr).ceil().max(1.0) as i32,
+            height: (geom.h * dpr).ceil().max(1.0) as i32,
+            rotation,
+            invert,
+        }
+    }
+}
+
+pub struct RasterCache {
+    map: HashMap<RasterKey, ImageSurface>,
+    lru: VecDeque<RasterKey>,
+    cap: usize,
+}
+
+impl RasterCache {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            lru: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    pub fn get(&mut self, key: &RasterKey) -> Option<ImageSurface> {
+        let surf = self.map.get(key)?.clone();
+        self.touch(key);
+        Some(surf)
+    }
+
+    pub fn contains(&self, key: &RasterKey) -> bool {
+        self.map.contains_key(key)
+    }
+
+    pub fn insert(&mut self, key: RasterKey, surf: ImageSurface) {
+        use std::collections::hash_map::Entry;
+        match self.map.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                occupied.insert(surf);
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(surf);
+                while self.map.len() > self.cap {
+                    if let Some(old) = self.lru.pop_front() {
+                        self.map.remove(&old);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        self.touch(&key);
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.lru.clear();
+    }
+
+    fn touch(&mut self, key: &RasterKey) {
+        self.lru.retain(|item| item != key);
+        self.lru.push_back(*key);
+    }
+}
+
+pub fn raster_page(
+    doc: &OpenDoc,
+    geom: &PageGeom,
+    rotation: i32,
+    invert: bool,
+    dpr: f64,
+) -> Option<ImageSurface> {
+    let dpr = dpr.max(1.0);
+    let key = RasterKey::from_geom(geom, rotation, invert, dpr);
+    let surf = ImageSurface::create(Format::ARgb32, key.width, key.height).ok()?;
+    {
+        let cr = Context::new(&surf).ok()?;
+        cr.scale(dpr, dpr);
+        draw_one_page(
+            &cr,
+            PageDrawing {
+                doc,
+                geom,
+                rotation,
+                invert,
+                selection: None,
+                search_hits: &[],
+                current_hit: None,
+            },
+        );
+    }
+    Some(surf)
+}
+
+pub fn paint_raster(cr: &Context, surf: &ImageSurface, css_w: f64, css_h: f64) {
+    let sw = surf.width() as f64;
+    let sh = surf.height() as f64;
+    if sw < 1.0 || sh < 1.0 || css_w < 1.0 || css_h < 1.0 {
+        return;
+    }
+    cr.save().ok();
+    cr.scale(css_w / sw, css_h / sh);
+    cr.set_source_surface(surf, 0.0, 0.0).ok();
+    cr.paint().ok();
+    cr.restore().ok();
+}
+
+pub fn annotation_render_bounds(
+    rect: DocumentRect,
+    page_width: f64,
+    page_height: f64,
+    rotation: i32,
+    scale: f64,
+) -> DocumentRect {
+    let display = document_rect_to_display(rect, page_width, page_height, rotation);
+    let scale = scale.max(0.01);
+    DocumentRect {
+        x: display.x * scale,
+        y: display.y * scale,
+        width: display.width * scale,
+        height: display.height * scale,
+    }
+}
+
+pub fn draw_annotations(cr: &Context, drawing: AnnotationDrawing<'_>) {
+    for annotation in drawing
+        .annotations
+        .iter()
+        .filter(|annotation| annotation.page == drawing.page)
+    {
+        let bounds = annotation_render_bounds(
+            annotation.rect,
+            drawing.page_width,
+            drawing.page_height,
+            drawing.rotation,
+            drawing.scale,
+        );
+        match annotation.kind {
+            AnnotationKind::Highlight => cr.set_source_rgba(1.0, 0.82, 0.08, 0.34),
+            AnnotationKind::Note { .. } => cr.set_source_rgba(1.0, 0.82, 0.08, 0.16),
+        }
+        cr.rectangle(bounds.x, bounds.y, bounds.width, bounds.height);
+        cr.fill().ok();
+
+        if matches!(annotation.kind, AnnotationKind::Note { .. }) {
+            let marker_x = bounds.x + bounds.width;
+            let marker_y = bounds.y;
+            cr.set_source_rgb(1.0, 0.72, 0.0);
+            cr.arc(marker_x, marker_y, 7.0, 0.0, PI * 2.0);
+            cr.fill().ok();
+            cr.set_source_rgb(0.22, 0.16, 0.0);
+            cr.set_line_width(1.5);
+            cr.move_to(marker_x, marker_y - 3.5);
+            cr.line_to(marker_x, marker_y + 1.5);
+            cr.stroke().ok();
+            cr.arc(marker_x, marker_y + 4.0, 0.8, 0.0, PI * 2.0);
+            cr.fill().ok();
+        }
+        if drawing.targeted == Some(annotation.id.as_str()) {
+            cr.set_source_rgba(0.25, 0.55, 1.0, 0.9);
+            cr.set_line_width(2.0);
+            cr.rectangle(bounds.x, bounds.y, bounds.width, bounds.height);
+            cr.stroke().ok();
+        }
+    }
+}
 
 impl Layout {
     pub fn compute(
@@ -199,26 +442,17 @@ fn scale_for(zoom: Zoom, pw: f64, ph: f64, vw: f64, vh: f64) -> f64 {
 }
 
 pub fn draw_one_page(cr: &Context, drawing: PageDrawing<'_>) {
-    let PageDrawing {
-        doc,
-        geom,
-        rotation,
-        invert,
-        selection,
-        search_hits,
-        current_hit,
-    } = drawing;
     let local = PageGeom {
         x: 0.0,
         y: 0.0,
-        ..*geom
+        ..*drawing.geom
     };
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.paint().ok();
 
-    if let Some(page) = doc.page(local.index) {
+    if let Some(page) = drawing.doc.page(local.index) {
         cr.save().ok();
-        match rotation.rem_euclid(360) {
+        match drawing.rotation.rem_euclid(360) {
             90 => {
                 cr.translate(local.w, 0.0);
                 cr.rotate(PI / 2.0);
@@ -235,13 +469,32 @@ pub fn draw_one_page(cr: &Context, drawing: PageDrawing<'_>) {
         }
         cr.scale(local.scale.max(0.01), local.scale.max(0.01));
         page.render(cr);
-        if invert {
+        if drawing.invert {
             cr.set_operator(Operator::Difference);
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.paint().ok();
         }
         cr.restore().ok();
     }
+
+    draw_page_overlays(cr, drawing);
+}
+
+pub fn draw_page_overlays(cr: &Context, drawing: PageDrawing<'_>) {
+    let PageDrawing {
+        doc,
+        geom,
+        rotation,
+        selection,
+        search_hits,
+        current_hit,
+        ..
+    } = drawing;
+    let local = PageGeom {
+        x: 0.0,
+        y: 0.0,
+        ..*geom
+    };
 
     for (i, (page, rect)) in search_hits.iter().enumerate() {
         if *page != local.index {
@@ -389,17 +642,37 @@ fn pdf_rect_to_view(
     )
 }
 
-pub fn thumbnail(doc: &OpenDoc, index: i32, max_w: f64, invert: bool) -> Option<ImageSurface> {
+pub fn thumbnail_pixel_size(page_w: f64, page_h: f64, css_width: f64, dpr: f64) -> (i32, i32) {
+    let dpr = dpr.max(1.0);
+    let css_width = css_width.max(1.0);
+    let page_w = page_w.max(1.0);
+    let scale = (css_width * dpr) / page_w;
+    (
+        (page_w * scale).ceil().max(1.0) as i32,
+        (page_h.max(1.0) * scale).ceil().max(1.0) as i32,
+    )
+}
+
+pub fn thumbnail_css_size(page_w: f64, page_h: f64, css_width: f64) -> (i32, i32) {
+    thumbnail_pixel_size(page_w, page_h, css_width, 1.0)
+}
+
+pub fn thumbnail(
+    doc: &OpenDoc,
+    index: i32,
+    css_width: f64,
+    dpr: f64,
+    invert: bool,
+) -> Option<ImageSurface> {
     let page = doc.page(index)?;
     let (pw, ph) = page.size();
-    let scale = (max_w / pw.max(1.0)).min(1.5);
-    let w = (pw * scale).ceil().max(1.0) as i32;
-    let h = (ph * scale).ceil().max(1.0) as i32;
+    let (w, h) = thumbnail_pixel_size(pw, ph, css_width, dpr);
     let surf = ImageSurface::create(Format::ARgb32, w, h).ok()?;
     {
         let cr = Context::new(&surf).ok()?;
         cr.set_source_rgb(1.0, 1.0, 1.0);
         cr.paint().ok()?;
+        let scale = w as f64 / pw.max(1.0);
         cr.scale(scale, scale);
         page.render(&cr);
         if invert {
@@ -536,5 +809,178 @@ mod tests {
             }
         }
         std::fs::remove_file(path).expect("remove test PDF");
+    }
+
+    fn stacked_pages(count: i32, height: f64) -> Vec<PageGeom> {
+        (0..count)
+            .map(|index| PageGeom {
+                index,
+                x: 0.0,
+                y: 16.0 + index as f64 * (height + 16.0),
+                w: 200.0,
+                h: height,
+                scale: 1.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_pages_near_the_viewport_are_considered_visible() {
+        let pages = stacked_pages(40, 800.0);
+        assert_eq!(pages_intersecting_view(&pages, 0.0, 700.0, 0.0), vec![0]);
+        assert_eq!(pages_intersecting_view(&pages, 2500.0, 700.0, 0.0), vec![3]);
+        assert_eq!(
+            pages_intersecting_view(&pages, 2500.0, 700.0, 400.0),
+            vec![2, 3, 4]
+        );
+        assert!(pages_intersecting_view(&pages, 0.0, 700.0, 0.0).len() < 5);
+        assert!(pages_intersecting_view(&[], 0.0, 700.0, 100.0).is_empty());
+    }
+
+    #[test]
+    fn page_raster_cache_keeps_a_bounded_lru() {
+        let mut cache = RasterCache::new(2);
+        let a = RasterKey {
+            index: 0,
+            width: 10,
+            height: 10,
+            rotation: 0,
+            invert: false,
+        };
+        let b = RasterKey { index: 1, ..a };
+        let c = RasterKey { index: 2, ..a };
+        let surf = || ImageSurface::create(Format::ARgb32, 10, 10).expect("surface");
+        cache.insert(a, surf());
+        cache.insert(b, surf());
+        assert!(cache.get(&a).is_some());
+        cache.insert(c, surf());
+        assert!(
+            cache.get(&b).is_none(),
+            "the least-recently used raster must be dropped"
+        );
+        assert!(cache.get(&a).is_some());
+        assert!(cache.get(&c).is_some());
+        cache.clear();
+        assert!(cache.get(&b).is_none());
+    }
+
+    #[test]
+    fn page_rasters_match_device_pixel_ratio() {
+        let geom = PageGeom {
+            index: 0,
+            x: 0.0,
+            y: 0.0,
+            w: 100.5,
+            h: 200.0,
+            scale: 1.0,
+        };
+        let one = RasterKey::from_geom(&geom, 0, false, 1.0);
+        assert_eq!((one.width, one.height), (101, 200));
+        let two = RasterKey::from_geom(&geom, 0, false, 2.0);
+        assert_eq!((two.width, two.height), (201, 400));
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn sidebar_thumbnails_raster_at_css_width_times_device_scale() {
+        let (w1, h1) = thumbnail_pixel_size(612.0, 792.0, 180.0, 1.0);
+        assert_eq!((w1, h1), (180, 233));
+        let (w2, h2) = thumbnail_pixel_size(612.0, 792.0, 180.0, 2.0);
+        assert_eq!((w2, h2), (360, 466));
+        assert!(
+            w2 >= 2 * 140,
+            "2× thumbs must beat the old 140px CSS raster"
+        );
+        assert_eq!(thumbnail_css_size(612.0, 792.0, 180.0), (180, 233));
+    }
+
+    #[test]
+    fn outline_navigation_uses_layout_y_not_every_widget_bound() {
+        let pages = stacked_pages(40, 800.0);
+        assert_eq!(page_at_content_y(&pages, 0.0), 0);
+        assert_eq!(page_at_content_y(&pages, 2500.0), 3);
+        assert_eq!(page_scroll_y(&pages, 3), (pages[3].y - 8.0).max(0.0));
+        assert_eq!(page_scroll_y(&pages, 99), 0.0);
+    }
+
+    #[test]
+    fn a_stale_raster_idle_must_not_drop_the_live_queue() {
+        assert!(raster_idle_is_stale(1, 2));
+        assert!(!raster_idle_is_stale(2, 2));
+        assert!(!raster_cache_needs_reset(1.0, 1.0, 0, 0, false, false));
+        assert!(raster_cache_needs_reset(1.0, 1.25, 0, 0, false, false));
+        assert!(raster_cache_needs_reset(1.0, 1.0, 0, 90, false, false));
+        assert!(raster_cache_needs_reset(1.0, 1.0, 0, 0, false, true));
+    }
+
+    #[test]
+    fn annotation_render_bounds_scale_after_rotation() {
+        let rect = DocumentRect {
+            x: 10.0,
+            y: 20.0,
+            width: 30.0,
+            height: 40.0,
+        };
+        let expected = [
+            (0, (20.0, 40.0, 60.0, 80.0)),
+            (90, (280.0, 20.0, 80.0, 60.0)),
+            (180, (120.0, 280.0, 60.0, 80.0)),
+            (270, (40.0, 120.0, 80.0, 60.0)),
+        ];
+        for (rotation, (x, y, width, height)) in expected {
+            assert_eq!(
+                annotation_render_bounds(rect, 100.0, 200.0, rotation, 2.0),
+                DocumentRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                "render bounds at {rotation}°"
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_paints_over_an_existing_page_raster() {
+        let mut surface = ImageSurface::create(Format::ARgb32, 100, 100).unwrap();
+        {
+            let cr = Context::new(&surface).unwrap();
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.paint().unwrap();
+            let annotation = Annotation {
+                id: "paint".into(),
+                page: 0,
+                rect: DocumentRect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 30.0,
+                    height: 10.0,
+                },
+                kind: AnnotationKind::Highlight,
+            };
+            draw_annotations(
+                &cr,
+                AnnotationDrawing {
+                    annotations: &[annotation],
+                    page: 0,
+                    page_width: 100.0,
+                    page_height: 100.0,
+                    rotation: 0,
+                    scale: 1.0,
+                    targeted: None,
+                },
+            );
+        }
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let data = surface.data().unwrap();
+        let inside = &data[25 * stride + 15 * 4..25 * stride + 15 * 4 + 4];
+        let outside = &data[5 * stride + 5 * 4..5 * stride + 5 * 4 + 4];
+        assert_ne!(
+            inside, outside,
+            "highlight must alter the cached page pixels"
+        );
+        assert_eq!(outside, &[255, 255, 255, 255]);
     }
 }

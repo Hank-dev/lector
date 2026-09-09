@@ -475,6 +475,84 @@ popover.lector-menu.background > contents {{
   background: alpha({fg}, 0.08);
   border-radius: {r}px;
 }}
+window.lector-dialog {{
+  background-color: {bg};
+  color: {fg};
+  font-family: "{font}";
+  font-size: {px}px;
+  border: 2px solid alpha({accent}, 0.76);
+}}
+.lector-dialog-title {{
+  color: {fg};
+  font-weight: 600;
+  padding: 0 8px;
+}}
+.lector-dialog-body {{
+  background-color: {bg};
+  padding: 10px 16px 16px;
+}}
+window.lector-dialog .lector-menu-heading {{
+  color: {menu_fg};
+  opacity: 0.50;
+  font-size: 9pt;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  padding: 6px 2px 2px;
+}}
+window.lector-dialog .lector-menu-label {{
+  color: {menu_fg};
+  font-weight: 500;
+}}
+window.lector-dialog .lector-menu-key {{
+  color: {menu_fg};
+  opacity: 0.48;
+  font-size: 10pt;
+  font-weight: 500;
+}}
+.lector-shortcut-row {{
+  min-height: 26px;
+  padding: 1px 2px;
+}}
+.lector-field-label {{
+  color: {fg};
+  opacity: 0.48;
+}}
+.lector-field-value {{
+  color: {fg};
+}}
+.lector-about-name {{
+  color: {fg};
+  font-size: 16px;
+  font-weight: 600;
+  margin-top: 4px;
+}}
+.lector-about-copy {{
+  color: {fg};
+  opacity: 0.68;
+}}
+.lector-about-version {{
+  color: {fg};
+  opacity: 0.45;
+  font-size: 10pt;
+  margin-top: 4px;
+}}
+.lector-history row:selected {{
+  background: alpha({accent}, 0.22);
+  border-radius: {r}px;
+}}
+.lector-history row:hover {{
+  background: alpha({fg}, 0.08);
+  border-radius: {r}px;
+}}
+.lector-history-path, .lector-history-page {{
+  color: {fg};
+  opacity: 0.55;
+  font-size: 10pt;
+}}
+.lector-history-missing {{
+  color: {accent};
+  font-weight: 600;
+}}
 tooltip {{
   background: alpha({bg}, 0.97);
   color: {fg};

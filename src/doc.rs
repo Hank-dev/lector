@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,35 @@ pub struct OutlineItem {
     pub title: String,
     pub page: Option<i32>,
     pub depth: u32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn outline_item_has_children(items: &[OutlineItem], index: usize) -> bool {
+    let Some(item) = items.get(index) else {
+        return false;
+    };
+    items
+        .get(index + 1)
+        .is_some_and(|next| next.depth > item.depth)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn visible_outline_indices(items: &[OutlineItem], collapsed: &HashSet<usize>) -> Vec<usize> {
+    let mut skip_deeper_than = None;
+    let mut visible = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if let Some(depth) = skip_deeper_than {
+            if item.depth > depth {
+                continue;
+            }
+            skip_deeper_than = None;
+        }
+        visible.push(index);
+        if collapsed.contains(&index) {
+            skip_deeper_than = Some(item.depth);
+        }
+    }
+    visible
 }
 
 #[derive(Clone, Debug)]
@@ -365,6 +395,7 @@ pub(crate) fn write_link_test_pdf() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn page_links_resolve_external_uris_and_internal_destinations() {
@@ -379,5 +410,49 @@ mod tests {
         assert_eq!(doc.link_at(0, 400.0, 400.0), None);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn sample_outline() -> Vec<OutlineItem> {
+        [
+            (0, "Chapter 1"),
+            (1, "1.1"),
+            (2, "1.1.1"),
+            (1, "1.2"),
+            (0, "Chapter 2"),
+            (1, "2.1"),
+        ]
+        .into_iter()
+        .map(|(depth, title)| OutlineItem {
+            title: title.into(),
+            page: Some(depth as i32),
+            depth,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn collapsing_a_chapter_hides_its_nested_entries() {
+        let items = sample_outline();
+        assert!(outline_item_has_children(&items, 0));
+        assert!(outline_item_has_children(&items, 1));
+        assert!(!outline_item_has_children(&items, 2));
+        assert!(outline_item_has_children(&items, 4));
+        assert!(!outline_item_has_children(&items, 5));
+
+        let mut collapsed = HashSet::new();
+        assert_eq!(
+            visible_outline_indices(&items, &collapsed),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+
+        collapsed.insert(0);
+        assert_eq!(visible_outline_indices(&items, &collapsed), vec![0, 4, 5]);
+
+        collapsed.clear();
+        collapsed.insert(1);
+        assert_eq!(
+            visible_outline_indices(&items, &collapsed),
+            vec![0, 1, 3, 4, 5]
+        );
     }
 }

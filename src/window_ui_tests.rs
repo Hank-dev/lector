@@ -18,6 +18,20 @@ fn widget_tree_has_label(widget: &gtk::Widget, expected: &str) -> bool {
     false
 }
 
+fn widget_tree_has_css_class(widget: &gtk::Widget, class: &str) -> bool {
+    if widget.has_css_class(class) {
+        return true;
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if widget_tree_has_css_class(&current, class) {
+            return true;
+        }
+        child = current.next_sibling();
+    }
+    false
+}
+
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_window_navigation_presentation_search_and_reload() {
@@ -44,6 +58,9 @@ fn actual_window_navigation_presentation_search_and_reload() {
         ui.zoom_in_btn.upcast_ref(),
         ui.zoom_drop.upcast_ref(),
         ui.find_btn.upcast_ref(),
+        ui.highlight_item.upcast_ref(),
+        ui.note_item.upcast_ref(),
+        ui.delete_annotation_item.upcast_ref(),
     ] {
         assert!(
             !control.is_sensitive(),
@@ -51,6 +68,7 @@ fn actual_window_navigation_presentation_search_and_reload() {
         );
     }
     ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Continuous);
     let long =
         crate::doc::write_test_pdf("window-long", &["BT /F1 20 Tf 72 700 Td (needle) Tj ET"; 8]);
     let short = crate::doc::write_test_pdf(
@@ -58,6 +76,17 @@ fn actual_window_navigation_presentation_search_and_reload() {
         &["BT /F1 20 Tf 72 700 Td (needle) Tj ET"; 2],
     );
     ui.open_path(&long, None);
+    ui.inner.borrow_mut().annotations = Some(AnnotationStore::default());
+    ui.inner.borrow_mut().selection = Some(Selection {
+        page: 0,
+        x1: 70.0,
+        y1: 70.0,
+        x2: 160.0,
+        y2: 110.0,
+    });
+    ui.update_annotation_actions();
+    assert!(ui.highlight_item.is_sensitive());
+    assert!(ui.note_item.is_sensitive());
     assert_eq!(ui.inner.borrow().doc.as_ref().unwrap().n_pages, 8);
     ui.follow_link(DocumentLink::GotoPage(3));
     assert_eq!(ui.inner.borrow().page, 3);
@@ -136,4 +165,95 @@ fn actual_window_navigation_presentation_search_and_reload() {
     ui.window.destroy();
     std::fs::remove_file(long).unwrap();
     std::fs::remove_file(short).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_window_info_dialogs_use_lector_chrome() {
+    gtk::init().expect("GTK display required");
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorDialogRegression")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    gtk::prelude::WidgetExt::realize(&ui.window);
+
+    let shortcuts = ui.shortcuts_dialog();
+    assert!(
+        shortcuts.has_css_class("lector-dialog") && shortcuts.has_css_class("lector-window"),
+        "info dialogs must use Lector window chrome, not a system alert"
+    );
+    let shortcuts_root = shortcuts.upcast_ref::<gtk::Widget>();
+    for label in [
+        "Keyboard shortcuts",
+        "FILE",
+        "VIEW",
+        "FIND",
+        "Open",
+        "Ctrl+O",
+        "Pinch to zoom",
+    ] {
+        assert!(
+            widget_tree_has_label(shortcuts_root, label),
+            "shortcuts dialog missing {label}"
+        );
+    }
+    assert!(
+        widget_tree_has_css_class(shortcuts_root, "lector-pill"),
+        "dialogs must use the same close pill as the toolbar"
+    );
+    shortcuts.destroy();
+
+    let about = ui.about_dialog();
+    let about_root = about.upcast_ref::<gtk::Widget>();
+    assert!(about.has_css_class("lector-dialog"));
+    assert!(widget_tree_has_label(about_root, "Lector"));
+    assert!(widget_tree_has_label(
+        about_root,
+        "Native PDF viewer for Omarchy"
+    ));
+    assert!(widget_tree_has_label(about_root, env!("CARGO_PKG_VERSION")));
+    assert!(
+        !widget_tree_has_label(about_root, "GNOME Document Viewer"),
+        "about copy should match Lector, not a stock toolkit blurb"
+    );
+    about.destroy();
+
+    ui.inner.borrow_mut().session = Session::default();
+    let pdf = crate::doc::write_test_pdf(
+        "dialog-props",
+        &["BT /F1 20 Tf 72 700 Td (properties) Tj ET"],
+    );
+    ui.open_path(&pdf, None);
+    let props = ui
+        .properties_dialog()
+        .expect("an open document must have properties");
+    let props_root = props.upcast_ref::<gtk::Widget>();
+    assert!(props.has_css_class("lector-dialog"));
+    for label in ["Properties", "File", "Title", "Pages"] {
+        assert!(
+            widget_tree_has_label(props_root, label),
+            "properties dialog missing {label}"
+        );
+    }
+    props.destroy();
+
+    ui.inner.borrow_mut().session.remember(
+        Path::new("/definitely/missing/lector.pdf"),
+        4,
+        Zoom::Actual,
+    );
+    let history = ui.reading_history_dialog();
+    let history_root = history.upcast_ref::<gtk::Widget>();
+    for label in ["Reading History", "lector.pdf", "Missing"] {
+        assert!(
+            widget_tree_has_label(history_root, label),
+            "history dialog missing {label}"
+        );
+    }
+    history.destroy();
+
+    ui.hold.borrow_mut().take();
+    std::fs::remove_file(pdf).unwrap();
 }

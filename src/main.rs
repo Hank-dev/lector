@@ -1,3 +1,4 @@
+mod annotations;
 mod doc;
 mod session;
 mod theme;

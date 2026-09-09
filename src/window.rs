@@ -1,4 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
@@ -6,17 +7,24 @@ use gtk::gdk::Key;
 use gtk::prelude::*;
 use gtk::{
     gdk, gio, glib, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton,
-    CssProvider, DrawingArea, DropDown, Entry, GestureClick, GestureDrag, Image, Label, ListBox,
-    MenuButton, Orientation, PasswordEntry, Popover, Revealer, ScrolledWindow, Separator, Stack,
-    StackSwitcher, ToggleButton,
+    CssProvider, DrawingArea, DropDown, Entry, GestureClick, GestureDrag, GestureZoom, Image,
+    Label, ListBox, MenuButton, Orientation, PasswordEntry, Popover, Revealer, ScrolledWindow,
+    Separator, Stack, StackSwitcher, ToggleButton,
 };
 
+use crate::annotations::{
+    display_rect_to_document, document_rect_to_display, new_annotation, Annotation, AnnotationKind,
+    AnnotationStore, DocumentRect,
+};
 use crate::doc::{DocumentLink, OpenDoc, OpenError};
 use crate::session::{self, Session};
 use crate::theme::{self, Theme};
 use crate::view::{
-    display_point_to_document, draw_one_page, selected_text, thumbnail, Layout, LayoutMode,
-    PageDrawing, Selection, Zoom, MAX_ZOOM,
+    display_point_to_document, draw_annotations, draw_page_overlays, page_at_content_y,
+    page_scroll_y, pages_intersecting_view, paint_raster, raster_cache_needs_reset,
+    raster_idle_is_stale, raster_page, selected_text, thumbnail, thumbnail_css_size,
+    AnnotationDrawing, Layout, LayoutMode, PageDrawing, RasterCache, RasterKey, Selection, Zoom,
+    MAX_ZOOM, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
 };
 
 const ZOOM_LABELS: [&str; 16] = [
@@ -130,6 +138,307 @@ fn remember_document_state(session: &mut Session, path: &Path, page: i32, zoom: 
     session.remember(path, page, zoom);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ViewportAnchor {
+    content_x: f64,
+    content_y: f64,
+    view_x: f64,
+    view_y: f64,
+    scale: f64,
+}
+
+fn zoom_from_factor(current_scale: f64, factor: f64) -> Zoom {
+    Zoom::Custom((current_scale * factor).clamp(0.1, MAX_ZOOM))
+}
+
+fn pinch_target_scale(start_scale: f64, gesture_scale: f64) -> f64 {
+    (start_scale * gesture_scale).clamp(0.1, MAX_ZOOM)
+}
+
+fn pinch_scale_is_meaningful(applied: f64, target: f64) -> bool {
+    (target - applied).abs() / applied.max(0.01) >= 0.02
+}
+
+fn ctrl_scroll_zoom_factor(dy: f64) -> f64 {
+    if dy == 0.0 {
+        1.0
+    } else if dy.abs() >= 1.0 {
+        if dy < 0.0 {
+            1.1
+        } else {
+            1.0 / 1.1
+        }
+    } else {
+        1.1_f64.powf(-dy)
+    }
+}
+
+fn restored_scroll(anchor: ViewportAnchor, new_scale: f64) -> (f64, f64) {
+    let factor = if anchor.scale > 0.0 {
+        new_scale / anchor.scale
+    } else {
+        1.0
+    };
+    (
+        anchor.content_x * factor - anchor.view_x,
+        anchor.content_y * factor - anchor.view_y,
+    )
+}
+
+fn clamp_adjustment(value: f64, lower: f64, upper: f64, page: f64) -> f64 {
+    let max = (upper - page).max(lower);
+    value.clamp(lower, max)
+}
+
+fn continuous_scroll_page_changed(current: i32, visible: i32) -> Option<i32> {
+    (visible != current).then_some(visible)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShortcutRow {
+    action: &'static str,
+    keys: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShortcutSection {
+    heading: &'static str,
+    rows: &'static [ShortcutRow],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnnotationShortcut {
+    History,
+    Highlight,
+    Note,
+}
+
+fn annotation_shortcut(key: Key, mods: gdk::ModifierType) -> Option<AnnotationShortcut> {
+    if !mods.contains(gdk::ModifierType::CONTROL_MASK) {
+        return None;
+    }
+    let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+    match key {
+        Key::h | Key::H if shift => Some(AnnotationShortcut::Highlight),
+        Key::h | Key::H => Some(AnnotationShortcut::History),
+        Key::n | Key::N if shift => Some(AnnotationShortcut::Note),
+        _ => None,
+    }
+}
+
+fn begin_selection_state(
+    selection: &mut Option<Selection>,
+    targeted_annotation: &mut Option<String>,
+    hit: Option<(i32, f64, f64)>,
+) {
+    *targeted_annotation = None;
+    *selection = hit.map(|(page, x, y)| Selection {
+        page,
+        x1: x,
+        y1: y,
+        x2: x,
+        y2: y,
+    });
+}
+
+fn replace_annotation_target(target: &mut Option<String>, replacement: Option<String>) -> bool {
+    if *target == replacement {
+        return false;
+    }
+    *target = replacement;
+    true
+}
+
+fn rotate_view_state(rotation: &mut i32, selection: &mut Option<Selection>, degrees: i32) {
+    *selection = None;
+    *rotation = (*rotation + degrees).rem_euclid(360);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AboutCopy {
+    name: &'static str,
+    tagline: &'static str,
+    detail: &'static str,
+    version: &'static str,
+}
+
+fn shortcut_sections() -> &'static [ShortcutSection] {
+    &[
+        ShortcutSection {
+            heading: "FILE",
+            rows: &[
+                ShortcutRow {
+                    action: "Open",
+                    keys: "Ctrl+O",
+                },
+                ShortcutRow {
+                    action: "Save a copy",
+                    keys: "Ctrl+S",
+                },
+                ShortcutRow {
+                    action: "Print",
+                    keys: "Ctrl+P",
+                },
+                ShortcutRow {
+                    action: "Reading history",
+                    keys: "Ctrl+H",
+                },
+            ],
+        },
+        ShortcutSection {
+            heading: "ANNOTATIONS",
+            rows: &[
+                ShortcutRow {
+                    action: "Highlight selection",
+                    keys: "Ctrl+Shift+H",
+                },
+                ShortcutRow {
+                    action: "Add note to selection",
+                    keys: "Ctrl+Shift+N",
+                },
+                ShortcutRow {
+                    action: "Delete targeted annotation",
+                    keys: "Delete",
+                },
+            ],
+        },
+        ShortcutSection {
+            heading: "VIEW",
+            rows: &[
+                ShortcutRow {
+                    action: "Side pane",
+                    keys: "F9",
+                },
+                ShortcutRow {
+                    action: "Continuous",
+                    keys: "c",
+                },
+                ShortcutRow {
+                    action: "Dual",
+                    keys: "d",
+                },
+                ShortcutRow {
+                    action: "Single page",
+                    keys: "s",
+                },
+                ShortcutRow {
+                    action: "Fit width",
+                    keys: "w",
+                },
+                ShortcutRow {
+                    action: "Fit page",
+                    keys: "a",
+                },
+                ShortcutRow {
+                    action: "Actual size",
+                    keys: "Ctrl+0",
+                },
+                ShortcutRow {
+                    action: "Zoom in / out",
+                    keys: "Ctrl++ / Ctrl+-",
+                },
+                ShortcutRow {
+                    action: "Pinch to zoom",
+                    keys: "Pinch",
+                },
+                ShortcutRow {
+                    action: "Invert colors",
+                    keys: "Ctrl+I",
+                },
+                ShortcutRow {
+                    action: "Rotate",
+                    keys: "Ctrl+R",
+                },
+                ShortcutRow {
+                    action: "Fullscreen",
+                    keys: "F11",
+                },
+                ShortcutRow {
+                    action: "Presentation",
+                    keys: "F5",
+                },
+            ],
+        },
+        ShortcutSection {
+            heading: "FIND",
+            rows: &[
+                ShortcutRow {
+                    action: "Find",
+                    keys: "Ctrl+F",
+                },
+                ShortcutRow {
+                    action: "Find next",
+                    keys: "Ctrl+G",
+                },
+                ShortcutRow {
+                    action: "Copy text",
+                    keys: "Ctrl+C",
+                },
+            ],
+        },
+        ShortcutSection {
+            heading: "NAVIGATION",
+            rows: &[
+                ShortcutRow {
+                    action: "Next page",
+                    keys: "n",
+                },
+                ShortcutRow {
+                    action: "Previous page",
+                    keys: "p",
+                },
+                ShortcutRow {
+                    action: "First / last page",
+                    keys: "Home / End",
+                },
+            ],
+        },
+        ShortcutSection {
+            heading: "DOCUMENT",
+            rows: &[ShortcutRow {
+                action: "Reload",
+                keys: "Ctrl+Shift+R",
+            }],
+        },
+    ]
+}
+
+fn display_meta(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("—")
+        .to_string()
+}
+
+fn property_fields(doc: &OpenDoc) -> Vec<(&'static str, String)> {
+    vec![
+        ("File", doc.path.display().to_string()),
+        ("Title", doc.title.clone()),
+        ("Author", display_meta(doc.author.as_deref())),
+        ("Subject", display_meta(doc.subject.as_deref())),
+        ("Creator", display_meta(doc.creator.as_deref())),
+        ("Producer", display_meta(doc.producer.as_deref())),
+        ("PDF", display_meta(doc.pdf_version.as_deref())),
+        ("Pages", doc.n_pages.to_string()),
+    ]
+}
+
+fn about_copy() -> AboutCopy {
+    AboutCopy {
+        name: "Lector",
+        tagline: "Native PDF viewer for Omarchy",
+        detail: "Poppler rendering · live theme follow",
+        version: env!("CARGO_PKG_VERSION"),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ViewRestore {
+    Anchor(ViewportAnchor),
+    CurrentPage,
+}
+
 struct Inner {
     doc: Option<OpenDoc>,
     zoom: Zoom,
@@ -145,15 +454,21 @@ struct Inner {
     presentation: bool,
     theme: Theme,
     session: Session,
+    annotations: Option<AnnotationStore>,
+    annotation_error: Option<String>,
+    targeted_annotation: Option<String>,
     view_w: f64,
     view_h: f64,
     ignore_zoom_dropdown: bool,
     ignore_scroll: bool,
     ignore_menu_checks: bool,
+    layout_gen: u64,
     search_gen: u64,
     thumb_gen: u64,
     search_query: String,
     pres_restore: Option<(LayoutMode, Zoom, Sidebar)>,
+    raster: RasterCache,
+    raster_gen: u64,
 }
 
 pub struct Lector {
@@ -182,9 +497,14 @@ pub struct Lector {
     dual_item: CheckButton,
     single_item: CheckButton,
     invert_item: CheckButton,
+    highlight_item: Button,
+    note_item: Button,
+    delete_annotation_item: Button,
     thumbs_sw: ScrolledWindow,
     page_widgets: RefCell<Vec<(i32, DrawingArea)>>,
     rendered_structure: RefCell<Option<PageStructure>>,
+    raster_pending: RefCell<HashSet<i32>>,
+    raster_busy: Cell<bool>,
     inner: Rc<RefCell<Inner>>,
     css: CssProvider,
     me: RefCell<Weak<Lector>>,
@@ -217,6 +537,11 @@ impl Lector {
         window.add_css_class("lector-window");
         window.set_titlebar(None::<&gtk::Box>);
 
+        let (annotations, annotation_error) = match AnnotationStore::load() {
+            Ok(store) => (Some(store), None),
+            Err(error) => (None, Some(error)),
+        };
+
         let inner = Rc::new(RefCell::new(Inner {
             doc: None,
             zoom: Zoom::FitWidth,
@@ -235,15 +560,21 @@ impl Lector {
             presentation: false,
             theme,
             session: Session::load(),
+            annotations,
+            annotation_error,
+            targeted_annotation: None,
             view_w: 800.0,
             view_h: 700.0,
             ignore_zoom_dropdown: false,
             ignore_scroll: false,
             ignore_menu_checks: false,
+            layout_gen: 0,
             search_gen: 0,
             thumb_gen: 0,
             search_query: String::new(),
             pres_restore: None,
+            raster: RasterCache::new(12),
+            raster_gen: 0,
         }));
         {
             let mut st = inner.borrow_mut();
@@ -299,6 +630,24 @@ impl Lector {
         dual_item.set_group(Some(&cont_item));
         single_item.set_group(Some(&cont_item));
         let invert_item = menu_check_row("Inverted colors", "Ctrl+I");
+        let highlight_item = bare_menu_row(
+            "format-text-highlight-symbolic",
+            "Highlight selection",
+            "Ctrl+Shift+H",
+        );
+        let note_item = bare_menu_row(
+            "document-edit-symbolic",
+            "Add note to selection…",
+            "Ctrl+Shift+N",
+        );
+        let delete_annotation_item = bare_menu_row(
+            "edit-delete-symbolic",
+            "Delete targeted annotation",
+            "Delete",
+        );
+        highlight_item.set_sensitive(false);
+        note_item.set_sensitive(false);
+        delete_annotation_item.set_sensitive(false);
         {
             let st = inner.borrow();
             cont_item.set_active(st.layout_mode == LayoutMode::Continuous);
@@ -393,15 +742,19 @@ impl Lector {
         // 30k-px-tall surface, which is how Evince avoids this too) ---
         let pages_box = GtkBox::new(Orientation::Vertical, 16);
         pages_box.add_css_class("lector-canvas");
-        pages_box.set_hexpand(true);
-        pages_box.set_vexpand(true);
+        // Natural size must drive the viewport. Expanding to fill clips a
+        // zoomed-in page and prevents horizontal panning.
+        pages_box.set_hexpand(false);
+        pages_box.set_vexpand(false);
         pages_box.set_can_focus(true);
-        pages_box.set_halign(gtk::Align::Fill);
+        pages_box.set_halign(gtk::Align::Center);
+        pages_box.set_valign(gtk::Align::Start);
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_child(Some(&pages_box));
         scrolled.set_hexpand(true);
         scrolled.set_vexpand(true);
+        scrolled.set_kinetic_scrolling(true);
         scrolled.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
 
         let body = GtkBox::new(Orientation::Horizontal, 0);
@@ -441,9 +794,14 @@ impl Lector {
             dual_item: dual_item.clone(),
             single_item: single_item.clone(),
             invert_item: invert_item.clone(),
+            highlight_item: highlight_item.clone(),
+            note_item: note_item.clone(),
+            delete_annotation_item: delete_annotation_item.clone(),
             thumbs_sw: thumbs_sw.clone(),
             page_widgets: RefCell::new(Vec::new()),
             rendered_structure: RefCell::new(None),
+            raster_pending: RefCell::new(HashSet::new()),
+            raster_busy: Cell::new(false),
             inner,
             css,
             me: RefCell::new(Weak::new()),
@@ -490,6 +848,16 @@ impl Lector {
             &h,
         );
         menu_col.append(&menu_sep());
+        menu_col.append(&menu_heading("ANNOTATIONS"));
+        for (button, action) in [
+            (&highlight_item, menu_highlight as fn(&Lector)),
+            (&note_item, menu_note),
+            (&delete_annotation_item, menu_delete_annotation),
+        ] {
+            connect_menu_row(button, &menu_pop, &h, action);
+            menu_col.append(button);
+        }
+        menu_col.append(&menu_sep());
         menu_col.append(&menu_heading("VIEW"));
         menu_col.append(&menu_row(
             "sidebar-show-symbolic",
@@ -532,6 +900,12 @@ impl Lector {
                     "Ctrl+Shift+R",
                     menu_reload,
                 ),
+                (
+                    "document-open-recent-symbolic",
+                    "Reading History…",
+                    "Ctrl+H",
+                    menu_history,
+                ),
                 ("document-properties-symbolic", "Properties", "", menu_props),
                 (
                     "input-keyboard-symbolic",
@@ -547,6 +921,14 @@ impl Lector {
         menu_col.set_overflow(gtk::Overflow::Hidden);
         menu_pop.set_child(Some(&menu_col));
         menu_btn.set_popover(Some(&menu_pop));
+        menu_pop.connect_show({
+            let h = h.clone();
+            move |_| {
+                if let Some(ui) = h.get() {
+                    ui.update_annotation_actions();
+                }
+            }
+        });
 
         for (item, mode) in [
             (cont_item.clone(), LayoutMode::Continuous),
@@ -669,7 +1051,15 @@ impl Lector {
             move |_, n, x, y| {
                 if let Some(ui) = h.get() {
                     if n == 1 {
-                        first_was_link.set(ui.activate_link_at(x, y));
+                        if ui.activate_note_at(x, y) {
+                            first_was_link.set(false);
+                        } else {
+                            let link = ui.activate_link_at(x, y);
+                            if !link {
+                                ui.target_annotation_at(x, y);
+                            }
+                            first_was_link.set(link);
+                        }
                     } else {
                         let has_link = ui.link_at_view(x, y).is_some();
                         if should_toggle_fit(n, has_link, first_was_link.get()) {
@@ -682,17 +1072,19 @@ impl Lector {
         });
         pages_box.add_controller(click);
 
-        let scroll = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
-        );
+        // Capture-phase on the scrolled window so Ctrl+scroll can zoom
+        // without a child controller stealing kinetic two-finger pans.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
         scroll.connect_scroll({
             let h = h.clone();
             move |c, _dx, dy| {
                 if c.current_event_state()
                     .contains(gdk::ModifierType::CONTROL_MASK)
+                    && dy != 0.0
                 {
                     if let Some(ui) = h.get() {
-                        ui.zoom_by(if dy < 0.0 { 1.1 } else { 1.0 / 1.1 });
+                        ui.zoom_by_at(ctrl_scroll_zoom_factor(dy), None);
                     }
                     glib::Propagation::Stop
                 } else {
@@ -700,7 +1092,34 @@ impl Lector {
                 }
             }
         });
-        pages_box.add_controller(scroll);
+        scrolled.add_controller(scroll);
+
+        let pinch = GestureZoom::new();
+        pinch.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let pinch_start = Rc::new(Cell::new(1.0));
+        pinch.connect_begin({
+            let h = h.clone();
+            let pinch_start = pinch_start.clone();
+            move |_, _| {
+                if let Some(ui) = h.get() {
+                    pinch_start.set(ui.inner.borrow().layout.scale.max(0.01));
+                }
+            }
+        });
+        pinch.connect_scale_changed({
+            let h = h.clone();
+            let pinch_start = pinch_start.clone();
+            move |g, scale| {
+                if let Some(ui) = h.get() {
+                    let target_scale = pinch_target_scale(pinch_start.get(), scale);
+                    if !pinch_scale_is_meaningful(ui.inner.borrow().layout.scale, target_scale) {
+                        return;
+                    }
+                    ui.set_zoom_at(Zoom::Custom(target_scale), g.bounding_box_center());
+                }
+            }
+        });
+        scrolled.add_controller(pinch);
 
         let drop = gtk::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
         drop.connect_drop({
@@ -910,6 +1329,12 @@ impl Lector {
 
     pub fn present(&self) {
         self.window.present();
+        if let Some(error) = self.inner.borrow().annotation_error.clone() {
+            self.alert(
+                "Could not load annotations",
+                &format!("{error}\n\nThe annotation file will not be modified."),
+            );
+        }
         self.pages_box.grab_focus();
         let h = Handle(self.me.borrow().clone());
         glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
@@ -951,6 +1376,7 @@ impl Lector {
             self.alert("Could not open document", "The file has no pages.");
             return;
         }
+        let opened_path = doc.path.clone();
         let restore = {
             let mut st = self.inner.borrow_mut();
             if let Some(old) = st.doc.as_ref() {
@@ -978,9 +1404,13 @@ impl Lector {
             }
             st.doc = Some(doc);
             st.selection = None;
+            st.targeted_annotation = None;
             if st.sidebar == Sidebar::Hidden {
                 st.sidebar = Sidebar::Thumbs;
             }
+            let page = st.page;
+            let zoom = st.zoom;
+            remember_document_state(&mut st.session, &opened_path, page, zoom);
         }
         self.search_entry.set_text("");
         self.search_info.set_text("");
@@ -1067,25 +1497,73 @@ impl Lector {
         });
     }
 
-    fn draw_page(&self, cr: &gtk::cairo::Context, index: i32, _dpr: f64) {
-        let st = &mut *self.inner.borrow_mut();
+    fn draw_page(&self, cr: &gtk::cairo::Context, index: i32, dpr: f64) {
+        let view_top = self.scrolled.vadjustment().value();
+        let view_h = self.scrolled.height() as f64;
+        let dpr = dpr.max(1.0);
+        let prepared = {
+            let mut st = self.inner.borrow_mut();
+            let Some(geom) = st.layout.page_geom(index) else {
+                return;
+            };
+            let near = pages_intersecting_view(&st.layout.pages, view_top, view_h, VIEW_PAGE_PAD)
+                .contains(&index);
+            let key = RasterKey::from_geom(&geom, st.rotation, st.invert, dpr);
+            let cached = st.raster.get(&key);
+            Some((
+                geom,
+                near,
+                cached,
+                st.rotation,
+                st.invert,
+                st.selection,
+                st.search_idx,
+            ))
+        };
+        let Some((geom, near, cached, rotation, invert, selection, search_idx)) = prepared else {
+            return;
+        };
+        if let Some(surf) = cached {
+            paint_raster(cr, &surf, geom.w, geom.h);
+        } else {
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.paint().ok();
+            if near {
+                self.queue_raster(index);
+            }
+        }
+        let st = self.inner.borrow();
         let Some(doc) = st.doc.as_ref() else {
             return;
         };
-        let Some(geom) = st.layout.page_geom(index) else {
-            return;
-        };
-        let hits = st.search_hits.clone();
-        draw_one_page(
+        let annotations = st
+            .annotations
+            .as_ref()
+            .map(|store| store.for_document(&doc.path))
+            .unwrap_or(&[]);
+        let (page_width, page_height) = doc.size(index, 0);
+        draw_annotations(
+            cr,
+            AnnotationDrawing {
+                annotations,
+                page: index,
+                page_width,
+                page_height,
+                rotation,
+                scale: geom.scale,
+                targeted: st.targeted_annotation.as_deref(),
+            },
+        );
+        draw_page_overlays(
             cr,
             PageDrawing {
                 doc,
                 geom: &geom,
-                rotation: st.rotation,
-                invert: st.invert,
-                selection: st.selection,
-                search_hits: &hits,
-                current_hit: st.search_idx,
+                rotation,
+                invert,
+                selection,
+                search_hits: &st.search_hits,
+                current_hit: search_idx,
             },
         );
     }
@@ -1112,33 +1590,132 @@ impl Lector {
         }
         if st.layout_mode == LayoutMode::Continuous && st.doc.is_some() {
             drop(st);
-            let page = self.page_at_view_y(self.scrolled.vadjustment().value() + 40.0);
-            let mut st = self.inner.borrow_mut();
-            if page != st.page {
-                st.page = page;
-                drop(st);
+            let page = page_at_content_y(
+                &self.inner.borrow().layout.pages,
+                self.scrolled.vadjustment().value() + 40.0,
+            );
+            let chrome = {
+                let mut st = self.inner.borrow_mut();
+                if let Some(next) = continuous_scroll_page_changed(st.page, page) {
+                    st.page = next;
+                    let remember = st
+                        .doc
+                        .as_ref()
+                        .map(|doc| (doc.path.clone(), st.page, st.zoom));
+                    if let Some((path, page, zoom)) = remember {
+                        remember_document_state(&mut st.session, &path, page, zoom);
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if chrome {
                 self.update_chrome();
             }
+            self.ensure_visible_rasters();
         }
     }
 
     fn queue_pages_draw(&self) {
-        for (_, da) in self.page_widgets.borrow().iter() {
-            da.queue_draw();
+        let view_top = self.scrolled.vadjustment().value();
+        let view_h = self.scrolled.height() as f64;
+        let visible = {
+            let st = self.inner.borrow();
+            pages_intersecting_view(&st.layout.pages, view_top, view_h, VIEW_PAGE_PAD)
+        };
+        for (index, da) in self.page_widgets.borrow().iter() {
+            if visible.contains(index) {
+                da.queue_draw();
+            }
         }
     }
 
-    fn page_at_view_y(&self, y: f64) -> i32 {
-        let widgets = self.page_widgets.borrow();
-        for (index, da) in widgets.iter() {
-            let Some(b) = da.compute_bounds(&self.pages_box) else {
-                continue;
-            };
-            if y < (b.y() + b.height()) as f64 {
-                return *index;
+    fn queue_raster(&self, index: i32) {
+        self.raster_pending.borrow_mut().insert(index);
+        self.kick_raster_idle();
+    }
+
+    fn ensure_visible_rasters(&self) {
+        let view_top = self.scrolled.vadjustment().value();
+        let view_h = self.scrolled.height() as f64;
+        let needed = {
+            let st = self.inner.borrow();
+            if st.doc.is_none() {
+                Vec::new()
+            } else {
+                pages_intersecting_view(&st.layout.pages, view_top, view_h, VIEW_PAGE_PAD)
+            }
+        };
+        if needed.is_empty() {
+            return;
+        }
+        {
+            let dpr = self.page_dpr();
+            let st = self.inner.borrow();
+            let mut pending = self.raster_pending.borrow_mut();
+            for index in needed {
+                let Some(geom) = st.layout.page_geom(index) else {
+                    continue;
+                };
+                let key = RasterKey::from_geom(&geom, st.rotation, st.invert, dpr);
+                if !st.raster.contains(&key) {
+                    pending.insert(index);
+                }
             }
         }
-        widgets.last().map(|(i, _)| *i).unwrap_or(0)
+        self.kick_raster_idle();
+    }
+
+    fn kick_raster_idle(&self) {
+        if self.raster_busy.get() || self.raster_pending.borrow().is_empty() {
+            return;
+        }
+        self.raster_busy.set(true);
+        let gen = self.inner.borrow().raster_gen;
+        let h = Handle(self.me.borrow().clone());
+        glib::idle_add_local_once(move || {
+            if let Some(ui) = h.get() {
+                ui.raster_one(gen);
+            }
+        });
+    }
+
+    fn raster_one(&self, gen: u64) {
+        if raster_idle_is_stale(gen, self.inner.borrow().raster_gen) {
+            self.raster_busy.set(false);
+            self.kick_raster_idle();
+            return;
+        }
+        let index = self.raster_pending.borrow_mut().iter().copied().next();
+        let Some(index) = index else {
+            self.raster_busy.set(false);
+            return;
+        };
+        self.raster_pending.borrow_mut().remove(&index);
+        let rendered = {
+            let st = self.inner.borrow();
+            match (st.doc.as_ref(), st.layout.page_geom(index)) {
+                (Some(doc), Some(geom)) => {
+                    let dpr = self.page_dpr();
+                    let key = RasterKey::from_geom(&geom, st.rotation, st.invert, dpr);
+                    raster_page(doc, &geom, st.rotation, st.invert, dpr).map(|surf| (key, surf))
+                }
+                _ => None,
+            }
+        };
+        if let Some((key, surf)) = rendered {
+            self.inner.borrow_mut().raster.insert(key, surf);
+            if let Some((_, da)) = self.page_widgets.borrow().iter().find(|(i, _)| *i == index) {
+                da.queue_draw();
+            }
+        }
+        self.raster_busy.set(false);
+        self.kick_raster_idle();
+    }
+
+    fn page_dpr(&self) -> f64 {
+        self.window.scale_factor().max(1) as f64
     }
 
     fn hit_at(&self, x: f64, y: f64) -> Option<(i32, f64, f64)> {
@@ -1170,8 +1747,58 @@ impl Lector {
         alert.show(Some(&self.window));
     }
 
+    fn capture_anchor(&self, focus: Option<(f64, f64)>) -> ViewportAnchor {
+        let (view_x, view_y) = focus.unwrap_or_else(|| {
+            (
+                (self.scrolled.width() as f64 * 0.5).max(0.0),
+                (self.scrolled.height() as f64 * 0.5).max(0.0),
+            )
+        });
+        ViewportAnchor {
+            content_x: self.scrolled.hadjustment().value() + view_x,
+            content_y: self.scrolled.vadjustment().value() + view_y,
+            view_x,
+            view_y,
+            scale: self.inner.borrow().layout.scale.max(0.01),
+        }
+    }
+
+    fn apply_anchor(&self, anchor: ViewportAnchor) {
+        let scale = self.inner.borrow().layout.scale;
+        let (x, y) = restored_scroll(anchor, scale);
+        let h = self.scrolled.hadjustment();
+        let v = self.scrolled.vadjustment();
+        h.set_value(clamp_adjustment(x, h.lower(), h.upper(), h.page_size()));
+        v.set_value(clamp_adjustment(y, v.lower(), v.upper(), v.page_size()));
+    }
+
+    fn schedule_view_restore(&self, restore: ViewRestore) {
+        let gen = {
+            let mut st = self.inner.borrow_mut();
+            st.ignore_scroll = true;
+            st.layout_gen = st.layout_gen.wrapping_add(1);
+            st.layout_gen
+        };
+        let h = Handle(self.me.borrow().clone());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
+            if let Some(ui) = h.get() {
+                if ui.inner.borrow().layout_gen == gen {
+                    match restore {
+                        ViewRestore::Anchor(anchor) => ui.apply_anchor(anchor),
+                        ViewRestore::CurrentPage => ui.scroll_to_current(),
+                    }
+                    ui.inner.borrow_mut().ignore_scroll = false;
+                }
+            }
+        });
+    }
+
     fn reflow(&self) {
-        {
+        self.reflow_restore(ViewRestore::Anchor(self.capture_anchor(None)));
+    }
+
+    fn reflow_restore(&self, restore: ViewRestore) {
+        let reset_rasters = {
             let st = &mut *self.inner.borrow_mut();
             let Some(doc) = st.doc.as_ref() else {
                 return;
@@ -1184,6 +1811,9 @@ impl Lector {
             if vh > 1.0 {
                 st.view_h = vh;
             }
+            let old_scale = st.layout.scale;
+            let old_rotation = st.rotation;
+            let old_invert = st.invert;
             st.layout = Layout::compute(
                 doc,
                 st.layout_mode,
@@ -1193,10 +1823,26 @@ impl Lector {
                 st.view_w.max(200.0),
                 st.view_h.max(200.0),
             );
+            let reset = raster_cache_needs_reset(
+                old_scale,
+                st.layout.scale,
+                old_rotation,
+                st.rotation,
+                old_invert,
+                st.invert,
+            );
+            if reset {
+                st.raster.clear();
+                st.raster_gen = st.raster_gen.wrapping_add(1);
+            }
+            reset
+        };
+        if reset_rasters {
+            self.raster_pending.borrow_mut().clear();
+            self.raster_busy.set(false);
         }
         let structure = {
-            let mut st = self.inner.borrow_mut();
-            st.ignore_scroll = true;
+            let st = self.inner.borrow();
             PageStructure::from_layout(st.layout_mode, &st.layout)
         };
         if self.rendered_structure.borrow().as_ref() == Some(&structure) {
@@ -1205,13 +1851,8 @@ impl Lector {
             self.rebuild_pages();
         }
         self.update_chrome();
-        let h = Handle(self.me.borrow().clone());
-        glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-            if let Some(ui) = h.get() {
-                ui.scroll_to_current();
-                ui.inner.borrow_mut().ignore_scroll = false;
-            }
-        });
+        self.schedule_view_restore(restore);
+        self.ensure_visible_rasters();
     }
 
     fn resize_page_widgets(&self) {
@@ -1230,15 +1871,10 @@ impl Lector {
     }
 
     fn scroll_to_current(&self) {
-        let page = self.inner.borrow().page;
-        let y = self
-            .page_widgets
-            .borrow()
-            .iter()
-            .find(|(i, _)| *i == page)
-            .and_then(|(_, da)| da.compute_bounds(&self.pages_box))
-            .map(|b| (b.y() as f64 - 8.0).max(0.0))
-            .unwrap_or(0.0);
+        let y = {
+            let st = self.inner.borrow();
+            page_scroll_y(&st.layout.pages, st.page)
+        };
         let v = self.scrolled.vadjustment();
         let max = (v.upper() - v.page_size()).max(0.0);
         v.set_value(y.min(max));
@@ -1266,7 +1902,6 @@ impl Lector {
                 }
             }
         });
-        da.queue_draw();
         da
     }
 
@@ -1309,6 +1944,7 @@ impl Lector {
                 self.pages_box.append(&da);
             }
         }
+        self.ensure_visible_rasters();
     }
 
     fn goto_page(&self, page: i32) {
@@ -1316,14 +1952,22 @@ impl Lector {
             let mut st = self.inner.borrow_mut();
             let n = st.doc.as_ref().map(|d| d.n_pages).unwrap_or(1);
             st.page = page.clamp(0, (n - 1).max(0));
+            let remember = st
+                .doc
+                .as_ref()
+                .map(|doc| (doc.path.clone(), st.page, st.zoom));
+            if let Some((path, page, zoom)) = remember {
+                remember_document_state(&mut st.session, &path, page, zoom);
+            }
             st.layout_mode
         };
         if mode != LayoutMode::Continuous {
-            self.reflow();
+            self.reflow_restore(ViewRestore::CurrentPage);
             return;
         }
         self.update_chrome();
         self.scroll_to_current();
+        self.ensure_visible_rasters();
     }
 
     fn goto_page_rel(&self, delta: i32) {
@@ -1332,18 +1976,23 @@ impl Lector {
     }
 
     fn set_zoom(&self, zoom: Zoom) {
+        self.set_zoom_at(zoom, None);
+    }
+
+    fn set_zoom_at(&self, zoom: Zoom, focus: Option<(f64, f64)>) {
+        let anchor = self.capture_anchor(focus);
         self.inner.borrow_mut().zoom = zoom;
         self.sync_zoom_dropdown();
-        self.reflow();
+        self.reflow_restore(ViewRestore::Anchor(anchor));
     }
 
     fn zoom_by(&self, factor: f64) {
-        let mut st = self.inner.borrow_mut();
-        let current = st.layout.scale;
-        st.zoom = Zoom::Custom((current * factor).clamp(0.1, MAX_ZOOM));
-        drop(st);
-        self.sync_zoom_dropdown();
-        self.reflow();
+        self.zoom_by_at(factor, None);
+    }
+
+    fn zoom_by_at(&self, factor: f64, focus: Option<(f64, f64)>) {
+        let current = self.inner.borrow().layout.scale;
+        self.set_zoom_at(zoom_from_factor(current, factor), focus);
     }
 
     fn zoom_from_dropdown(&self, idx: u32) {
@@ -1438,13 +2087,20 @@ impl Lector {
         }
         self.invert_item.set_active(on);
         self.inner.borrow_mut().ignore_menu_checks = false;
+        self.inner.borrow_mut().raster.clear();
         self.rebuild_sidebar();
         self.queue_pages_draw();
+        self.ensure_visible_rasters();
     }
 
     fn rotate(&self, deg: i32) {
         let mut st = self.inner.borrow_mut();
-        st.rotation = (st.rotation + deg).rem_euclid(360);
+        let Inner {
+            rotation,
+            selection,
+            ..
+        } = &mut *st;
+        rotate_view_state(rotation, selection, deg);
         drop(st);
         self.reflow();
     }
@@ -1671,19 +2327,25 @@ impl Lector {
                 continue;
             }
             let page = row.index();
+            let dpr = self.page_dpr();
             let surf = {
                 let st = self.inner.borrow();
                 let Some(doc) = st.doc.as_ref() else {
                     return;
                 };
-                thumbnail(doc, page, 140.0, invert)
+                thumbnail(doc, page, THUMB_CSS_WIDTH, dpr, invert)
             };
             if let Some(surf) = surf {
                 if let Some(tex) = surface_texture(&surf) {
                     let pic = gtk::Picture::for_paintable(&tex);
                     pic.set_can_shrink(true);
                     pic.set_content_fit(gtk::ContentFit::Contain);
-                    pic.set_size_request(140, 190);
+                    let (cw, ch) = thumbnail_css_size(
+                        surf.width() as f64 / dpr.max(1.0),
+                        surf.height() as f64 / dpr.max(1.0),
+                        THUMB_CSS_WIDTH,
+                    );
+                    pic.set_size_request(cw, ch);
                     if let Some(boxw) = col.downcast_ref::<GtkBox>() {
                         boxw.prepend(&pic);
                     }
@@ -1898,15 +2560,13 @@ impl Lector {
     }
 
     fn drag_begin(&self, x: f64, y: f64) {
-        if let Some((page, px, py)) = self.hit_at(x, y) {
-            self.inner.borrow_mut().selection = Some(Selection {
-                page,
-                x1: px,
-                y1: py,
-                x2: px,
-                y2: py,
-            });
+        let hit = self.hit_at(x, y);
+        {
+            let st = &mut *self.inner.borrow_mut();
+            begin_selection_state(&mut st.selection, &mut st.targeted_annotation, hit);
         }
+        self.queue_pages_draw();
+        self.update_annotation_actions();
     }
 
     fn drag_update(&self, x: f64, y: f64) {
@@ -1924,6 +2584,7 @@ impl Lector {
             }
         }
         self.queue_pages_draw();
+        self.update_annotation_actions();
     }
 
     fn copy_selection(&self) {
@@ -1936,6 +2597,246 @@ impl Lector {
                 display.clipboard().set_text(&text);
             }
         }
+    }
+
+    fn selected_annotation_region(&self) -> Option<(PathBuf, i32, DocumentRect)> {
+        let st = self.inner.borrow();
+        let doc = st.doc.as_ref()?;
+        let selection = st.selection?;
+        selected_text(doc, st.rotation, selection)?;
+        let (page_width, page_height) = doc.size(selection.page, 0);
+        let rect = display_rect_to_document(
+            selection.x1,
+            selection.y1,
+            selection.x2,
+            selection.y2,
+            page_width,
+            page_height,
+            st.rotation,
+        )?;
+        Some((doc.path.clone(), selection.page, rect))
+    }
+
+    fn update_annotation_actions(&self) {
+        let can_create = self.selected_annotation_region().is_some()
+            && self.inner.borrow().annotations.is_some();
+        self.highlight_item.set_sensitive(can_create);
+        self.note_item.set_sensitive(can_create);
+        self.delete_annotation_item
+            .set_sensitive(self.annotation_to_delete().is_some());
+    }
+
+    fn annotation_to_delete(&self) -> Option<String> {
+        let selected = self.selected_annotation_region();
+        let st = self.inner.borrow();
+        let doc = st.doc.as_ref()?;
+        let annotations = st.annotations.as_ref()?.for_document(&doc.path);
+        if let Some(id) = st.targeted_annotation.as_ref() {
+            if annotations.iter().any(|annotation| &annotation.id == id) {
+                return Some(id.clone());
+            }
+        }
+        let (_, page, rect) = selected?;
+        annotations
+            .iter()
+            .rev()
+            .find(|annotation| {
+                annotation.page == page && document_rects_intersect(annotation.rect, rect)
+            })
+            .map(|annotation| annotation.id.clone())
+    }
+
+    fn annotation_store_error(&self) -> String {
+        self.inner
+            .borrow()
+            .annotation_error
+            .clone()
+            .unwrap_or_else(|| "The annotation store is unavailable.".into())
+    }
+
+    fn create_annotation(&self, kind: AnnotationKind) {
+        let Some((path, page, rect)) = self.selected_annotation_region() else {
+            return;
+        };
+        let annotation = new_annotation(page, rect, kind);
+        let result = {
+            let st = self.inner.borrow();
+            st.annotations.as_ref().map(|store| {
+                let mut candidate = store.clone();
+                candidate.add(&path, annotation.clone());
+                candidate.save().map(|_| candidate)
+            })
+        };
+        match result {
+            Some(Ok(candidate)) => {
+                let mut st = self.inner.borrow_mut();
+                st.annotations = Some(candidate);
+                st.targeted_annotation = Some(annotation.id);
+                drop(st);
+                self.queue_pages_draw();
+                self.update_annotation_actions();
+            }
+            Some(Err(error)) => self.alert("Could not save annotation", &error),
+            None => self.alert("Annotations unavailable", &self.annotation_store_error()),
+        }
+    }
+
+    fn add_highlight(&self) {
+        self.create_annotation(AnnotationKind::Highlight);
+    }
+
+    fn add_note(&self) {
+        if self.selected_annotation_region().is_none() {
+            return;
+        }
+        if self.inner.borrow().annotations.is_none() {
+            self.alert("Annotations unavailable", &self.annotation_store_error());
+            return;
+        }
+        let text = gtk::TextView::new();
+        text.set_wrap_mode(gtk::WrapMode::WordChar);
+        text.set_size_request(420, 130);
+        text.set_tooltip_text(Some("Text attached to the selected PDF region"));
+        let save = Button::with_label("Add Note");
+        save.add_css_class("suggested-action");
+        save.set_sensitive(false);
+        let cancel = Button::with_label("Cancel");
+        let actions = GtkBox::new(Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&cancel);
+        actions.append(&save);
+        let body = GtkBox::new(Orientation::Vertical, 10);
+        body.append(&text);
+        body.append(&actions);
+        let dialog = self.themed_dialog("Add Note", &body);
+        text.buffer().connect_changed({
+            let save = save.clone();
+            move |buffer| {
+                let value = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                save.set_sensitive(!value.trim().is_empty());
+            }
+        });
+        cancel.connect_clicked({
+            let dialog = dialog.clone();
+            move |_| dialog.close()
+        });
+        save.connect_clicked({
+            let dialog = dialog.clone();
+            let text = text.clone();
+            let h = Handle(self.me.borrow().clone());
+            move |_| {
+                let buffer = text.buffer();
+                let value = buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                    .trim()
+                    .to_string();
+                if value.is_empty() {
+                    return;
+                }
+                dialog.close();
+                if let Some(ui) = h.get() {
+                    ui.create_annotation(AnnotationKind::Note { text: value });
+                }
+            }
+        });
+        dialog.present();
+        text.grab_focus();
+    }
+
+    fn delete_targeted_annotation(&self) {
+        let Some(id) = self.annotation_to_delete() else {
+            return;
+        };
+        let path = {
+            let st = self.inner.borrow();
+            let Some(doc) = st.doc.as_ref() else { return };
+            doc.path.clone()
+        };
+        let result = {
+            let st = self.inner.borrow();
+            st.annotations.as_ref().map(|store| {
+                let mut candidate = store.clone();
+                if !candidate.remove(&path, &id) {
+                    return Ok(candidate);
+                }
+                candidate.save().map(|_| candidate)
+            })
+        };
+        match result {
+            Some(Ok(candidate)) => {
+                let mut st = self.inner.borrow_mut();
+                st.annotations = Some(candidate);
+                if st.targeted_annotation.as_deref() == Some(id.as_str()) {
+                    st.targeted_annotation = None;
+                }
+                drop(st);
+                self.queue_pages_draw();
+                self.update_annotation_actions();
+            }
+            Some(Err(error)) => self.alert("Could not delete annotation", &error),
+            None => self.alert("Annotations unavailable", &self.annotation_store_error()),
+        }
+    }
+
+    fn annotation_at_view(&self, x: f64, y: f64, marker_only: bool) -> Option<Annotation> {
+        let (page, display_x, display_y) = self.hit_at(x, y)?;
+        let st = self.inner.borrow();
+        let doc = st.doc.as_ref()?;
+        let (page_width, page_height) = doc.size(page, 0);
+        let marker_radius = 11.0 / st.layout.scale.max(0.01);
+        st.annotations
+            .as_ref()?
+            .for_document(&doc.path)
+            .iter()
+            .rev()
+            .filter(|annotation| annotation.page == page)
+            .find(|annotation| {
+                let bounds =
+                    document_rect_to_display(annotation.rect, page_width, page_height, st.rotation);
+                if matches!(annotation.kind, AnnotationKind::Note { .. }) {
+                    let dx = display_x - (bounds.x + bounds.width);
+                    let dy = display_y - bounds.y;
+                    if dx * dx + dy * dy <= marker_radius * marker_radius {
+                        return true;
+                    }
+                }
+                !marker_only && document_rect_contains(bounds, display_x, display_y)
+            })
+            .cloned()
+    }
+
+    fn activate_note_at(&self, x: f64, y: f64) -> bool {
+        let Some(annotation) = self.annotation_at_view(x, y, true) else {
+            return false;
+        };
+        let AnnotationKind::Note { text } = annotation.kind else {
+            return false;
+        };
+        self.inner.borrow_mut().targeted_annotation = Some(annotation.id);
+        self.queue_pages_draw();
+        let label = Label::new(Some(&text));
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        label.set_selectable(true);
+        label.set_xalign(0.0);
+        label.set_max_width_chars(60);
+        self.themed_dialog("Annotation Note", &label).present();
+        true
+    }
+
+    fn target_annotation_at(&self, x: f64, y: f64) -> bool {
+        let replacement = self
+            .annotation_at_view(x, y, false)
+            .map(|annotation| annotation.id);
+        let found = replacement.is_some();
+        if replace_annotation_target(
+            &mut self.inner.borrow_mut().targeted_annotation,
+            replacement,
+        ) {
+            self.queue_pages_draw();
+        }
+        self.update_annotation_actions();
+        found
     }
 
     fn print_doc(&self) {
@@ -2011,54 +2912,275 @@ impl Lector {
     }
 
     fn show_properties(&self) {
-        let st = self.inner.borrow();
-        let Some(doc) = st.doc.as_ref() else {
-            return;
-        };
-        let body = format!(
-            "File: {}\nTitle: {}\nAuthor: {}\nSubject: {}\nCreator: {}\nProducer: {}\nPDF: {}\nPages: {}",
-            doc.path.display(),
-            doc.title,
-            doc.author.as_deref().unwrap_or("—"),
-            doc.subject.as_deref().unwrap_or("—"),
-            doc.creator.as_deref().unwrap_or("—"),
-            doc.producer.as_deref().unwrap_or("—"),
-            doc.pdf_version.as_deref().unwrap_or("—"),
-            doc.n_pages,
-        );
-        drop(st);
-        let alert = gtk::AlertDialog::builder()
-            .modal(true)
-            .message("Properties")
-            .detail(&body)
-            .build();
-        alert.show(Some(&self.window));
+        if let Some(dialog) = self.properties_dialog() {
+            dialog.present();
+        }
+    }
+
+    fn show_reading_history(&self) {
+        self.reading_history_dialog().present();
     }
 
     fn show_shortcuts(&self) {
-        let body = "\
-Ctrl+O  Open          Ctrl+S  Save a copy     Ctrl+P  Print
-Ctrl+F  Find          Ctrl+G  Find next       Ctrl+C  Copy text
-F9  Side pane         F11  Fullscreen         F5  Presentation
-c  Continuous         d  Dual                 s  Single page
-w  Fit width          a  Fit page             Ctrl+0  100%
-Ctrl++ / Ctrl+- / Ctrl+scroll  Zoom
-Ctrl+I  Invert        Ctrl+R  Rotate          n / p  Next / previous page";
-        let alert = gtk::AlertDialog::builder()
-            .modal(true)
-            .message("Keyboard shortcuts")
-            .detail(body)
-            .build();
-        alert.show(Some(&self.window));
+        self.shortcuts_dialog().present();
     }
 
     fn show_about(&self) {
-        let alert = gtk::AlertDialog::builder()
+        self.about_dialog().present();
+    }
+
+    fn themed_dialog(&self, title: &str, body: &impl IsA<gtk::Widget>) -> gtk::Window {
+        let win = gtk::Window::builder()
+            .transient_for(&self.window)
             .modal(true)
-            .message("Lector")
-            .detail("A native PDF viewer for Omarchy.\nPoppler rendering, live theme follow.\nLayout modelled on GNOME Document Viewer.")
+            .title(title)
+            .resizable(false)
+            .default_width(460)
             .build();
-        alert.show(Some(&self.window));
+        win.add_css_class("lector-window");
+        win.add_css_class("lector-dialog");
+        win.set_titlebar(None::<&gtk::Box>);
+
+        let title_label = Label::new(Some(title));
+        title_label.add_css_class("lector-dialog-title");
+        title_label.set_hexpand(true);
+        title_label.set_halign(gtk::Align::Start);
+        title_label.set_xalign(0.0);
+
+        let close = icon_pill("window-close-symbolic", "Close");
+        let header = GtkBox::new(Orientation::Horizontal, 2);
+        header.add_css_class("lector-toolbar");
+        header.append(&title_label);
+        header.append(&close);
+
+        let body_wrap = GtkBox::new(Orientation::Vertical, 0);
+        body_wrap.add_css_class("lector-dialog-body");
+        body_wrap.append(body);
+
+        let root = GtkBox::new(Orientation::Vertical, 0);
+        root.append(&header);
+        root.append(&body_wrap);
+        win.set_child(Some(&root));
+
+        let win_close = win.clone();
+        close.connect_clicked(move |_| {
+            win_close.close();
+        });
+        let keys = gtk::EventControllerKey::new();
+        let win_esc = win.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == Key::Escape {
+                win_esc.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        win.add_controller(keys);
+        win
+    }
+
+    fn shortcuts_dialog(&self) -> gtk::Window {
+        let left = GtkBox::new(Orientation::Vertical, 2);
+        let right = GtkBox::new(Orientation::Vertical, 2);
+        left.set_hexpand(true);
+        right.set_hexpand(true);
+        for section in shortcut_sections() {
+            let col = match section.heading {
+                "VIEW" | "NAVIGATION" => &right,
+                _ => &left,
+            };
+            col.append(&menu_heading(section.heading));
+            for row in section.rows {
+                col.append(&shortcut_row(row.action, row.keys));
+            }
+        }
+        let columns = GtkBox::new(Orientation::Horizontal, 28);
+        columns.append(&left);
+        columns.append(&right);
+        let scrolled = ScrolledWindow::new();
+        scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scrolled.set_max_content_height(520);
+        scrolled.set_propagate_natural_height(true);
+        scrolled.set_child(Some(&columns));
+        self.themed_dialog("Keyboard shortcuts", &scrolled)
+    }
+
+    fn reading_history_dialog(&self) -> gtk::Window {
+        let entries = self.inner.borrow().session.history(20);
+        let list = ListBox::new();
+        list.add_css_class("lector-history");
+        list.set_selection_mode(gtk::SelectionMode::Single);
+        if entries.is_empty() {
+            let empty = Label::new(Some("No reading history yet"));
+            empty.add_css_class("dim-label");
+            empty.set_margin_top(24);
+            empty.set_margin_bottom(24);
+            list.append(&empty);
+        } else {
+            for entry in &entries {
+                let row = gtk::ListBoxRow::new();
+                let text = GtkBox::new(Orientation::Vertical, 2);
+                text.set_hexpand(true);
+                let name = Label::new(Some(&entry.basename));
+                name.add_css_class("lector-menu-label");
+                name.set_halign(gtk::Align::Start);
+                name.set_xalign(0.0);
+                let path = Label::new(Some(&entry.path.display().to_string()));
+                path.add_css_class("lector-history-path");
+                path.set_halign(gtk::Align::Start);
+                path.set_xalign(0.0);
+                path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                text.append(&name);
+                text.append(&path);
+                let status_text = if entry.exists {
+                    format!("Page {}", entry.page)
+                } else {
+                    "Missing".into()
+                };
+                let status = Label::new(Some(&status_text));
+                status.add_css_class(if entry.exists {
+                    "lector-history-page"
+                } else {
+                    "lector-history-missing"
+                });
+                let content = GtkBox::new(Orientation::Horizontal, 12);
+                content.set_margin_top(7);
+                content.set_margin_bottom(7);
+                content.set_margin_start(4);
+                content.set_margin_end(4);
+                content.append(&text);
+                content.append(&status);
+                row.set_child(Some(&content));
+                row.set_sensitive(entry.exists);
+                list.append(&row);
+            }
+        }
+
+        let clear = Button::with_label("Clear History…");
+        clear.set_tooltip_text(Some("Requires confirmation; annotations are kept"));
+        clear.set_sensitive(!entries.is_empty());
+        clear.set_halign(gtk::Align::End);
+        let body = GtkBox::new(Orientation::Vertical, 10);
+        let scrolled = ScrolledWindow::new();
+        scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scrolled.set_min_content_height(160);
+        scrolled.set_max_content_height(520);
+        scrolled.set_propagate_natural_height(true);
+        scrolled.set_child(Some(&list));
+        body.append(&scrolled);
+        body.append(&clear);
+        let dialog = self.themed_dialog("Reading History", &body);
+        dialog.set_default_width(620);
+
+        let paths = Rc::new(
+            entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        list.connect_row_activated({
+            let paths = paths.clone();
+            let dialog = dialog.clone();
+            let h = Handle(self.me.borrow().clone());
+            move |_, row| {
+                let Some(path) = paths.get(row.index() as usize) else {
+                    return;
+                };
+                dialog.close();
+                if let Some(ui) = h.get() {
+                    ui.open_path(path, None);
+                }
+            }
+        });
+        clear.connect_clicked({
+            let dialog = dialog.clone();
+            let h = Handle(self.me.borrow().clone());
+            move |_| {
+                let confirmation = gtk::AlertDialog::builder()
+                    .modal(true)
+                    .message("Clear reading history?")
+                    .detail("This removes remembered documents and page positions. Annotations are not deleted.")
+                    .buttons(["Cancel", "Clear History"])
+                    .cancel_button(0)
+                    .default_button(0)
+                    .build();
+                let dialog_after = dialog.clone();
+                let h_after = h.clone();
+                confirmation.choose(Some(&dialog), gio::Cancellable::NONE, move |result| {
+                    if result != Ok(1) {
+                        return;
+                    }
+                    let Some(ui) = h_after.get() else { return };
+                    let result = {
+                        let st = ui.inner.borrow();
+                        let mut candidate = st.session.clone();
+                        candidate.clear_history_for_open_document(
+                            st.doc.as_ref().map(|document| document.path.as_path()),
+                        );
+                        candidate.save().map(|_| candidate)
+                    };
+                    match result {
+                        Ok(session) => {
+                            ui.inner.borrow_mut().session = session;
+                            dialog_after.close();
+                        }
+                        Err(error) => ui.alert("Could not clear history", &error),
+                    }
+                });
+            }
+        });
+        dialog
+    }
+
+    fn about_dialog(&self) -> gtk::Window {
+        let about = about_copy();
+        let col = GtkBox::new(Orientation::Vertical, 6);
+        col.set_halign(gtk::Align::Center);
+        col.set_valign(gtk::Align::Center);
+        let icon = Image::from_icon_name("org.omarchy.Lector");
+        icon.set_pixel_size(64);
+        let name = Label::new(Some(about.name));
+        name.add_css_class("lector-about-name");
+        let tagline = Label::new(Some(about.tagline));
+        tagline.add_css_class("lector-about-copy");
+        let detail = Label::new(Some(about.detail));
+        detail.add_css_class("lector-about-copy");
+        let version = Label::new(Some(about.version));
+        version.add_css_class("lector-about-version");
+        col.append(&icon);
+        col.append(&name);
+        col.append(&tagline);
+        col.append(&detail);
+        col.append(&version);
+        self.themed_dialog("About Lector", &col)
+    }
+
+    fn properties_dialog(&self) -> Option<gtk::Window> {
+        let st = self.inner.borrow();
+        let doc = st.doc.as_ref()?;
+        let fields = property_fields(doc);
+        drop(st);
+        let list = GtkBox::new(Orientation::Vertical, 8);
+        for (key, value) in fields {
+            let row = GtkBox::new(Orientation::Horizontal, 16);
+            let label = Label::new(Some(key));
+            label.add_css_class("lector-field-label");
+            label.set_xalign(0.0);
+            label.set_width_chars(9);
+            label.set_halign(gtk::Align::Start);
+            let val = Label::new(Some(&value));
+            val.add_css_class("lector-field-value");
+            val.set_hexpand(true);
+            val.set_xalign(0.0);
+            val.set_halign(gtk::Align::Start);
+            val.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            val.set_selectable(true);
+            row.append(&label);
+            row.append(&val);
+            list.append(&row);
+        }
+        Some(self.themed_dialog("Properties", &list))
     }
 
     fn reload(&self) {
@@ -2128,6 +3250,8 @@ Ctrl+I  Invert        Ctrl+R  Rotate          n / p  Next / previous page";
             self.page_total.set_text("/ 0");
             self.page_entry.set_text("");
         }
+        drop(st);
+        self.update_annotation_actions();
     }
 
     fn key(&self, key: Key, mods: gdk::ModifierType) -> glib::Propagation {
@@ -2147,6 +3271,15 @@ Ctrl+I  Invert        Ctrl+R  Rotate          n / p  Next / previous page";
                 return glib::Propagation::Stop;
             }
             return glib::Propagation::Proceed;
+        }
+
+        if let Some(shortcut) = annotation_shortcut(key, mods) {
+            match shortcut {
+                AnnotationShortcut::History => self.show_reading_history(),
+                AnnotationShortcut::Highlight => self.add_highlight(),
+                AnnotationShortcut::Note => self.add_note(),
+            }
+            return glib::Propagation::Stop;
         }
 
         if ctrl {
@@ -2259,6 +3392,10 @@ Ctrl+I  Invert        Ctrl+R  Rotate          n / p  Next / previous page";
                 self.toggle_sidebar();
                 glib::Propagation::Stop
             }
+            Key::Delete => {
+                self.delete_targeted_annotation();
+                glib::Propagation::Stop
+            }
             Key::slash => {
                 self.show_search();
                 glib::Propagation::Stop
@@ -2316,6 +3453,14 @@ Ctrl+I  Invert        Ctrl+R  Rotate          n / p  Next / previous page";
     }
 }
 
+fn document_rect_contains(rect: DocumentRect, x: f64, y: f64) -> bool {
+    x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
+}
+
+fn document_rects_intersect(a: DocumentRect, b: DocumentRect) -> bool {
+    a.x <= b.x + b.width && a.x + a.width >= b.x && a.y <= b.y + b.height && a.y + a.height >= b.y
+}
+
 fn should_toggle_fit(click_count: i32, has_link: bool, first_was_link: bool) -> bool {
     click_count == 2 && !has_link && !first_was_link
 }
@@ -2368,6 +3513,22 @@ fn menu_heading(text: &str) -> Label {
     l
 }
 
+fn shortcut_row(action: &str, keys: &str) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.add_css_class("lector-shortcut-row");
+    let name = Label::new(Some(action));
+    name.add_css_class("lector-menu-label");
+    name.set_halign(gtk::Align::Start);
+    name.set_hexpand(true);
+    name.set_xalign(0.0);
+    let key = Label::new(Some(keys));
+    key.add_css_class("lector-menu-key");
+    key.set_halign(gtk::Align::End);
+    row.append(&name);
+    row.append(&key);
+    row
+}
+
 fn menu_check_row(label: &str, shortcut: &str) -> CheckButton {
     let item = CheckButton::new();
     item.update_property(&[gtk::accessible::Property::Label(label)]);
@@ -2392,20 +3553,14 @@ fn menu_check_row(label: &str, shortcut: &str) -> CheckButton {
     item
 }
 
-fn menu_row(
-    icon: &str,
-    label: &str,
-    shortcut: &str,
-    pop: &Popover,
-    h: &Handle,
-    f: fn(&Lector),
-) -> Button {
+fn bare_menu_row(icon: &str, label: &str, shortcut: &str) -> Button {
     let b = Button::new();
     b.add_css_class("lector-menu-item");
     b.add_css_class("flat");
     b.set_halign(gtk::Align::Fill);
     b.set_hexpand(true);
     b.set_has_frame(false);
+    b.set_tooltip_text(Some(label));
 
     let row = GtkBox::new(Orientation::Horizontal, 10);
     let ico = Image::from_icon_name(icon);
@@ -2425,15 +3580,30 @@ fn menu_row(
         row.append(&key);
     }
     b.set_child(Some(&row));
+    b
+}
 
+fn connect_menu_row(button: &Button, pop: &Popover, h: &Handle, f: fn(&Lector)) {
     let pop = pop.clone();
     let h = h.clone();
-    b.connect_clicked(move |_| {
+    button.connect_clicked(move |_| {
         pop.popdown();
         if let Some(ui) = h.get() {
             f(&ui);
         }
     });
+}
+
+fn menu_row(
+    icon: &str,
+    label: &str,
+    shortcut: &str,
+    pop: &Popover,
+    h: &Handle,
+    f: fn(&Lector),
+) -> Button {
+    let b = bare_menu_row(icon, label, shortcut);
+    connect_menu_row(&b, pop, h, f);
     b
 }
 
@@ -2472,6 +3642,18 @@ fn menu_pres(ui: &Lector) {
 }
 fn menu_reload(ui: &Lector) {
     ui.reload();
+}
+fn menu_highlight(ui: &Lector) {
+    ui.add_highlight();
+}
+fn menu_note(ui: &Lector) {
+    ui.add_note();
+}
+fn menu_delete_annotation(ui: &Lector) {
+    ui.delete_targeted_annotation();
+}
+fn menu_history(ui: &Lector) {
+    ui.show_reading_history();
 }
 fn menu_props(ui: &Lector) {
     ui.show_properties();
@@ -2681,5 +3863,159 @@ mod tests {
             session::parse_zoom(&restored.zoom, restored.custom),
             Zoom::Custom(1.4)
         );
+    }
+
+    #[test]
+    fn ctrl_scroll_zoom_uses_stepped_wheel_and_smooth_touchpad_deltas() {
+        assert_eq!(ctrl_scroll_zoom_factor(0.0), 1.0);
+        assert_eq!(ctrl_scroll_zoom_factor(-1.0), 1.1);
+        assert_eq!(ctrl_scroll_zoom_factor(1.0), 1.0 / 1.1);
+        assert!((ctrl_scroll_zoom_factor(-0.2) - 1.1_f64.powf(0.2)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pinch_and_factor_zoom_clamp_to_supported_range() {
+        assert_eq!(pinch_target_scale(1.0, 2.0), 2.0);
+        assert_eq!(pinch_target_scale(1.0, 0.01), 0.1);
+        assert_eq!(pinch_target_scale(8.0, 4.0), MAX_ZOOM);
+        assert_eq!(zoom_from_factor(1.0, 1.15), Zoom::Custom(1.15));
+        assert_eq!(zoom_from_factor(0.1, 0.5), Zoom::Custom(0.1));
+        assert_eq!(zoom_from_factor(10.0, 4.0), Zoom::Custom(MAX_ZOOM));
+        assert!(pinch_scale_is_meaningful(1.0, 1.03));
+        assert!(!pinch_scale_is_meaningful(1.0, 1.01));
+    }
+
+    #[test]
+    fn zoom_restores_the_content_point_under_the_viewport_focus() {
+        let anchor = ViewportAnchor {
+            content_x: 100.0,
+            content_y: 200.0,
+            view_x: 40.0,
+            view_y: 50.0,
+            scale: 1.0,
+        };
+        assert_eq!(restored_scroll(anchor, 2.0), (160.0, 350.0));
+        assert_eq!(clamp_adjustment(500.0, 0.0, 400.0, 100.0), 300.0);
+        assert_eq!(clamp_adjustment(-10.0, 0.0, 400.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn same_page_scroll_does_not_request_a_chrome_update() {
+        assert_eq!(continuous_scroll_page_changed(0, 0), None);
+        assert_eq!(continuous_scroll_page_changed(2, 2), None);
+        assert_eq!(continuous_scroll_page_changed(0, 4), Some(4));
+    }
+
+    #[test]
+    fn shortcut_overlay_is_grouped_like_the_app_menu() {
+        let headings: Vec<_> = shortcut_sections().iter().map(|s| s.heading).collect();
+        assert_eq!(
+            headings,
+            [
+                "FILE",
+                "ANNOTATIONS",
+                "VIEW",
+                "FIND",
+                "NAVIGATION",
+                "DOCUMENT"
+            ]
+        );
+        assert!(shortcut_sections().iter().any(|section| {
+            section
+                .rows
+                .iter()
+                .any(|row| row.action == "Open" && row.keys == "Ctrl+O")
+        }));
+        assert!(shortcut_sections()
+            .iter()
+            .any(|section| section.rows.iter().any(|row| row.action == "Pinch to zoom")));
+        assert!(shortcut_sections().iter().any(|section| section
+            .rows
+            .iter()
+            .any(|row| row.action == "Highlight selection" && row.keys == "Ctrl+Shift+H")));
+    }
+
+    #[test]
+    fn shifted_annotation_shortcuts_accept_uppercase_keyvals() {
+        let modifiers = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+        assert_eq!(
+            annotation_shortcut(Key::H, modifiers),
+            Some(AnnotationShortcut::Highlight)
+        );
+        assert_eq!(
+            annotation_shortcut(Key::N, modifiers),
+            Some(AnnotationShortcut::Note)
+        );
+        assert_eq!(
+            annotation_shortcut(Key::h, gdk::ModifierType::CONTROL_MASK),
+            Some(AnnotationShortcut::History)
+        );
+    }
+
+    #[test]
+    fn beginning_selection_and_empty_annotation_hits_clear_the_old_target() {
+        let mut selection = None;
+        let mut targeted = Some("old-annotation".to_string());
+        begin_selection_state(&mut selection, &mut targeted, Some((2, 10.0, 20.0)));
+        let selection = selection.expect("selection begins at the hit");
+        assert_eq!(selection.page, 2);
+        assert_eq!((selection.x1, selection.y1), (10.0, 20.0));
+        assert_eq!((selection.x2, selection.y2), (10.0, 20.0));
+        assert_eq!(targeted, None);
+
+        targeted = Some("another-annotation".to_string());
+        assert!(replace_annotation_target(&mut targeted, None));
+        assert_eq!(targeted, None);
+    }
+
+    #[test]
+    fn rotation_clears_display_coordinate_selection() {
+        let mut rotation = 270;
+        let mut selection = Some(Selection {
+            page: 0,
+            x1: 10.0,
+            y1: 20.0,
+            x2: 30.0,
+            y2: 40.0,
+        });
+
+        rotate_view_state(&mut rotation, &mut selection, 90);
+
+        assert_eq!(rotation, 0);
+        assert!(selection.is_none());
+    }
+
+    #[test]
+    fn document_properties_use_em_dash_for_missing_metadata() {
+        assert_eq!(display_meta(None), "—");
+        assert_eq!(display_meta(Some("")), "—");
+        assert_eq!(display_meta(Some("  ")), "—");
+        assert_eq!(display_meta(Some("Hanky")), "Hanky");
+        let path = crate::doc::write_test_pdf("props-meta", &["BT /F1 20 Tf 72 700 Td (hi) Tj ET"]);
+        let doc = crate::doc::OpenDoc::open(&path, None).expect("fixture pdf");
+        let rows = property_fields(&doc);
+        assert!(rows.iter().any(|(key, value)| *key == "File"
+            && Path::new(value)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("props-meta"))));
+        assert!(rows
+            .iter()
+            .any(|(key, value)| *key == "Pages" && value == "1"));
+        for key in ["Author", "Subject"] {
+            assert!(
+                rows.iter().any(|(k, v)| *k == key && v == "—"),
+                "{key} should use an em dash when Poppler has no value"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn about_copy_names_lector_not_a_generic_toolkit_dialog() {
+        let about = about_copy();
+        assert_eq!(about.name, "Lector");
+        assert_eq!(about.tagline, "Native PDF viewer for Omarchy");
+        assert_eq!(about.version, env!("CARGO_PKG_VERSION"));
+        assert!(!about.detail.contains("GNOME"));
     }
 }

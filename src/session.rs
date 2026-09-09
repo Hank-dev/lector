@@ -11,16 +11,24 @@ use crate::view::{LayoutMode, Zoom};
 const MAX_FILES: usize = 200;
 static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Session {
     pub files: HashMap<String, FileState>,
     #[serde(default)]
     pub recent: Vec<String>,
+    #[serde(default)]
+    history_generation: u64,
     pub sidebar: String,
     pub invert: bool,
     pub layout: String,
     #[serde(skip)]
     dirty_files: HashSet<String>,
+    #[serde(skip)]
+    history_cleared: bool,
+    #[serde(skip)]
+    loaded_history_generation: u64,
+    #[serde(skip)]
+    suppressed_history_path: Option<String>,
     #[serde(skip)]
     loaded_sidebar: String,
     #[serde(skip)]
@@ -34,6 +42,14 @@ pub struct FileState {
     pub page: i32,
     pub zoom: String,
     pub custom: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub path: PathBuf,
+    pub basename: String,
+    pub page: i32,
+    pub exists: bool,
 }
 
 impl Default for FileState {
@@ -93,19 +109,27 @@ impl Session {
     }
 
     fn merge_dirty(&mut self, dirty: &Session) {
+        if dirty.history_cleared && dirty.history_generation >= self.history_generation {
+            self.files.clear();
+            self.recent.clear();
+            self.history_generation = dirty.history_generation;
+        }
         // Replay surviving updates in reading order. Local retention eviction
         // is not an explicit deletion of another window's newer state.
-        for key in dirty
-            .recent
-            .iter()
-            .filter(|key| dirty.dirty_files.contains(*key))
-        {
-            if let Some(state) = dirty.files.get(key) {
-                self.files.insert(key.clone(), state.clone());
-                self.recent.retain(|recent| recent != key);
-                self.recent.push(key.clone());
+        if dirty.loaded_history_generation >= self.history_generation {
+            for key in dirty
+                .recent
+                .iter()
+                .filter(|key| dirty.dirty_files.contains(*key))
+            {
+                if let Some(state) = dirty.files.get(key) {
+                    self.files.insert(key.clone(), state.clone());
+                    self.recent.retain(|recent| recent != key);
+                    self.recent.push(key.clone());
+                }
             }
         }
+        self.suppressed_history_path = dirty.suppressed_history_path.clone();
         if dirty.sidebar != dirty.loaded_sidebar {
             self.sidebar = dirty.sidebar.clone();
         }
@@ -120,6 +144,8 @@ impl Session {
 
     fn mark_clean(&mut self) {
         self.dirty_files.clear();
+        self.history_cleared = false;
+        self.loaded_history_generation = self.history_generation;
         self.loaded_sidebar = self.sidebar.clone();
         self.loaded_invert = self.invert;
         self.loaded_layout = self.layout.clone();
@@ -149,6 +175,10 @@ impl Session {
 
     pub fn remember(&mut self, path: &Path, page: i32, zoom: Zoom) {
         let key = path.to_string_lossy().into_owned();
+        if self.suppressed_history_path.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.suppressed_history_path = None;
         self.files.insert(
             key.clone(),
             FileState {
@@ -168,6 +198,45 @@ impl Session {
 
     pub fn restore(&self, path: &Path) -> Option<FileState> {
         self.files.get(path.to_string_lossy().as_ref()).cloned()
+    }
+
+    pub fn history(&self, limit: usize) -> Vec<HistoryEntry> {
+        self.recent
+            .iter()
+            .rev()
+            .filter_map(|key| {
+                let state = self.files.get(key)?;
+                let path = PathBuf::from(key);
+                let basename = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| key.clone());
+                Some(HistoryEntry {
+                    exists: path.is_file(),
+                    path,
+                    basename,
+                    page: state.page.saturating_add(1),
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+
+    pub fn clear_history(&mut self) {
+        self.files.clear();
+        self.recent.clear();
+        self.dirty_files.clear();
+        self.history_generation = self
+            .history_generation
+            .max(self.loaded_history_generation)
+            .saturating_add(1);
+        self.history_cleared = true;
+    }
+
+    pub fn clear_history_for_open_document(&mut self, open_path: Option<&Path>) {
+        self.clear_history();
+        self.suppressed_history_path = open_path.map(|path| path.to_string_lossy().into_owned());
     }
 }
 
@@ -438,6 +507,130 @@ mod tests {
         second.save_to(&path).unwrap();
         assert!(Session::load_from_path(&path).invert);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn history_projection_is_newest_first_capped_and_marks_missing_files() {
+        let root = test_path("history-projection")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut session = Session::default();
+        for index in 0..25 {
+            let path = root.join(format!("book-{index}.pdf"));
+            fs::write(&path, b"pdf fixture placeholder").unwrap();
+            session.remember(&path, index, Zoom::Actual);
+        }
+        let missing = root.join("book-23.pdf");
+        fs::remove_file(&missing).unwrap();
+
+        let history = session.history(20);
+        assert_eq!(history.len(), 20);
+        assert_eq!(history[0].basename, "book-24.pdf");
+        assert_eq!(history[0].page, 25);
+        assert_eq!(history[1].path, missing);
+        assert!(!history[1].exists);
+        assert_eq!(history[19].basename, "book-5.pdf");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clearing_history_persists_without_stale_writer_resurrection() {
+        let path = test_path("clear-history");
+        let mut initial = Session::default();
+        initial.remember(Path::new("/documents/old-a.pdf"), 1, Zoom::Actual);
+        initial.remember(Path::new("/documents/old-b.pdf"), 2, Zoom::Actual);
+        initial.save_to(&path).unwrap();
+
+        let mut clearer = Session::load_from_path(&path);
+        let mut stale = Session::load_from_path(&path);
+        stale.remember(Path::new("/documents/new.pdf"), 3, Zoom::Actual);
+        clearer.clear_history();
+        clearer.save_to(&path).unwrap();
+        stale.save_to(&path).unwrap();
+
+        let merged = Session::load_from_path(&path);
+        assert!(merged.recent.is_empty());
+        assert!(merged.restore(Path::new("/documents/old-a.pdf")).is_none());
+        assert!(merged.restore(Path::new("/documents/old-b.pdf")).is_none());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn clear_epoch_blocks_same_path_updates_from_a_stale_session() {
+        let path = test_path("clear-history-same-path");
+        let document = Path::new("/documents/already-open.pdf");
+        let mut initial = Session::default();
+        initial.remember(document, 1, Zoom::Actual);
+        initial.save_to(&path).unwrap();
+
+        let mut stale = Session::load_from_path(&path);
+        let mut clearer = Session::load_from_path(&path);
+        let stale_generation = stale.loaded_history_generation;
+        stale.remember(document, 8, Zoom::Custom(1.5));
+        clearer.clear_history();
+        clearer.save_to(&path).unwrap();
+        stale.save_to(&path).unwrap();
+
+        let merged = Session::load_from_path(&path);
+        assert!(merged.restore(document).is_none());
+        assert!(merged.history_generation > stale_generation);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn session_loaded_after_clear_can_add_new_history() {
+        let path = test_path("post-clear-history");
+        let mut initial = remembered(2);
+        initial.save_to(&path).unwrap();
+        initial.clear_history();
+        initial.save_to(&path).unwrap();
+
+        let mut post_clear = Session::load_from_path(&path);
+        post_clear.remember(Path::new("/documents/new.pdf"), 4, Zoom::FitPage);
+        post_clear.save_to(&path).unwrap();
+
+        let merged = Session::load_from_path(&path);
+        assert_eq!(merged.recent, vec!["/documents/new.pdf"]);
+        assert_eq!(merged.history_generation, post_clear.history_generation);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn clearing_while_open_suppresses_reload_and_close_until_a_different_document_opens() {
+        let path = test_path("clear-open-document");
+        let open = Path::new("/documents/open.pdf");
+        let different = Path::new("/documents/different.pdf");
+        let mut session = Session::default();
+        session.remember(open, 2, Zoom::Actual);
+        session.clear_history_for_open_document(Some(open));
+        session.save_to(&path).unwrap();
+
+        session.remember(open, 3, Zoom::FitPage); // reload
+        session.remember(open, 4, Zoom::Custom(1.2)); // close persistence
+        session.save_to(&path).unwrap();
+        assert!(Session::load_from_path(&path).restore(open).is_none());
+
+        session.remember(different, 5, Zoom::Actual);
+        session.remember(open, 6, Zoom::Actual);
+        session.save_to(&path).unwrap();
+        let reloaded = Session::load_from_path(&path);
+        assert!(reloaded.restore(different).is_some());
+        assert!(reloaded.restore(open).is_some());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_session_without_history_generation_defaults_to_zero() {
+        let legacy = r#"
+files = {}
+recent = []
+sidebar = "thumbs"
+invert = false
+layout = "continuous"
+"#;
+        let session: Session = toml::from_str(legacy).unwrap();
+        assert_eq!(session.history_generation, 0);
     }
 
     #[cfg(unix)]
