@@ -76,18 +76,6 @@ fn actual_window_navigation_presentation_search_and_reload() {
         &["BT /F1 20 Tf 72 700 Td (needle) Tj ET"; 2],
     );
     ui.open_path(&long, None);
-    let scroll = ui.scrolled.vadjustment();
-    scroll.configure(100.0, 0.0, 1000.0, 64.0, 270.0, 300.0);
-    assert_eq!(
-        ui.key(Key::Down, gdk::ModifierType::empty()),
-        glib::Propagation::Stop
-    );
-    assert_eq!(scroll.value(), 164.0);
-    assert_eq!(
-        ui.key(Key::Up, gdk::ModifierType::empty()),
-        glib::Propagation::Stop
-    );
-    assert_eq!(scroll.value(), 100.0);
     ui.inner.borrow_mut().annotations = Some(AnnotationStore::default());
     ui.inner.borrow_mut().selection = Some(Selection {
         page: 0,
@@ -265,6 +253,42 @@ fn actual_window_info_dialogs_use_lector_chrome() {
         );
     }
     history.destroy();
+
+    ui.hold.borrow_mut().take();
+    std::fs::remove_file(pdf).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_continuous_arrow_key_scroll_releases_state_before_adjustment_signal() {
+    gtk::init().expect("GTK display required");
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorArrowScrollRegression")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    let pdf = crate::doc::write_test_pdf(
+        "arrow-scroll",
+        &["BT /F1 20 Tf 72 700 Td (scroll) Tj ET"; 3],
+    );
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Continuous);
+    ui.open_path(&pdf, None);
+    ui.inner.borrow_mut().ignore_scroll = false;
+
+    let scroll = ui.scrolled.vadjustment();
+    scroll.configure(100.0, 0.0, 1000.0, 64.0, 270.0, 300.0);
+    assert_eq!(
+        ui.key(Key::Down, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert_eq!(scroll.value(), 164.0);
+    assert_eq!(
+        ui.key(Key::Up, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert_eq!(scroll.value(), 100.0);
 
     ui.hold.borrow_mut().take();
     std::fs::remove_file(pdf).unwrap();

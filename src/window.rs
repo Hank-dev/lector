@@ -3395,9 +3395,10 @@ impl Lector {
         }
 
         if !ctrl && !shift {
+            let mode = self.inner.borrow().layout_mode;
             let adjustment = self.scrolled.vadjustment();
             if let Some(target) = continuous_arrow_scroll_target(
-                self.inner.borrow().layout_mode,
+                mode,
                 key,
                 adjustment.value(),
                 adjustment.lower(),
