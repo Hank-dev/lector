@@ -32,6 +32,16 @@ fn widget_tree_has_css_class(widget: &gtk::Widget, class: &str) -> bool {
     false
 }
 
+fn wait_for_view_restore(ui: &Lector, context: &glib::MainContext) {
+    for _ in 0..512 {
+        if !ui.inner.borrow().ignore_scroll {
+            return;
+        }
+        context.iteration(true);
+    }
+    assert!(!ui.inner.borrow().ignore_scroll, "view restore timed out");
+}
+
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_window_navigation_presentation_search_and_reload() {
@@ -96,13 +106,27 @@ fn actual_window_navigation_presentation_search_and_reload() {
     assert!(!ui.single_item.is_active());
     assert_eq!(
         ui.invert_item.is_active(),
-        ui.inner.borrow().invert,
-        "inversion menu state must reflect the active preference"
+        ui.inner.borrow().pdf_mode == PdfMode::Inverted,
+        "inverted menu state must reflect the active preference"
+    );
+    assert_eq!(
+        ui.normal_item.is_active(),
+        ui.inner.borrow().pdf_mode == PdfMode::Normal,
+        "normal menu state must reflect the active preference"
+    );
+    assert_eq!(
+        ui.omarchy_item.is_active(),
+        ui.inner.borrow().pdf_mode == PdfMode::Omarchy,
+        "Omarchy menu state must reflect the active preference"
     );
     ui.dual_item.set_active(true);
     assert_eq!(ui.inner.borrow().layout_mode, LayoutMode::Dual);
-    ui.invert_item.set_active(!ui.invert_item.is_active());
-    assert_eq!(ui.inner.borrow().invert, ui.invert_item.is_active());
+    ui.omarchy_item.set_active(true);
+    assert_eq!(ui.inner.borrow().pdf_mode, PdfMode::Omarchy);
+    ui.normal_item.set_active(true);
+    assert_eq!(ui.inner.borrow().pdf_mode, PdfMode::Normal);
+    ui.invert_item.set_active(true);
+    assert_eq!(ui.inner.borrow().pdf_mode, PdfMode::Inverted);
     ui.set_layout(LayoutMode::Single);
     assert!(ui.single_item.is_active());
     assert!(!ui.cont_item.is_active());
@@ -255,6 +279,60 @@ fn actual_window_info_dialogs_use_lector_chrome() {
     history.destroy();
 
     ui.hold.borrow_mut().take();
+    std::fs::remove_file(pdf).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_pinch_zoom_keeps_anchor_and_page_during_reflow() {
+    gtk::init().expect("GTK display required");
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorPinchRegression")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.window.present();
+    let context = glib::MainContext::default();
+    for _ in 0..64 {
+        context.iteration(false);
+    }
+
+    let pdf = crate::doc::write_test_pdf(
+        "pinch-anchor",
+        &["BT /F1 20 Tf 72 700 Td (pinch) Tj ET"; 30],
+    );
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Continuous);
+    ui.open_path(&pdf, None);
+    ui.goto_page(15);
+    wait_for_view_restore(&ui, &context);
+
+    let page_before = ui.inner.borrow().page;
+    let start_scale = ui.inner.borrow().layout.scale;
+    let anchor = ui.capture_anchor(Some((300.0, 260.0)));
+    let (first_zoom, first_restore) = pinch_zoom_update(start_scale, 1.2, anchor);
+    ui.set_zoom_restore(first_zoom, first_restore);
+    assert_eq!(
+        ui.inner.borrow().page,
+        page_before,
+        "temporary adjustment signals during pinch reflow must not change pages"
+    );
+    let (final_zoom, final_restore) = pinch_zoom_update(start_scale, 1.5, anchor);
+    ui.set_zoom_restore(final_zoom, final_restore);
+    wait_for_view_restore(&ui, &context);
+    let final_scale = ui.inner.borrow().layout.scale;
+    let (_, expected_y) = restored_scroll(anchor, final_scale);
+    let v = ui.scrolled.vadjustment();
+    let expected_y = clamp_adjustment(expected_y, v.lower(), v.upper(), v.page_size());
+    assert!(
+        (v.value() - expected_y).abs() < 1.0,
+        "pinch must restore the original focal point: got {}, expected {expected_y}",
+        v.value()
+    );
+
+    ui.hold.borrow_mut().take();
+    ui.window.destroy();
     std::fs::remove_file(pdf).unwrap();
 }
 

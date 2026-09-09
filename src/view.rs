@@ -6,6 +6,34 @@ use poppler::{Color, Rectangle, SelectionStyle};
 
 use crate::annotations::{document_rect_to_display, Annotation, AnnotationKind, DocumentRect};
 use crate::doc::OpenDoc;
+use crate::theme::PdfPalette;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PdfMode {
+    Normal,
+    Inverted,
+    Omarchy,
+}
+
+impl PdfMode {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Inverted => "inverted",
+            Self::Omarchy => "omarchy",
+        }
+    }
+
+    pub fn parse(value: &str, legacy_invert: bool) -> Self {
+        match value {
+            "normal" => Self::Normal,
+            "inverted" => Self::Inverted,
+            "omarchy" => Self::Omarchy,
+            _ if legacy_invert => Self::Inverted,
+            _ => Self::Normal,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Zoom {
@@ -114,12 +142,21 @@ pub fn raster_cache_needs_reset(
     new_scale: f64,
     old_rotation: i32,
     new_rotation: i32,
-    old_invert: bool,
-    new_invert: bool,
+    old_mode: PdfMode,
+    new_mode: PdfMode,
 ) -> bool {
-    old_rotation != new_rotation
-        || old_invert != new_invert
-        || (old_scale - new_scale).abs() > 0.001
+    old_rotation != new_rotation || old_mode != new_mode || (old_scale - new_scale).abs() > 0.001
+}
+
+pub fn raster_cache_needs_clear(
+    _old_scale: f64,
+    _new_scale: f64,
+    old_rotation: i32,
+    new_rotation: i32,
+    old_mode: PdfMode,
+    new_mode: PdfMode,
+) -> bool {
+    old_rotation != new_rotation || old_mode != new_mode
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -128,18 +165,30 @@ pub struct RasterKey {
     pub width: i32,
     pub height: i32,
     pub rotation: i32,
-    pub invert: bool,
+    pub pdf_mode: PdfMode,
+    pub palette: PdfPalette,
 }
 
 impl RasterKey {
-    pub fn from_geom(geom: &PageGeom, rotation: i32, invert: bool, dpr: f64) -> Self {
+    pub fn from_geom(
+        geom: &PageGeom,
+        rotation: i32,
+        pdf_mode: PdfMode,
+        palette: PdfPalette,
+        dpr: f64,
+    ) -> Self {
         let dpr = dpr.max(1.0);
         Self {
             index: geom.index,
             width: (geom.w * dpr).ceil().max(1.0) as i32,
             height: (geom.h * dpr).ceil().max(1.0) as i32,
             rotation,
-            invert,
+            pdf_mode,
+            palette: if pdf_mode == PdfMode::Omarchy {
+                palette
+            } else {
+                PdfPalette::default()
+            },
         }
     }
 }
@@ -163,6 +212,16 @@ impl RasterCache {
         let surf = self.map.get(key)?.clone();
         self.touch(key);
         Some(surf)
+    }
+
+    pub fn get_page(&mut self, index: i32) -> Option<ImageSurface> {
+        let key = self
+            .lru
+            .iter()
+            .rev()
+            .find(|key| key.index == index)
+            .copied()?;
+        self.get(&key)
     }
 
     pub fn contains(&self, key: &RasterKey) -> bool {
@@ -204,12 +263,13 @@ pub fn raster_page(
     doc: &OpenDoc,
     geom: &PageGeom,
     rotation: i32,
-    invert: bool,
+    pdf_mode: PdfMode,
+    palette: PdfPalette,
     dpr: f64,
 ) -> Option<ImageSurface> {
     let dpr = dpr.max(1.0);
-    let key = RasterKey::from_geom(geom, rotation, invert, dpr);
-    let surf = ImageSurface::create(Format::ARgb32, key.width, key.height).ok()?;
+    let key = RasterKey::from_geom(geom, rotation, pdf_mode, palette, dpr);
+    let mut surf = ImageSurface::create(Format::ARgb32, key.width, key.height).ok()?;
     {
         let cr = Context::new(&surf).ok()?;
         cr.scale(dpr, dpr);
@@ -219,14 +279,77 @@ pub fn raster_page(
                 doc,
                 geom,
                 rotation,
-                invert,
+                invert: pdf_mode == PdfMode::Inverted,
                 selection: None,
                 search_hits: &[],
                 current_hit: None,
             },
         );
     }
+    if pdf_mode == PdfMode::Omarchy {
+        theme_surface(&mut surf, palette)?;
+    }
     Some(surf)
+}
+
+fn rendered_rgb(source: [u8; 3], mode: PdfMode, palette: PdfPalette) -> [u8; 3] {
+    match mode {
+        PdfMode::Normal => source,
+        PdfMode::Inverted => source.map(|channel| 255 - channel),
+        PdfMode::Omarchy => themed_rgb(source, palette, false),
+    }
+}
+
+fn themed_rgb(source: [u8; 3], palette: PdfPalette, invert: bool) -> [u8; 3] {
+    let source = source.map(|channel| {
+        let channel = if invert { 255 - channel } else { channel };
+        channel as f64 / 255.0
+    });
+    let luma = 0.2126 * source[0] + 0.7152 * source[1] + 0.0722 * source[2];
+    let chroma = source.iter().copied().fold(f64::MIN, f64::max)
+        - source.iter().copied().fold(f64::MAX, f64::min);
+    let preserve = (chroma * 1.1).clamp(0.0, 0.72);
+    let mut output = [0; 3];
+    for channel in 0..3 {
+        let paper = palette.paper[channel] as f64 / 255.0;
+        let ink = palette.ink[channel] as f64 / 255.0;
+        let toned = ink * (1.0 - luma) + paper * luma;
+        let mixed = toned * (1.0 - preserve) + source[channel] * preserve;
+        output[channel] = (mixed.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+
+    let color_luma = |rgb: [u8; 3]| {
+        (0.2126 * rgb[0] as f64 + 0.7152 * rgb[1] as f64 + 0.0722 * rgb[2] as f64) / 255.0
+    };
+    if color_luma(palette.paper) + 0.1 < color_luma(palette.ink) && chroma > 0.08 {
+        let lift = ((chroma - 0.05) * 0.8).clamp(0.0, 0.30);
+        for (channel, ink) in output.iter_mut().zip(palette.ink) {
+            *channel = (*channel as f64 * (1.0 - lift) + ink as f64 * lift).round() as u8;
+        }
+    }
+    output
+}
+
+fn theme_surface(surface: &mut ImageSurface, palette: PdfPalette) -> Option<()> {
+    surface.flush();
+    let width = surface.width() as usize;
+    let height = surface.height() as usize;
+    let stride = surface.stride() as usize;
+    {
+        let mut data = surface.data().ok()?;
+        for row in data.chunks_exact_mut(stride).take(height) {
+            let (pixels, _) = row[..width * 4].as_chunks_mut::<4>();
+            for pixel in pixels {
+                let mapped =
+                    rendered_rgb([pixel[2], pixel[1], pixel[0]], PdfMode::Omarchy, palette);
+                pixel[0] = mapped[2];
+                pixel[1] = mapped[1];
+                pixel[2] = mapped[0];
+            }
+        }
+    }
+    surface.mark_dirty();
+    Some(())
 }
 
 pub fn paint_raster(cr: &Context, surf: &ImageSurface, css_w: f64, css_h: f64) {
@@ -662,12 +785,13 @@ pub fn thumbnail(
     index: i32,
     css_width: f64,
     dpr: f64,
-    invert: bool,
+    pdf_mode: PdfMode,
+    palette: PdfPalette,
 ) -> Option<ImageSurface> {
     let page = doc.page(index)?;
     let (pw, ph) = page.size();
     let (w, h) = thumbnail_pixel_size(pw, ph, css_width, dpr);
-    let surf = ImageSurface::create(Format::ARgb32, w, h).ok()?;
+    let mut surf = ImageSurface::create(Format::ARgb32, w, h).ok()?;
     {
         let cr = Context::new(&surf).ok()?;
         cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -675,11 +799,14 @@ pub fn thumbnail(
         let scale = w as f64 / pw.max(1.0);
         cr.scale(scale, scale);
         page.render(&cr);
-        if invert {
+        if pdf_mode == PdfMode::Inverted {
             cr.set_operator(Operator::Difference);
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.paint().ok()?;
         }
+    }
+    if pdf_mode == PdfMode::Omarchy {
+        theme_surface(&mut surf, palette)?;
     }
     Some(surf)
 }
@@ -687,6 +814,69 @@ pub fn thumbnail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::PdfPalette;
+
+    #[test]
+    fn pdf_modes_keep_normal_invert_and_omarchy_distinct() {
+        let palette = PdfPalette {
+            paper: [16, 32, 48],
+            ink: [208, 224, 240],
+        };
+        let source = [10, 40, 90];
+
+        assert_eq!(rendered_rgb(source, PdfMode::Normal, palette), source);
+        assert_eq!(
+            rendered_rgb(source, PdfMode::Inverted, palette),
+            [245, 215, 165]
+        );
+        assert_ne!(rendered_rgb(source, PdfMode::Omarchy, palette), source);
+    }
+
+    #[test]
+    fn pdf_neutrals_are_mapped_between_omarchy_ink_and_paper() {
+        let palette = PdfPalette {
+            paper: [16, 32, 48],
+            ink: [208, 224, 240],
+        };
+
+        assert_eq!(themed_rgb([0, 0, 0], palette, false), palette.ink);
+        assert_eq!(themed_rgb([255, 255, 255], palette, false), palette.paper);
+        assert_eq!(themed_rgb([0, 0, 0], palette, true), palette.paper);
+        assert_eq!(themed_rgb([255, 255, 255], palette, true), palette.ink);
+
+        let middle = themed_rgb([128, 128, 128], palette, false);
+        for (channel, value) in middle.iter().enumerate() {
+            assert!(*value > palette.paper[channel]);
+            assert!(*value < palette.ink[channel]);
+        }
+    }
+
+    #[test]
+    fn pdf_chroma_survives_palette_mapping() {
+        let palette = PdfPalette {
+            paper: [13, 11, 26],
+            ink: [196, 192, 224],
+        };
+        let red = themed_rgb([230, 30, 40], palette, false);
+        assert!(
+            red[0] > red[1] + 40,
+            "red detail must remain recognizably red"
+        );
+        assert!(red[0] > red[2] + 30, "red detail must not become neutral");
+    }
+
+    #[test]
+    fn dark_pdf_palette_lifts_colored_headings_without_losing_hue() {
+        let palette = PdfPalette {
+            paper: [13, 11, 26],
+            ink: [196, 192, 224],
+        };
+        let blue = themed_rgb([31, 78, 121], palette, false);
+        let luma =
+            (0.2126 * blue[0] as f64 + 0.7152 * blue[1] as f64 + 0.0722 * blue[2] as f64) / 255.0;
+        assert!(luma >= 0.5, "dark-theme headings need readable contrast");
+        assert!(blue[2] > blue[0] + 25, "blue heading hue must survive");
+    }
 
     #[test]
     fn displayed_link_points_follow_page_rotation() {
@@ -825,6 +1015,58 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes visual PDF palette samples; set LECTOR_VISUAL_PDF and LECTOR_VISUAL_DIR"]
+    fn visual_pdf_palette_samples() {
+        use std::fs::File;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(std::env::var_os("LECTOR_VISUAL_PDF").expect("PDF path"));
+        let output = PathBuf::from(std::env::var_os("LECTOR_VISUAL_DIR").expect("output dir"));
+        std::fs::create_dir_all(&output).expect("create visual output directory");
+        let doc = OpenDoc::open(&path, None).expect("open visual PDF");
+        let (page_w, page_h) = doc.size(0, 0);
+        let scale = 900.0 / page_w.max(1.0);
+        let geom = PageGeom {
+            index: 0,
+            x: 0.0,
+            y: 0.0,
+            w: page_w * scale,
+            h: page_h * scale,
+            scale,
+        };
+        for (name, palette) in [
+            (
+                "miroir-void",
+                PdfPalette {
+                    paper: [0x0d, 0x0b, 0x1a],
+                    ink: [0xc4, 0xc0, 0xe0],
+                },
+            ),
+            (
+                "catppuccin",
+                PdfPalette {
+                    paper: [0x1e, 0x1e, 0x2e],
+                    ink: [0xcd, 0xd6, 0xf4],
+                },
+            ),
+            (
+                "flexoki-light",
+                PdfPalette {
+                    paper: [0xff, 0xfc, 0xf0],
+                    ink: [0x10, 0x0f, 0x0f],
+                },
+            ),
+        ] {
+            let surface =
+                raster_page(&doc, &geom, 0, PdfMode::Omarchy, palette, 1.0).expect("raster");
+            let path = output.join(format!("{name}.png"));
+            let mut file = File::create(&path).expect("create preview");
+            surface.write_to_png(&mut file).expect("write preview");
+            eprintln!("{}", path.display());
+        }
+    }
+
+    #[test]
     fn only_pages_near_the_viewport_are_considered_visible() {
         let pages = stacked_pages(40, 800.0);
         assert_eq!(pages_intersecting_view(&pages, 0.0, 700.0, 0.0), vec![0]);
@@ -838,6 +1080,27 @@ mod tests {
     }
 
     #[test]
+    fn page_raster_cache_can_show_the_previous_scale_while_replacement_renders() {
+        let mut cache = RasterCache::new(2);
+        let key = RasterKey {
+            index: 7,
+            width: 100,
+            height: 200,
+            rotation: 0,
+            pdf_mode: PdfMode::Normal,
+            palette: PdfPalette::default(),
+        };
+        let surface = ImageSurface::create(Format::ARgb32, 100, 200).expect("surface");
+        cache.insert(key, surface);
+
+        let fallback = cache
+            .get_page(7)
+            .expect("old-scale page raster should remain available");
+        assert_eq!((fallback.width(), fallback.height()), (100, 200));
+        assert!(cache.get_page(8).is_none());
+    }
+
+    #[test]
     fn page_raster_cache_keeps_a_bounded_lru() {
         let mut cache = RasterCache::new(2);
         let a = RasterKey {
@@ -845,7 +1108,8 @@ mod tests {
             width: 10,
             height: 10,
             rotation: 0,
-            invert: false,
+            pdf_mode: PdfMode::Normal,
+            palette: PdfPalette::default(),
         };
         let b = RasterKey { index: 1, ..a };
         let c = RasterKey { index: 2, ..a };
@@ -874,9 +1138,9 @@ mod tests {
             h: 200.0,
             scale: 1.0,
         };
-        let one = RasterKey::from_geom(&geom, 0, false, 1.0);
+        let one = RasterKey::from_geom(&geom, 0, PdfMode::Normal, PdfPalette::default(), 1.0);
         assert_eq!((one.width, one.height), (101, 200));
-        let two = RasterKey::from_geom(&geom, 0, false, 2.0);
+        let two = RasterKey::from_geom(&geom, 0, PdfMode::Normal, PdfPalette::default(), 2.0);
         assert_eq!((two.width, two.height), (201, 400));
         assert_ne!(one, two);
     }
@@ -907,10 +1171,54 @@ mod tests {
     fn a_stale_raster_idle_must_not_drop_the_live_queue() {
         assert!(raster_idle_is_stale(1, 2));
         assert!(!raster_idle_is_stale(2, 2));
-        assert!(!raster_cache_needs_reset(1.0, 1.0, 0, 0, false, false));
-        assert!(raster_cache_needs_reset(1.0, 1.25, 0, 0, false, false));
-        assert!(raster_cache_needs_reset(1.0, 1.0, 0, 90, false, false));
-        assert!(raster_cache_needs_reset(1.0, 1.0, 0, 0, false, true));
+        assert!(!raster_cache_needs_reset(
+            1.0,
+            1.0,
+            0,
+            0,
+            PdfMode::Normal,
+            PdfMode::Normal
+        ));
+        assert!(raster_cache_needs_reset(
+            1.0,
+            1.25,
+            0,
+            0,
+            PdfMode::Normal,
+            PdfMode::Normal
+        ));
+        assert!(raster_cache_needs_reset(
+            1.0,
+            1.0,
+            0,
+            90,
+            PdfMode::Normal,
+            PdfMode::Normal
+        ));
+        assert!(raster_cache_needs_reset(
+            1.0,
+            1.0,
+            0,
+            0,
+            PdfMode::Normal,
+            PdfMode::Omarchy
+        ));
+        assert!(!raster_cache_needs_clear(
+            1.0,
+            1.5,
+            0,
+            0,
+            PdfMode::Normal,
+            PdfMode::Normal
+        ));
+        assert!(raster_cache_needs_clear(
+            1.0,
+            1.0,
+            0,
+            90,
+            PdfMode::Normal,
+            PdfMode::Normal
+        ));
     }
 
     #[test]

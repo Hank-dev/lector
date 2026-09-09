@@ -20,6 +20,8 @@ pub struct Session {
     history_generation: u64,
     pub sidebar: String,
     pub invert: bool,
+    #[serde(default)]
+    pub pdf_mode: String,
     pub layout: String,
     #[serde(skip)]
     dirty_files: HashSet<String>,
@@ -33,6 +35,8 @@ pub struct Session {
     loaded_sidebar: String,
     #[serde(skip)]
     loaded_invert: bool,
+    #[serde(skip)]
+    loaded_pdf_mode: String,
     #[serde(skip)]
     loaded_layout: String,
 }
@@ -136,6 +140,9 @@ impl Session {
         if dirty.invert != dirty.loaded_invert {
             self.invert = dirty.invert;
         }
+        if dirty.pdf_mode != dirty.loaded_pdf_mode {
+            self.pdf_mode = dirty.pdf_mode.clone();
+        }
         if dirty.layout != dirty.loaded_layout {
             self.layout = dirty.layout.clone();
         }
@@ -148,6 +155,7 @@ impl Session {
         self.loaded_history_generation = self.history_generation;
         self.loaded_sidebar = self.sidebar.clone();
         self.loaded_invert = self.invert;
+        self.loaded_pdf_mode = self.pdf_mode.clone();
         self.loaded_layout = self.layout.clone();
     }
 
@@ -494,6 +502,30 @@ mod tests {
             .is_some());
         assert_eq!(session.files.len(), MAX_FILES);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pdf_mode_is_persisted_and_legacy_invert_remains_readable() {
+        let path = test_path("pdf-mode");
+        let mut session = Session {
+            pdf_mode: "omarchy".into(),
+            ..Session::default()
+        };
+        session.save_to(&path).unwrap();
+        assert_eq!(Session::load_from_path(&path).pdf_mode, "omarchy");
+
+        let legacy_path = test_path("legacy-invert");
+        fs::write(
+            &legacy_path,
+            "files = {}\nrecent = []\nsidebar = \"thumbs\"\ninvert = true\nlayout = \"continuous\"\n",
+        )
+        .unwrap();
+        let legacy = Session::load_from_path(&legacy_path);
+        assert_eq!(legacy.pdf_mode, "");
+        assert!(legacy.invert);
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        fs::remove_dir_all(legacy_path.parent().unwrap()).unwrap();
     }
 
     #[test]

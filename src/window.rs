@@ -21,10 +21,10 @@ use crate::session::{self, Session};
 use crate::theme::{self, Theme};
 use crate::view::{
     display_point_to_document, draw_annotations, draw_page_overlays, page_at_content_y,
-    page_scroll_y, pages_intersecting_view, paint_raster, raster_cache_needs_reset,
-    raster_idle_is_stale, raster_page, selected_text, thumbnail, thumbnail_css_size,
-    AnnotationDrawing, Layout, LayoutMode, PageDrawing, RasterCache, RasterKey, Selection, Zoom,
-    MAX_ZOOM, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
+    page_scroll_y, pages_intersecting_view, paint_raster, raster_cache_needs_clear,
+    raster_cache_needs_reset, raster_idle_is_stale, raster_page, selected_text, thumbnail,
+    thumbnail_css_size, AnnotationDrawing, Layout, LayoutMode, PageDrawing, PdfMode, RasterCache,
+    RasterKey, Selection, Zoom, MAX_ZOOM, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
 };
 
 const ZOOM_LABELS: [&str; 16] = [
@@ -157,6 +157,17 @@ fn pinch_target_scale(start_scale: f64, gesture_scale: f64) -> f64 {
 
 fn pinch_scale_is_meaningful(applied: f64, target: f64) -> bool {
     (target - applied).abs() / applied.max(0.01) >= 0.02
+}
+
+fn pinch_zoom_update(
+    start_scale: f64,
+    gesture_scale: f64,
+    anchor: ViewportAnchor,
+) -> (Zoom, ViewRestore) {
+    (
+        Zoom::Custom(pinch_target_scale(start_scale, gesture_scale)),
+        ViewRestore::Anchor(anchor),
+    )
 }
 
 fn ctrl_scroll_zoom_factor(dy: f64) -> f64 {
@@ -458,7 +469,7 @@ fn about_copy() -> AboutCopy {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ViewRestore {
     Anchor(ViewportAnchor),
     CurrentPage,
@@ -469,7 +480,7 @@ struct Inner {
     zoom: Zoom,
     layout_mode: LayoutMode,
     rotation: i32,
-    invert: bool,
+    pdf_mode: PdfMode,
     page: i32,
     layout: Layout,
     selection: Option<Selection>,
@@ -521,6 +532,8 @@ pub struct Lector {
     cont_item: CheckButton,
     dual_item: CheckButton,
     single_item: CheckButton,
+    normal_item: CheckButton,
+    omarchy_item: CheckButton,
     invert_item: CheckButton,
     highlight_item: Button,
     note_item: Button,
@@ -572,7 +585,7 @@ impl Lector {
             zoom: Zoom::FitWidth,
             layout_mode: LayoutMode::Continuous,
             rotation: 0,
-            invert: false,
+            pdf_mode: PdfMode::Normal,
             page: 0,
             layout: Layout {
                 pages: Vec::new(),
@@ -603,7 +616,7 @@ impl Lector {
         }));
         {
             let mut st = inner.borrow_mut();
-            st.invert = st.session.invert;
+            st.pdf_mode = PdfMode::parse(&st.session.pdf_mode, st.session.invert);
             st.layout_mode = session::parse_layout(&st.session.layout);
             st.sidebar = match st.session.sidebar.as_str() {
                 "hidden" => Sidebar::Hidden,
@@ -654,7 +667,11 @@ impl Lector {
         let single_item = menu_check_row("Single page", "s");
         dual_item.set_group(Some(&cont_item));
         single_item.set_group(Some(&cont_item));
+        let normal_item = menu_check_row("Normal colors", "");
+        let omarchy_item = menu_check_row("Follow Omarchy", "");
         let invert_item = menu_check_row("Inverted colors", "Ctrl+I");
+        omarchy_item.set_group(Some(&normal_item));
+        invert_item.set_group(Some(&normal_item));
         let highlight_item = bare_menu_row(
             "format-text-highlight-symbolic",
             "Highlight selection",
@@ -678,7 +695,9 @@ impl Lector {
             cont_item.set_active(st.layout_mode == LayoutMode::Continuous);
             dual_item.set_active(st.layout_mode == LayoutMode::Dual);
             single_item.set_active(st.layout_mode == LayoutMode::Single);
-            invert_item.set_active(st.invert);
+            normal_item.set_active(st.pdf_mode == PdfMode::Normal);
+            omarchy_item.set_active(st.pdf_mode == PdfMode::Omarchy);
+            invert_item.set_active(st.pdf_mode == PdfMode::Inverted);
         }
 
         prev_btn.set_margin_start(8);
@@ -818,6 +837,8 @@ impl Lector {
             cont_item: cont_item.clone(),
             dual_item: dual_item.clone(),
             single_item: single_item.clone(),
+            normal_item: normal_item.clone(),
+            omarchy_item: omarchy_item.clone(),
             invert_item: invert_item.clone(),
             highlight_item: highlight_item.clone(),
             note_item: note_item.clone(),
@@ -895,6 +916,10 @@ impl Lector {
         menu_col.append(&cont_item);
         menu_col.append(&dual_item);
         menu_col.append(&single_item);
+        menu_col.append(&menu_sep());
+        menu_col.append(&menu_heading("PDF COLORS"));
+        menu_col.append(&normal_item);
+        menu_col.append(&omarchy_item);
         menu_col.append(&invert_item);
         for (icon, label, shortcut, action) in [
             (
@@ -944,7 +969,12 @@ impl Lector {
             &h,
         );
         menu_col.set_overflow(gtk::Overflow::Hidden);
-        menu_pop.set_child(Some(&menu_col));
+        let menu_scroll = ScrolledWindow::new();
+        menu_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        menu_scroll.set_max_content_height(540);
+        menu_scroll.set_propagate_natural_height(true);
+        menu_scroll.set_child(Some(&menu_col));
+        menu_pop.set_child(Some(&menu_scroll));
         menu_btn.set_popover(Some(&menu_pop));
         menu_pop.connect_show({
             let h = h.clone();
@@ -971,18 +1001,22 @@ impl Lector {
                 ui.set_layout(mode);
             });
         }
-        invert_item.connect_toggled({
+        for (item, mode) in [
+            (normal_item.clone(), PdfMode::Normal),
+            (omarchy_item.clone(), PdfMode::Omarchy),
+            (invert_item.clone(), PdfMode::Inverted),
+        ] {
             let h = h.clone();
             let pop = menu_pop.clone();
-            move |item| {
+            item.connect_toggled(move |item| {
                 let Some(ui) = h.get() else { return };
-                if ui.inner.borrow().ignore_menu_checks {
+                if !item.is_active() || ui.inner.borrow().ignore_menu_checks {
                     return;
                 }
                 pop.popdown();
-                ui.set_invert(item.is_active());
-            }
-        });
+                ui.set_pdf_mode(mode);
+            });
+        }
         if std::env::var_os("LECTOR_DEBUG_MENU").is_some() {
             let btn = menu_btn.clone();
             let pop = menu_pop.clone();
@@ -1122,27 +1156,41 @@ impl Lector {
         let pinch = GestureZoom::new();
         pinch.set_propagation_phase(gtk::PropagationPhase::Capture);
         let pinch_start = Rc::new(Cell::new(1.0));
+        let pinch_anchor = Rc::new(Cell::new(None::<ViewportAnchor>));
         pinch.connect_begin({
             let h = h.clone();
             let pinch_start = pinch_start.clone();
-            move |_, _| {
+            let pinch_anchor = pinch_anchor.clone();
+            move |gesture, _| {
                 if let Some(ui) = h.get() {
                     pinch_start.set(ui.inner.borrow().layout.scale.max(0.01));
+                    pinch_anchor.set(Some(ui.capture_anchor(gesture.bounding_box_center())));
                 }
             }
         });
         pinch.connect_scale_changed({
             let h = h.clone();
             let pinch_start = pinch_start.clone();
-            move |g, scale| {
+            let pinch_anchor = pinch_anchor.clone();
+            move |gesture, scale| {
                 if let Some(ui) = h.get() {
-                    let target_scale = pinch_target_scale(pinch_start.get(), scale);
+                    let anchor = pinch_anchor
+                        .get()
+                        .unwrap_or_else(|| ui.capture_anchor(gesture.bounding_box_center()));
+                    let (zoom, restore) = pinch_zoom_update(pinch_start.get(), scale, anchor);
+                    let Zoom::Custom(target_scale) = zoom else {
+                        return;
+                    };
                     if !pinch_scale_is_meaningful(ui.inner.borrow().layout.scale, target_scale) {
                         return;
                     }
-                    ui.set_zoom_at(Zoom::Custom(target_scale), g.bounding_box_center());
+                    ui.set_zoom_restore(zoom, restore);
                 }
             }
+        });
+        pinch.connect_end({
+            let pinch_anchor = pinch_anchor.clone();
+            move |_, _| pinch_anchor.set(None)
         });
         scrolled.add_controller(pinch);
 
@@ -1533,29 +1581,43 @@ impl Lector {
             };
             let near = pages_intersecting_view(&st.layout.pages, view_top, view_h, VIEW_PAGE_PAD)
                 .contains(&index);
-            let key = RasterKey::from_geom(&geom, st.rotation, st.invert, dpr);
+            let key =
+                RasterKey::from_geom(&geom, st.rotation, st.pdf_mode, st.theme.pdf_palette(), dpr);
             let cached = st.raster.get(&key);
+            let exact_raster = cached.is_some();
+            let visible_raster = cached.or_else(|| st.raster.get_page(index));
             Some((
                 geom,
                 near,
-                cached,
+                exact_raster,
+                visible_raster,
                 st.rotation,
-                st.invert,
+                st.pdf_mode == PdfMode::Inverted,
                 st.selection,
                 st.search_idx,
             ))
         };
-        let Some((geom, near, cached, rotation, invert, selection, search_idx)) = prepared else {
+        let Some((
+            geom,
+            near,
+            exact_raster,
+            visible_raster,
+            rotation,
+            invert,
+            selection,
+            search_idx,
+        )) = prepared
+        else {
             return;
         };
-        if let Some(surf) = cached {
+        if let Some(surf) = visible_raster {
             paint_raster(cr, &surf, geom.w, geom.h);
         } else {
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.paint().ok();
-            if near {
-                self.queue_raster(index);
-            }
+        }
+        if near && !exact_raster {
+            self.queue_raster(index);
         }
         let st = self.inner.borrow();
         let Some(doc) = st.doc.as_ref() else {
@@ -1683,7 +1745,13 @@ impl Lector {
                 let Some(geom) = st.layout.page_geom(index) else {
                     continue;
                 };
-                let key = RasterKey::from_geom(&geom, st.rotation, st.invert, dpr);
+                let key = RasterKey::from_geom(
+                    &geom,
+                    st.rotation,
+                    st.pdf_mode,
+                    st.theme.pdf_palette(),
+                    dpr,
+                );
                 if !st.raster.contains(&key) {
                     pending.insert(index);
                 }
@@ -1723,8 +1791,10 @@ impl Lector {
             match (st.doc.as_ref(), st.layout.page_geom(index)) {
                 (Some(doc), Some(geom)) => {
                     let dpr = self.page_dpr();
-                    let key = RasterKey::from_geom(&geom, st.rotation, st.invert, dpr);
-                    raster_page(doc, &geom, st.rotation, st.invert, dpr).map(|surf| (key, surf))
+                    let palette = st.theme.pdf_palette();
+                    let key = RasterKey::from_geom(&geom, st.rotation, st.pdf_mode, palette, dpr);
+                    raster_page(doc, &geom, st.rotation, st.pdf_mode, palette, dpr)
+                        .map(|surf| (key, surf))
                 }
                 _ => None,
             }
@@ -1805,15 +1875,25 @@ impl Lector {
             st.layout_gen
         };
         let h = Handle(self.me.borrow().clone());
-        glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
-            if let Some(ui) = h.get() {
-                if ui.inner.borrow().layout_gen == gen {
-                    match restore {
-                        ViewRestore::Anchor(anchor) => ui.apply_anchor(anchor),
-                        ViewRestore::CurrentPage => ui.scroll_to_current(),
-                    }
-                    ui.inner.borrow_mut().ignore_scroll = false;
-                }
+        let mut attempts = 0_u8;
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            let Some(ui) = h.get() else {
+                return glib::ControlFlow::Break;
+            };
+            if ui.inner.borrow().layout_gen != gen {
+                return glib::ControlFlow::Break;
+            }
+
+            match restore {
+                ViewRestore::Anchor(anchor) => ui.apply_anchor(anchor),
+                ViewRestore::CurrentPage => ui.scroll_to_current(),
+            }
+            attempts += 1;
+            if attempts >= 6 {
+                ui.inner.borrow_mut().ignore_scroll = false;
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
             }
         });
     }
@@ -1825,9 +1905,11 @@ impl Lector {
     fn reflow_restore(&self, restore: ViewRestore) {
         let reset_rasters = {
             let st = &mut *self.inner.borrow_mut();
-            let Some(doc) = st.doc.as_ref() else {
+            if st.doc.is_none() {
                 return;
-            };
+            }
+            st.ignore_scroll = true;
+            let doc = st.doc.as_ref().expect("document checked above");
             let vw = self.scrolled.width() as f64;
             let vh = self.scrolled.height() as f64;
             if vw > 1.0 {
@@ -1838,7 +1920,7 @@ impl Lector {
             }
             let old_scale = st.layout.scale;
             let old_rotation = st.rotation;
-            let old_invert = st.invert;
+            let old_mode = st.pdf_mode;
             st.layout = Layout::compute(
                 doc,
                 st.layout_mode,
@@ -1853,11 +1935,21 @@ impl Lector {
                 st.layout.scale,
                 old_rotation,
                 st.rotation,
-                old_invert,
-                st.invert,
+                old_mode,
+                st.pdf_mode,
             );
-            if reset {
+            let clear = raster_cache_needs_clear(
+                old_scale,
+                st.layout.scale,
+                old_rotation,
+                st.rotation,
+                old_mode,
+                st.pdf_mode,
+            );
+            if clear {
                 st.raster.clear();
+            }
+            if reset {
                 st.raster_gen = st.raster_gen.wrapping_add(1);
             }
             reset
@@ -2006,9 +2098,13 @@ impl Lector {
 
     fn set_zoom_at(&self, zoom: Zoom, focus: Option<(f64, f64)>) {
         let anchor = self.capture_anchor(focus);
+        self.set_zoom_restore(zoom, ViewRestore::Anchor(anchor));
+    }
+
+    fn set_zoom_restore(&self, zoom: Zoom, restore: ViewRestore) {
         self.inner.borrow_mut().zoom = zoom;
         self.sync_zoom_dropdown();
-        self.reflow_restore(ViewRestore::Anchor(anchor));
+        self.reflow_restore(restore);
     }
 
     fn zoom_by(&self, factor: f64) {
@@ -2104,13 +2200,15 @@ impl Lector {
         self.goto_page(page);
     }
 
-    fn set_invert(&self, on: bool) {
+    fn set_pdf_mode(&self, mode: PdfMode) {
         {
             let mut st = self.inner.borrow_mut();
-            st.invert = on;
+            st.pdf_mode = mode;
             st.ignore_menu_checks = true;
         }
-        self.invert_item.set_active(on);
+        self.normal_item.set_active(mode == PdfMode::Normal);
+        self.omarchy_item.set_active(mode == PdfMode::Omarchy);
+        self.invert_item.set_active(mode == PdfMode::Inverted);
         self.inner.borrow_mut().ignore_menu_checks = false;
         self.inner.borrow_mut().raster.clear();
         self.rebuild_sidebar();
@@ -2325,7 +2423,7 @@ impl Lector {
         let v = self.thumbs_sw.vadjustment();
         let top = v.value();
         let bot = top + v.page_size().max(1.0);
-        let invert = self.inner.borrow().invert;
+        let pdf_mode = self.inner.borrow().pdf_mode;
         let mut filled = 0;
         let mut child = self.thumbs.first_child();
         while let Some(widget) = child {
@@ -2358,7 +2456,14 @@ impl Lector {
                 let Some(doc) = st.doc.as_ref() else {
                     return;
                 };
-                thumbnail(doc, page, THUMB_CSS_WIDTH, dpr, invert)
+                thumbnail(
+                    doc,
+                    page,
+                    THUMB_CSS_WIDTH,
+                    dpr,
+                    pdf_mode,
+                    st.theme.pdf_palette(),
+                )
             };
             if let Some(surf) = surf {
                 if let Some(tex) = surface_texture(&surf) {
@@ -3228,7 +3333,8 @@ impl Lector {
             if let Some((path, page, zoom)) = remember {
                 remember_document_state(&mut st.session, &path, page, zoom);
             }
-            st.session.invert = st.invert;
+            st.session.invert = st.pdf_mode == PdfMode::Inverted;
+            st.session.pdf_mode = st.pdf_mode.key().into();
             st.session.layout = match st.layout_mode {
                 LayoutMode::Single => "single".into(),
                 LayoutMode::Dual => "dual".into(),
@@ -3249,8 +3355,14 @@ impl Lector {
     fn reload_theme(&self) {
         let theme = Theme::load();
         theme::apply_css(&self.css, &theme);
-        self.inner.borrow_mut().theme = theme;
+        {
+            let mut st = self.inner.borrow_mut();
+            st.theme = theme;
+            st.raster.clear();
+        }
+        self.rebuild_sidebar();
         self.queue_pages_draw();
+        self.ensure_visible_rasters();
         self.update_chrome();
     }
 
@@ -3351,8 +3463,12 @@ impl Lector {
                     return glib::Propagation::Stop;
                 }
                 Key::i => {
-                    let on = !self.inner.borrow().invert;
-                    self.set_invert(on);
+                    let next = if self.inner.borrow().pdf_mode == PdfMode::Inverted {
+                        PdfMode::Normal
+                    } else {
+                        PdfMode::Inverted
+                    };
+                    self.set_pdf_mode(next);
                     return glib::Propagation::Stop;
                 }
                 Key::plus | Key::equal | Key::KP_Add => {
@@ -3729,8 +3845,28 @@ fn surface_texture(surf: &cairo::ImageSurface) -> Option<gdk::MemoryTexture> {
 mod ui_tests;
 
 #[cfg(test)]
+#[path = "window_menu_test.rs"]
+mod menu_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinch_updates_reuse_the_gesture_start_anchor() {
+        let anchor = ViewportAnchor {
+            content_x: 500.0,
+            content_y: 1200.0,
+            view_x: 250.0,
+            view_y: 300.0,
+            scale: 1.0,
+        };
+
+        let (zoom, restore) = pinch_zoom_update(1.0, 1.5, anchor);
+        assert_eq!(zoom, Zoom::Custom(1.5));
+        assert_eq!(restore, ViewRestore::Anchor(anchor));
+        assert_eq!(restored_scroll(anchor, 1.5), (500.0, 1500.0));
+    }
 
     #[test]
     fn double_click_fit_is_suppressed_over_document_links() {

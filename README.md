@@ -6,7 +6,9 @@ Same layout as GNOME Document Viewer (Evince): header bar, left side pane
 with thumbnails/outline, find bar, zoom drop-down, hamburger menu. Pages
 render with Poppler (the same engine Evince uses). Chrome follows the
 active Omarchy theme — palette, font, corner radius, transparency — and
-reloads when you switch themes.
+reloads when you switch themes. PDF colors can remain normal, be inverted,
+or follow the active Omarchy background/foreground palette while preserving
+colored diagrams.
 
 ## Layout
 
@@ -31,7 +33,8 @@ reloads when you switch themes.
 - Persistent yellow highlights and text notes attached to selected regions
 - Reading History dialog with the latest 20 documents, page positions, and missing-file status
 - Clickable internal and external links
-- Inverted colors, rotate, fullscreen, presentation (F5)
+- Normal, inverted, or Omarchy-following PDF colors
+- Rotate, fullscreen, presentation (F5)
 - Print and save a copy
 - Encrypted PDFs
 - Remembers page and zoom per file in a private, concurrency-safe session store
@@ -96,7 +99,8 @@ atomic/private persistence, stale-writer merging, deletion, and all page rotatio
 | Ctrl+P | Print |
 
 Menu: Open, Save a Copy, Print, highlight selection, add/delete annotations,
-Side Pane, Continuous, Dual, Single page, Inverted Colors, Rotate, Fullscreen,
+Side Pane, Continuous, Dual, Single page, PDF colors (Normal, Follow Omarchy,
+or Inverted), Rotate, Fullscreen,
 Presentation, Reload, Reading History, Properties, Keyboard shortcuts, and About Lector.
 
 Annotations are stored by Lector in `~/.config/lector/annotations.toml`, never beside

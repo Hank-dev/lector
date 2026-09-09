@@ -9,6 +9,21 @@ use std::time::Duration;
 use gtk::prelude::*;
 use gtk::{gdk, glib, CssProvider, STYLE_PROVIDER_PRIORITY_USER};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PdfPalette {
+    pub paper: [u8; 3],
+    pub ink: [u8; 3],
+}
+
+impl Default for PdfPalette {
+    fn default() -> Self {
+        Self {
+            paper: [0x1a, 0x1b, 0x26],
+            ink: [0xc0, 0xca, 0xf5],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub mode: String,
@@ -103,6 +118,14 @@ impl Theme {
         t.font = omarchy_font();
         t.radius = hypr_rounding().unwrap_or(t.radius);
         t
+    }
+
+    pub fn pdf_palette(&self) -> PdfPalette {
+        let fallback = PdfPalette::default();
+        PdfPalette {
+            paper: parse_hex_rgb(&self.background).unwrap_or(fallback.paper),
+            ink: parse_hex_rgb(&self.foreground).unwrap_or(fallback.ink),
+        }
     }
 
     pub fn css(&self) -> String {
@@ -785,6 +808,18 @@ fn hypr_rounding() -> Option<i32> {
     None
 }
 
+fn parse_hex_rgb(value: &str) -> Option<[u8; 3]> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    Some([
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ])
+}
+
 fn css_font(name: &str) -> String {
     name.replace(['\\', '"', ';', '{', '}'], "")
 }
@@ -793,4 +828,39 @@ pub fn path_uri(path: &Path) -> String {
     glib::filename_to_uri(path, None)
         .map(|s| s.to_string())
         .unwrap_or_else(|_| format!("file://{}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_palette_uses_omarchy_paper_and_ink_tokens() {
+        let theme = Theme {
+            background: "#102030".into(),
+            foreground: "#d0e0f0".into(),
+            ..Theme::default()
+        };
+
+        assert_eq!(
+            theme.pdf_palette(),
+            PdfPalette {
+                paper: [0x10, 0x20, 0x30],
+                ink: [0xd0, 0xe0, 0xf0],
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_pdf_palette_tokens_fall_back_independently() {
+        let theme = Theme {
+            background: "not-a-color".into(),
+            foreground: "#abcdef".into(),
+            ..Theme::default()
+        };
+
+        let palette = theme.pdf_palette();
+        assert_eq!(palette.paper, PdfPalette::default().paper);
+        assert_eq!(palette.ink, [0xab, 0xcd, 0xef]);
+    }
 }
