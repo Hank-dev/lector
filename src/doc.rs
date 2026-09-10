@@ -65,6 +65,7 @@ pub struct OpenDoc {
     pub document: Document,
     pub n_pages: i32,
     pub sizes: Vec<PageSize>,
+    pub labels: Vec<String>,
     pub outline: Vec<OutlineItem>,
     pub title: String,
     pub author: Option<String>,
@@ -79,6 +80,51 @@ pub struct OpenDoc {
 pub enum OpenError {
     Encrypted,
     Other(String),
+}
+
+pub fn page_index_from_input(input: &str, labels: &[String]) -> Option<i32> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if let Some(index) = labels
+        .iter()
+        .position(|label| label.eq_ignore_ascii_case(input))
+    {
+        return Some(index as i32);
+    }
+    input
+        .parse::<i32>()
+        .ok()
+        .filter(|number| *number >= 1 && *number <= labels.len() as i32)
+        .map(|number| number - 1)
+}
+
+pub fn display_page_label(labels: &[String], index: i32) -> String {
+    labels
+        .get(index as usize)
+        .filter(|label| !label.is_empty())
+        .cloned()
+        .unwrap_or_else(|| (index + 1).to_string())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+}
+
+impl SearchOptions {
+    pub fn flags(self) -> poppler::FindFlags {
+        let mut flags = poppler::FindFlags::DEFAULT;
+        if self.case_sensitive {
+            flags |= poppler::FindFlags::CASE_SENSITIVE;
+        }
+        if self.whole_word {
+            flags |= poppler::FindFlags::WHOLE_WORDS_ONLY;
+        }
+        flags
+    }
 }
 
 impl OpenDoc {
@@ -111,12 +157,20 @@ impl OpenDoc {
 
         let n_pages = document.n_pages();
         let mut sizes = Vec::with_capacity(n_pages as usize);
+        let mut labels = Vec::with_capacity(n_pages as usize);
         for i in 0..n_pages {
             if let Some(page) = document.page(i) {
                 let (w, h) = page.size();
                 sizes.push(PageSize { w, h });
+                let label = page
+                    .label()
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| (i + 1).to_string());
+                labels.push(label);
             } else {
                 sizes.push(PageSize { w: 612.0, h: 792.0 });
+                labels.push((i + 1).to_string());
             }
         }
 
@@ -136,6 +190,7 @@ impl OpenDoc {
             uri,
             n_pages,
             sizes,
+            labels,
             outline,
             title,
             author: document.author().map(|s| s.to_string()),
@@ -163,14 +218,19 @@ impl OpenDoc {
         }
     }
 
-    pub fn find_page(&self, index: i32, query: &str) -> Vec<(i32, poppler::Rectangle)> {
+    pub fn find_page(
+        &self,
+        index: i32,
+        query: &str,
+        options: SearchOptions,
+    ) -> Vec<(i32, poppler::Rectangle)> {
         if query.is_empty() {
             return Vec::new();
         }
         let Some(page) = self.page(index) else {
             return Vec::new();
         };
-        page.find_text(query)
+        page.find_text_with_options(query, options.flags())
             .into_iter()
             .map(|rect| (index, rect))
             .collect()
@@ -299,6 +359,24 @@ fn dest_page(doc: &Document, dest: *mut PopplerDest) -> Option<i32> {
 
 #[cfg(test)]
 pub(crate) fn write_test_pdf(name: &str, page_contents: &[&str]) -> PathBuf {
+    write_test_pdf_catalog(name, page_contents, "")
+}
+
+#[cfg(test)]
+pub(crate) fn write_labeled_test_pdf() -> PathBuf {
+    write_test_pdf_catalog(
+        "labels",
+        &[
+            "BT /F1 20 Tf 72 700 Td (roman one) Tj ET",
+            "BT /F1 20 Tf 72 700 Td (roman two) Tj ET",
+            "BT /F1 20 Tf 72 700 Td (arabic one) Tj ET",
+        ],
+        " /PageLabels << /Nums [ 0 << /S /r >> 2 << /S /D >> ] >>",
+    )
+}
+
+#[cfg(test)]
+fn write_test_pdf_catalog(name: &str, page_contents: &[&str], catalog_extra: &str) -> PathBuf {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -315,7 +393,7 @@ pub(crate) fn write_test_pdf(name: &str, page_contents: &[&str]) -> PathBuf {
         .collect::<Vec<_>>()
         .join(" ");
     let mut objects = vec![
-        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        format!("<< /Type /Catalog /Pages 2 0 R{catalog_extra} >>"),
         format!("<< /Type /Pages /Kids [{kids}] /Count {page_count} >>"),
     ];
     for i in 0..page_count {
@@ -398,6 +476,50 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn search_options_honor_case_and_whole_words() {
+        let path = write_test_pdf(
+            "search-options",
+            &[
+                "BT /F1 20 Tf 72 700 Td (needle) Tj ET",
+                "BT /F1 20 Tf 72 700 Td (Needle) Tj ET",
+                "BT /F1 20 Tf 72 700 Td (needles) Tj ET",
+            ],
+        );
+        let doc = OpenDoc::open(&path, None).unwrap();
+        let hits = |options: SearchOptions| {
+            (0..doc.n_pages)
+                .flat_map(|page| doc.find_page(page, "needle", options))
+                .map(|(page, _)| page)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(hits(SearchOptions::default()), vec![0, 1, 2]);
+        assert_eq!(
+            hits(SearchOptions {
+                case_sensitive: true,
+                whole_word: false
+            }),
+            vec![0, 2]
+        );
+        assert_eq!(
+            hits(SearchOptions {
+                case_sensitive: false,
+                whole_word: true
+            }),
+            vec![0, 1]
+        );
+        assert_eq!(
+            hits(SearchOptions {
+                case_sensitive: true,
+                whole_word: true
+            }),
+            vec![0]
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn page_links_resolve_external_uris_and_internal_destinations() {
         let path = write_link_test_pdf();
         let doc = OpenDoc::open(&path, None).unwrap();
@@ -428,6 +550,30 @@ mod tests {
             depth,
         })
         .collect()
+    }
+
+    #[test]
+    fn poppler_page_labels_are_loaded_from_the_document() {
+        let path = write_labeled_test_pdf();
+        let doc = OpenDoc::open(&path, None).unwrap();
+        assert_eq!(doc.labels, ["i", "ii", "1"]);
+        assert_eq!(page_index_from_input("ii", &doc.labels), Some(1));
+        assert_eq!(page_index_from_input("1", &doc.labels), Some(2));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn page_input_prefers_labels_then_one_based_numbers() {
+        let labels = ["i", "ii", "1"].map(str::to_string);
+        assert_eq!(page_index_from_input("ii", &labels), Some(1));
+        assert_eq!(page_index_from_input("1", &labels), Some(2));
+        assert_eq!(page_index_from_input("3", &labels), Some(2));
+        assert_eq!(page_index_from_input("iv", &labels), None);
+        assert_eq!(page_index_from_input("  II ", &labels), Some(1));
+        assert_eq!(page_index_from_input("0", &labels), None);
+        assert_eq!(display_page_label(&labels, 0), "i");
+        assert_eq!(display_page_label(&labels, 2), "1");
+        assert_eq!(display_page_label(&labels, 9), "10");
     }
 
     #[test]

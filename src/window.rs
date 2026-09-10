@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use gtk::gdk::Key;
 use gtk::prelude::*;
@@ -16,7 +17,10 @@ use crate::annotations::{
     display_rect_to_document, document_rect_to_display, new_annotation, Annotation, AnnotationKind,
     AnnotationStore, DocumentRect,
 };
-use crate::doc::{DocumentLink, OpenDoc, OpenError};
+use crate::doc::{
+    display_page_label, outline_item_has_children, page_index_from_input, visible_outline_indices,
+    DocumentLink, OpenDoc, OpenError, SearchOptions,
+};
 use crate::session::{self, Session};
 use crate::theme::{self, Theme};
 use crate::view::{
@@ -118,8 +122,95 @@ fn restore_presentation_state(
     true
 }
 
+fn toggle_outline_collapsed(
+    items: &[crate::doc::OutlineItem],
+    collapsed: &mut HashSet<usize>,
+    index: usize,
+) -> bool {
+    if !outline_item_has_children(items, index) {
+        return false;
+    }
+    if !collapsed.insert(index) {
+        collapsed.remove(&index);
+    }
+    true
+}
+
 fn allocation_changed(previous: (i32, i32), current: (i32, i32)) -> bool {
     previous != current && current.0 > 32 && current.1 > 32
+}
+
+const LIVE_SEARCH_MS: u64 = 220;
+const FILE_CHANGE_MS: u64 = 400;
+const FILE_WATCH_GRACE_MS: u64 = 500;
+const SEARCH_SNIPPET_CHARS: usize = 48;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiskChange {
+    Modified,
+    Removed,
+}
+
+fn classify_document_event(event: gio::FileMonitorEvent) -> Option<DiskChange> {
+    match event {
+        gio::FileMonitorEvent::Changed
+        | gio::FileMonitorEvent::ChangesDoneHint
+        | gio::FileMonitorEvent::Created
+        | gio::FileMonitorEvent::Moved
+        | gio::FileMonitorEvent::Renamed
+        | gio::FileMonitorEvent::MovedIn => Some(DiskChange::Modified),
+        gio::FileMonitorEvent::Deleted | gio::FileMonitorEvent::MovedOut => {
+            Some(DiskChange::Removed)
+        }
+        _ => None,
+    }
+}
+
+fn collapsed_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn ellipsize_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    format!("{}…", text.chars().take(keep).collect::<String>())
+}
+
+fn search_snippet(text: &str, query: &str, case_sensitive: bool) -> String {
+    let hay = collapsed_whitespace(text);
+    if hay.is_empty() {
+        return String::new();
+    }
+    let query = query.trim();
+    let start = if query.is_empty() {
+        0
+    } else {
+        let found = if case_sensitive {
+            hay.find(query)
+        } else {
+            hay.to_lowercase().find(&query.to_lowercase())
+        };
+        match found {
+            Some(index) => hay[..index]
+                .trim_end()
+                .rfind(' ')
+                .map(|space| space + 1)
+                .unwrap_or(0),
+            None => 0,
+        }
+    };
+    ellipsize_chars(&hay[start..], SEARCH_SNIPPET_CHARS)
+}
+
+fn search_result_row_text(label: &str, snippet: &str) -> String {
+    if snippet.is_empty() {
+        format!("Page {label}")
+    } else {
+        format!("{label}  {snippet}")
+    }
 }
 
 fn invalidate_search_for_document(
@@ -134,8 +225,73 @@ fn invalidate_search_for_document(
     *search_idx = None;
 }
 
-fn remember_document_state(session: &mut Session, path: &Path, page: i32, zoom: Zoom) {
-    session.remember(path, page, zoom);
+fn remember_document_state(
+    session: &mut Session,
+    path: &Path,
+    page: i32,
+    zoom: Zoom,
+    rotation: i32,
+) {
+    session.remember_with_rotation(path, page, zoom, rotation);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ViewLocation {
+    page: i32,
+    horizontal: f64,
+    vertical: f64,
+}
+
+impl ViewLocation {
+    fn new(page: i32, horizontal: f64, vertical: f64) -> Self {
+        Self {
+            page,
+            horizontal,
+            vertical,
+        }
+    }
+}
+
+#[derive(Default)]
+struct NavigationHistory {
+    back: Vec<ViewLocation>,
+    forward: Vec<ViewLocation>,
+}
+
+impl NavigationHistory {
+    fn visit(&mut self, from: ViewLocation, to: ViewLocation) {
+        if from == to {
+            return;
+        }
+        if self.back.last().copied() != Some(from) {
+            self.back.push(from);
+            if self.back.len() > 100 {
+                self.back.remove(0);
+            }
+        }
+        self.forward.clear();
+    }
+
+    fn back(&mut self, current: ViewLocation) -> Option<ViewLocation> {
+        let target = self.back.pop()?;
+        if self.forward.last().copied() != Some(current) {
+            self.forward.push(current);
+        }
+        Some(target)
+    }
+
+    fn forward(&mut self, current: ViewLocation) -> Option<ViewLocation> {
+        let target = self.forward.pop()?;
+        if self.back.last().copied() != Some(current) {
+            self.back.push(current);
+        }
+        Some(target)
+    }
+
+    fn clear(&mut self) {
+        self.back.clear();
+        self.forward.clear();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -236,6 +392,23 @@ struct ShortcutRow {
 struct ShortcutSection {
     heading: &'static str,
     rows: &'static [ShortcutRow],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryDirection {
+    Back,
+    Forward,
+}
+
+fn navigation_shortcut(key: Key, mods: gdk::ModifierType) -> Option<HistoryDirection> {
+    if !mods.contains(gdk::ModifierType::ALT_MASK) {
+        return None;
+    }
+    match key {
+        Key::Left => Some(HistoryDirection::Back),
+        Key::Right => Some(HistoryDirection::Forward),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,6 +585,10 @@ fn shortcut_sections() -> &'static [ShortcutSection] {
             heading: "NAVIGATION",
             rows: &[
                 ShortcutRow {
+                    action: "Back / forward",
+                    keys: "Alt+← / Alt+→",
+                },
+                ShortcutRow {
                     action: "Next page",
                     keys: "n",
                 },
@@ -473,6 +650,7 @@ fn about_copy() -> AboutCopy {
 enum ViewRestore {
     Anchor(ViewportAnchor),
     CurrentPage,
+    Location(ViewLocation),
 }
 
 struct Inner {
@@ -493,6 +671,7 @@ struct Inner {
     annotations: Option<AnnotationStore>,
     annotation_error: Option<String>,
     targeted_annotation: Option<String>,
+    outline_collapsed: HashSet<usize>,
     view_w: f64,
     view_h: f64,
     ignore_zoom_dropdown: bool,
@@ -502,9 +681,11 @@ struct Inner {
     search_gen: u64,
     thumb_gen: u64,
     search_query: String,
+    search_options: SearchOptions,
     pres_restore: Option<(LayoutMode, Zoom, Sidebar)>,
     raster: RasterCache,
     raster_gen: u64,
+    navigation: NavigationHistory,
 }
 
 pub struct Lector {
@@ -516,7 +697,16 @@ pub struct Lector {
     page_total: Label,
     search_entry: Entry,
     search_info: Label,
+    search_results: ListBox,
+    search_results_sw: ScrolledWindow,
+    #[allow(dead_code)]
+    case_btn: ToggleButton,
+    #[allow(dead_code)]
+    word_btn: ToggleButton,
     find_bar: Revealer,
+    file_banner: Revealer,
+    file_banner_label: Label,
+    file_reload_btn: Button,
     sidebar_revealer: Revealer,
     sidebar_btn: ToggleButton,
     stack: Stack,
@@ -524,6 +714,8 @@ pub struct Lector {
     outline: ListBox,
     zoom_drop: DropDown,
     title_label: Label,
+    back_btn: Button,
+    forward_btn: Button,
     prev_btn: Button,
     next_btn: Button,
     zoom_out_btn: Button,
@@ -538,6 +730,7 @@ pub struct Lector {
     highlight_item: Button,
     note_item: Button,
     delete_annotation_item: Button,
+    document_menu_items: RefCell<Vec<gtk::Widget>>,
     thumbs_sw: ScrolledWindow,
     page_widgets: RefCell<Vec<(i32, DrawingArea)>>,
     rendered_structure: RefCell<Option<PageStructure>>,
@@ -548,6 +741,13 @@ pub struct Lector {
     me: RefCell<Weak<Lector>>,
     hold: RefCell<Option<Rc<Lector>>>,
     _monitor: RefCell<Option<gio::FileMonitor>>,
+    doc_monitor: RefCell<Option<gio::FileMonitor>>,
+    search_debounce_gen: Cell<u64>,
+    file_change_gen: Cell<u64>,
+    ignore_search_changed: Cell<bool>,
+    ignore_search_results: Cell<bool>,
+    pending_disk_change: Cell<Option<DiskChange>>,
+    file_watch_ignore_until: Cell<Option<Instant>>,
 }
 
 #[derive(Clone)]
@@ -601,6 +801,7 @@ impl Lector {
             annotations,
             annotation_error,
             targeted_annotation: None,
+            outline_collapsed: HashSet::new(),
             view_w: 800.0,
             view_h: 700.0,
             ignore_zoom_dropdown: false,
@@ -610,9 +811,11 @@ impl Lector {
             search_gen: 0,
             thumb_gen: 0,
             search_query: String::new(),
+            search_options: SearchOptions::default(),
             pres_restore: None,
             raster: RasterCache::new(12),
             raster_gen: 0,
+            navigation: NavigationHistory::default(),
         }));
         {
             let mut st = inner.borrow_mut();
@@ -633,12 +836,14 @@ impl Lector {
 
         let sidebar_btn = toggle_pill("view-list-symbolic", "Side pane (F9)");
         let open_btn = icon_pill("document-open-symbolic", "Open (Ctrl+O)");
+        let back_btn = icon_pill("edit-undo-symbolic", "Back (Alt+Left)");
+        let forward_btn = icon_pill("edit-redo-symbolic", "Forward (Alt+Right)");
         let prev_btn = icon_pill("go-previous-symbolic", "Previous page (p)");
         let next_btn = icon_pill("go-next-symbolic", "Next page (n)");
 
         let page_entry = Entry::new();
-        page_entry.set_width_chars(3);
-        page_entry.set_max_width_chars(5);
+        page_entry.set_width_chars(4);
+        page_entry.set_max_width_chars(8);
         page_entry.set_placeholder_text(Some("1"));
         page_entry.set_tooltip_text(Some("Go to page"));
         page_entry.add_css_class("lector-page-entry");
@@ -700,6 +905,7 @@ impl Lector {
             invert_item.set_active(st.pdf_mode == PdfMode::Inverted);
         }
 
+        back_btn.set_margin_start(8);
         prev_btn.set_margin_start(8);
         zoom_out_btn.set_margin_start(8);
         find_btn.set_margin_start(8);
@@ -709,6 +915,8 @@ impl Lector {
         toolbar.set_valign(gtk::Align::Center);
         toolbar.append(&sidebar_btn);
         toolbar.append(&open_btn);
+        toolbar.append(&back_btn);
+        toolbar.append(&forward_btn);
         toolbar.append(&prev_btn);
         toolbar.append(&page_entry);
         toolbar.append(&page_total);
@@ -734,16 +942,53 @@ impl Lector {
         find_next.set_tooltip_text(Some("Next match"));
         let find_close = Button::from_icon_name("window-close-symbolic");
         find_close.add_css_class("flat");
+        let case_btn = ToggleButton::with_label("Aa");
+        case_btn.add_css_class("flat");
+        case_btn.set_tooltip_text(Some("Match case"));
+        let word_btn = ToggleButton::with_label("W");
+        word_btn.add_css_class("flat");
+        word_btn.set_tooltip_text(Some("Whole words"));
         let find_row = GtkBox::new(Orientation::Horizontal, 8);
-        find_row.add_css_class("lector-find");
         find_row.append(&Label::new(Some("Find:")));
         find_row.append(&search_entry);
+        find_row.append(&case_btn);
+        find_row.append(&word_btn);
         find_row.append(&search_info);
         find_row.append(&find_prev);
         find_row.append(&find_next);
         find_row.append(&find_close);
+        let search_results = ListBox::new();
+        search_results.add_css_class("lector-search-results");
+        search_results.set_selection_mode(gtk::SelectionMode::Single);
+        let search_results_sw = ScrolledWindow::new();
+        search_results_sw.set_child(Some(&search_results));
+        search_results_sw.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        search_results_sw.set_max_content_height(148);
+        search_results_sw.set_propagate_natural_height(true);
+        search_results_sw.set_visible(false);
+        let find_col = GtkBox::new(Orientation::Vertical, 4);
+        find_col.add_css_class("lector-find");
+        find_col.append(&find_row);
+        find_col.append(&search_results_sw);
         let find_bar = Revealer::new();
-        find_bar.set_child(Some(&find_row));
+        find_bar.set_child(Some(&find_col));
+
+        let file_banner_label = Label::new(Some("This file has changed on disk."));
+        file_banner_label.set_hexpand(true);
+        file_banner_label.set_xalign(0.0);
+        file_banner_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let file_reload_btn = Button::with_label("Reload");
+        file_reload_btn.add_css_class("lector-pill");
+        let file_dismiss_btn = Button::from_icon_name("window-close-symbolic");
+        file_dismiss_btn.add_css_class("flat");
+        file_dismiss_btn.set_tooltip_text(Some("Dismiss"));
+        let file_row = GtkBox::new(Orientation::Horizontal, 8);
+        file_row.add_css_class("lector-file-banner");
+        file_row.append(&file_banner_label);
+        file_row.append(&file_reload_btn);
+        file_row.append(&file_dismiss_btn);
+        let file_banner = Revealer::new();
+        file_banner.set_child(Some(&file_row));
 
         // --- side pane ---
         let thumbs = ListBox::new();
@@ -809,6 +1054,7 @@ impl Lector {
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.append(&toolbar);
         root.append(&find_bar);
+        root.append(&file_banner);
         root.append(&body);
         window.set_child(Some(&root));
 
@@ -821,7 +1067,14 @@ impl Lector {
             page_total: page_total.clone(),
             search_entry: search_entry.clone(),
             search_info: search_info.clone(),
+            search_results: search_results.clone(),
+            search_results_sw: search_results_sw.clone(),
+            case_btn: case_btn.clone(),
+            word_btn: word_btn.clone(),
             find_bar: find_bar.clone(),
+            file_banner: file_banner.clone(),
+            file_banner_label: file_banner_label.clone(),
+            file_reload_btn: file_reload_btn.clone(),
             sidebar_revealer: sidebar_revealer.clone(),
             sidebar_btn: sidebar_btn.clone(),
             stack: stack.clone(),
@@ -829,6 +1082,8 @@ impl Lector {
             outline: outline.clone(),
             zoom_drop: zoom_drop.clone(),
             title_label: title_label.clone(),
+            back_btn: back_btn.clone(),
+            forward_btn: forward_btn.clone(),
             prev_btn: prev_btn.clone(),
             next_btn: next_btn.clone(),
             zoom_out_btn: zoom_out_btn.clone(),
@@ -843,6 +1098,7 @@ impl Lector {
             highlight_item: highlight_item.clone(),
             note_item: note_item.clone(),
             delete_annotation_item: delete_annotation_item.clone(),
+            document_menu_items: RefCell::new(Vec::new()),
             thumbs_sw: thumbs_sw.clone(),
             page_widgets: RefCell::new(Vec::new()),
             rendered_structure: RefCell::new(None),
@@ -853,6 +1109,13 @@ impl Lector {
             me: RefCell::new(Weak::new()),
             hold: RefCell::new(None),
             _monitor: RefCell::new(None),
+            doc_monitor: RefCell::new(None),
+            search_debounce_gen: Cell::new(0),
+            file_change_gen: Cell::new(0),
+            ignore_search_changed: Cell::new(false),
+            ignore_search_results: Cell::new(false),
+            pending_disk_change: Cell::new(None),
+            file_watch_ignore_until: Cell::new(None),
         });
         *ui.me.borrow_mut() = Rc::downgrade(&ui);
         let h = Handle(Rc::downgrade(&ui));
@@ -976,6 +1239,32 @@ impl Lector {
         menu_scroll.set_child(Some(&menu_col));
         menu_pop.set_child(Some(&menu_scroll));
         menu_btn.set_popover(Some(&menu_pop));
+        {
+            let document_labels = [
+                "Save a Copy…",
+                "Print…",
+                "Rotate left",
+                "Rotate right",
+                "Presentation",
+                "Reload",
+                "Properties",
+            ];
+            let mut items = Vec::new();
+            let mut child = menu_col.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if let Ok(button) = widget.clone().downcast::<Button>() {
+                    if button
+                        .tooltip_text()
+                        .as_deref()
+                        .is_some_and(|label| document_labels.contains(&label))
+                    {
+                        items.push(widget);
+                    }
+                }
+            }
+            *ui.document_menu_items.borrow_mut() = items;
+        }
         menu_pop.connect_show({
             let h = h.clone();
             move |_| {
@@ -1238,6 +1527,22 @@ impl Lector {
                 }
             }
         });
+        back_btn.connect_clicked({
+            let h = h.clone();
+            move |_| {
+                if let Some(ui) = h.get() {
+                    ui.navigate_back();
+                }
+            }
+        });
+        forward_btn.connect_clicked({
+            let h = h.clone();
+            move |_| {
+                if let Some(ui) = h.get() {
+                    ui.navigate_forward();
+                }
+            }
+        });
         prev_btn.connect_clicked({
             let h = h.clone();
             move |_| {
@@ -1305,9 +1610,18 @@ impl Lector {
         page_entry.connect_activate({
             let h = h.clone();
             move |e| {
-                if let (Some(ui), Ok(n)) = (h.get(), e.text().parse::<i32>()) {
-                    ui.goto_page(n - 1);
-                    ui.pages_box.grab_focus();
+                if let Some(ui) = h.get() {
+                    let labels = ui
+                        .inner
+                        .borrow()
+                        .doc
+                        .as_ref()
+                        .map(|doc| doc.labels.clone())
+                        .unwrap_or_default();
+                    if let Some(page) = page_index_from_input(&e.text(), &labels) {
+                        ui.navigate_to_page(page);
+                        ui.pages_box.grab_focus();
+                    }
                 }
             }
         });
@@ -1315,7 +1629,69 @@ impl Lector {
             let h = h.clone();
             move |e| {
                 if let Some(ui) = h.get() {
+                    ui.cancel_live_search();
                     ui.search(&e.text());
+                }
+            }
+        });
+        search_entry.connect_changed({
+            let h = h.clone();
+            move |e| {
+                if let Some(ui) = h.get() {
+                    if ui.ignore_search_changed.get() {
+                        return;
+                    }
+                    ui.queue_live_search();
+                    let _ = e;
+                }
+            }
+        });
+        case_btn.connect_toggled({
+            let h = h.clone();
+            move |btn| {
+                if let Some(ui) = h.get() {
+                    ui.inner.borrow_mut().search_options.case_sensitive = btn.is_active();
+                    ui.rerun_visible_search();
+                }
+            }
+        });
+        word_btn.connect_toggled({
+            let h = h.clone();
+            move |btn| {
+                if let Some(ui) = h.get() {
+                    ui.inner.borrow_mut().search_options.whole_word = btn.is_active();
+                    ui.rerun_visible_search();
+                }
+            }
+        });
+        search_results.connect_row_activated({
+            let h = h.clone();
+            move |_, row| {
+                if let Some(ui) = h.get() {
+                    if ui.ignore_search_results.get() {
+                        return;
+                    }
+                    if let Ok(index) = row.widget_name().trim_start_matches('s').parse::<usize>() {
+                        ui.inner.borrow_mut().search_idx = Some(index);
+                        ui.jump_search();
+                    }
+                }
+            }
+        });
+        file_reload_btn.connect_clicked({
+            let h = h.clone();
+            move |_| {
+                if let Some(ui) = h.get() {
+                    ui.hide_file_banner();
+                    ui.reload();
+                }
+            }
+        });
+        file_dismiss_btn.connect_clicked({
+            let h = h.clone();
+            move |_| {
+                if let Some(ui) = h.get() {
+                    ui.hide_file_banner();
                 }
             }
         });
@@ -1339,7 +1715,7 @@ impl Lector {
             let h = h.clone();
             move |_, row| {
                 if let Some(ui) = h.get() {
-                    ui.goto_page(row.index());
+                    ui.navigate_to_page(row.index());
                 }
             }
         });
@@ -1347,12 +1723,22 @@ impl Lector {
             let h = h.clone();
             move |_, row| {
                 if let Some(ui) = h.get() {
-                    let page = row
+                    let index = row
                         .widget_name()
-                        .trim_start_matches('p')
-                        .parse::<i32>()
-                        .unwrap_or(0);
-                    ui.goto_page(page);
+                        .trim_start_matches('o')
+                        .parse::<usize>()
+                        .ok();
+                    let page = index.and_then(|index| {
+                        ui.inner
+                            .borrow()
+                            .doc
+                            .as_ref()
+                            .and_then(|doc| doc.outline.get(index))
+                            .and_then(|item| item.page)
+                    });
+                    if let Some(page) = page {
+                        ui.navigate_to_page(page);
+                    }
                 }
             }
         });
@@ -1453,8 +1839,14 @@ impl Lector {
         let restore = {
             let mut st = self.inner.borrow_mut();
             if let Some(old) = st.doc.as_ref() {
-                let previous = (old.path.clone(), st.page, st.zoom);
-                remember_document_state(&mut st.session, &previous.0, previous.1, previous.2);
+                let previous = (old.path.clone(), st.page, st.zoom, st.rotation);
+                remember_document_state(
+                    &mut st.session,
+                    &previous.0,
+                    previous.1,
+                    previous.2,
+                    previous.3,
+                );
             }
             let Inner {
                 search_gen,
@@ -1471,22 +1863,30 @@ impl Lector {
             if let Some(r) = restore {
                 st.page = r.page.clamp(0, (doc.n_pages - 1).max(0));
                 st.zoom = session::parse_zoom(&r.zoom, r.custom);
+                st.rotation = r.rotation;
             } else {
                 st.page = 0;
                 st.zoom = Zoom::FitWidth;
+                st.rotation = 0;
             }
             st.doc = Some(doc);
             st.selection = None;
             st.targeted_annotation = None;
+            st.outline_collapsed.clear();
+            st.navigation.clear();
             if st.sidebar == Sidebar::Hidden {
                 st.sidebar = Sidebar::Thumbs;
             }
             let page = st.page;
             let zoom = st.zoom;
-            remember_document_state(&mut st.session, &opened_path, page, zoom);
+            let rotation = st.rotation;
+            remember_document_state(&mut st.session, &opened_path, page, zoom, rotation);
         }
+        self.ignore_search_changed.set(true);
         self.search_entry.set_text("");
+        self.ignore_search_changed.set(false);
         self.search_info.set_text("");
+        self.clear_search_results();
         let page = self.inner.borrow().page;
         self.sync_zoom_dropdown();
         self.rebuild_sidebar();
@@ -1495,6 +1895,7 @@ impl Lector {
         self.goto_page(page);
         self.update_chrome();
         self.queue_pages_draw();
+        self.watch_open_document();
     }
 
     fn ask_password(&self, path: PathBuf) {
@@ -1688,9 +2089,9 @@ impl Lector {
                     let remember = st
                         .doc
                         .as_ref()
-                        .map(|doc| (doc.path.clone(), st.page, st.zoom));
-                    if let Some((path, page, zoom)) = remember {
-                        remember_document_state(&mut st.session, &path, page, zoom);
+                        .map(|doc| (doc.path.clone(), st.page, st.zoom, st.rotation));
+                    if let Some((path, page, zoom, rotation)) = remember {
+                        remember_document_state(&mut st.session, &path, page, zoom, rotation);
                     }
                     true
                 } else {
@@ -1887,6 +2288,22 @@ impl Lector {
             match restore {
                 ViewRestore::Anchor(anchor) => ui.apply_anchor(anchor),
                 ViewRestore::CurrentPage => ui.scroll_to_current(),
+                ViewRestore::Location(location) => {
+                    let horizontal = ui.scrolled.hadjustment();
+                    horizontal.set_value(clamp_adjustment(
+                        location.horizontal,
+                        horizontal.lower(),
+                        horizontal.upper(),
+                        horizontal.page_size(),
+                    ));
+                    let vertical = ui.scrolled.vadjustment();
+                    vertical.set_value(clamp_adjustment(
+                        location.vertical,
+                        vertical.lower(),
+                        vertical.upper(),
+                        vertical.page_size(),
+                    ));
+                }
             }
             attempts += 1;
             if attempts >= 6 {
@@ -2064,6 +2481,72 @@ impl Lector {
         self.ensure_visible_rasters();
     }
 
+    fn current_location(&self) -> ViewLocation {
+        ViewLocation::new(
+            self.inner.borrow().page,
+            self.scrolled.hadjustment().value(),
+            self.scrolled.vadjustment().value(),
+        )
+    }
+
+    fn navigate_to_page(&self, page: i32) {
+        let current = self.current_location();
+        let (target_page, target_y) = {
+            let st = self.inner.borrow();
+            let n = st.doc.as_ref().map(|doc| doc.n_pages).unwrap_or(1);
+            let target_page = page.clamp(0, (n - 1).max(0));
+            (target_page, page_scroll_y(&st.layout.pages, target_page))
+        };
+        if target_page == current.page {
+            self.goto_page(target_page);
+            return;
+        }
+        let target = ViewLocation::new(target_page, 0.0, target_y);
+        self.inner.borrow_mut().navigation.visit(current, target);
+        self.goto_page(target_page);
+        self.update_navigation_buttons();
+    }
+
+    fn restore_location(&self, location: ViewLocation) {
+        {
+            let mut st = self.inner.borrow_mut();
+            let n = st.doc.as_ref().map(|doc| doc.n_pages).unwrap_or(1);
+            st.page = location.page.clamp(0, (n - 1).max(0));
+            let remember = st
+                .doc
+                .as_ref()
+                .map(|doc| (doc.path.clone(), st.page, st.zoom, st.rotation));
+            if let Some((path, page, zoom, rotation)) = remember {
+                remember_document_state(&mut st.session, &path, page, zoom, rotation);
+            }
+        }
+        self.reflow_restore(ViewRestore::Location(location));
+        self.update_navigation_buttons();
+    }
+
+    fn navigate_back(&self) {
+        let current = self.current_location();
+        let target = self.inner.borrow_mut().navigation.back(current);
+        if let Some(location) = target {
+            self.restore_location(location);
+        }
+    }
+
+    fn navigate_forward(&self) {
+        let current = self.current_location();
+        let target = self.inner.borrow_mut().navigation.forward(current);
+        if let Some(location) = target {
+            self.restore_location(location);
+        }
+    }
+
+    fn update_navigation_buttons(&self) {
+        let st = self.inner.borrow();
+        self.back_btn.set_sensitive(!st.navigation.back.is_empty());
+        self.forward_btn
+            .set_sensitive(!st.navigation.forward.is_empty());
+    }
+
     fn goto_page(&self, page: i32) {
         let mode = {
             let mut st = self.inner.borrow_mut();
@@ -2072,9 +2555,9 @@ impl Lector {
             let remember = st
                 .doc
                 .as_ref()
-                .map(|doc| (doc.path.clone(), st.page, st.zoom));
-            if let Some((path, page, zoom)) = remember {
-                remember_document_state(&mut st.session, &path, page, zoom);
+                .map(|doc| (doc.path.clone(), st.page, st.zoom, st.rotation));
+            if let Some((path, page, zoom, rotation)) = remember {
+                remember_document_state(&mut st.session, &path, page, zoom, rotation);
             }
             st.layout_mode
         };
@@ -2346,9 +2829,6 @@ impl Lector {
         while let Some(c) = self.thumbs.first_child() {
             self.thumbs.remove(&c);
         }
-        while let Some(c) = self.outline.first_child() {
-            self.outline.remove(&c);
-        }
         let st = self.inner.borrow();
         let Some(doc) = st.doc.as_ref() else {
             return;
@@ -2384,23 +2864,80 @@ impl Lector {
             row.set_sensitive(false);
             self.thumbs.append(&row);
         }
-        let outline = self.inner.borrow().doc.as_ref().map(|d| d.outline.clone());
-        if let Some(items) = outline {
-            for item in items {
-                let row = gtk::ListBoxRow::new();
-                let lab = Label::new(Some(&item.title));
-                lab.set_xalign(0.0);
-                lab.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                lab.set_margin_start(10 + item.depth as i32 * 14);
-                lab.set_margin_top(6);
-                lab.set_margin_bottom(6);
-                lab.set_margin_end(8);
-                row.set_child(Some(&lab));
-                row.set_widget_name(&format!("p{}", item.page.unwrap_or(0)));
-                self.outline.append(&row);
-            }
-        }
+        self.rebuild_outline();
         self.schedule_thumbs();
+    }
+
+    fn rebuild_outline(&self) {
+        while let Some(child) = self.outline.first_child() {
+            self.outline.remove(&child);
+        }
+        let (items, collapsed) = {
+            let st = self.inner.borrow();
+            let Some(doc) = st.doc.as_ref() else { return };
+            (doc.outline.clone(), st.outline_collapsed.clone())
+        };
+        for index in visible_outline_indices(&items, &collapsed) {
+            let item = &items[index];
+            let row = gtk::ListBoxRow::new();
+            row.set_widget_name(&format!("o{index}"));
+            let content = GtkBox::new(Orientation::Horizontal, 2);
+            content.set_margin_start(6 + item.depth as i32 * 14);
+            content.set_margin_end(8);
+            content.set_margin_top(2);
+            content.set_margin_bottom(2);
+
+            if outline_item_has_children(&items, index) {
+                let icon = if collapsed.contains(&index) {
+                    "pan-end-symbolic"
+                } else {
+                    "pan-down-symbolic"
+                };
+                let toggle = Button::from_icon_name(icon);
+                toggle.add_css_class("flat");
+                toggle.set_tooltip_text(Some(if collapsed.contains(&index) {
+                    "Expand section"
+                } else {
+                    "Collapse section"
+                }));
+                toggle.update_property(&[gtk::accessible::Property::Label(
+                    if collapsed.contains(&index) {
+                        "Expand section"
+                    } else {
+                        "Collapse section"
+                    },
+                )]);
+                toggle.connect_clicked({
+                    let h = Handle(self.me.borrow().clone());
+                    move |_| {
+                        let Some(ui) = h.get() else { return };
+                        let changed = {
+                            let mut st = ui.inner.borrow_mut();
+                            let Some(items) = st.doc.as_ref().map(|doc| doc.outline.clone()) else {
+                                return;
+                            };
+                            toggle_outline_collapsed(&items, &mut st.outline_collapsed, index)
+                        };
+                        if changed {
+                            ui.rebuild_outline();
+                        }
+                    }
+                });
+                content.append(&toggle);
+            } else {
+                let spacer = GtkBox::new(Orientation::Horizontal, 0);
+                spacer.set_size_request(34, 1);
+                content.append(&spacer);
+            }
+
+            let label = Label::new(Some(&item.title));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            content.append(&label);
+            row.set_child(Some(&content));
+            self.outline.append(&row);
+        }
     }
 
     fn schedule_thumbs(&self) {
@@ -2506,6 +3043,7 @@ impl Lector {
         };
         if q.is_empty() {
             self.search_info.set_text("");
+            self.clear_search_results();
             self.queue_pages_draw();
             return;
         }
@@ -2513,7 +3051,7 @@ impl Lector {
         {
             let mut st = self.inner.borrow_mut();
             if let Some(doc) = st.doc.as_ref() {
-                st.search_hits = doc.find_page(start, &q);
+                st.search_hits = doc.find_page(start, &q, st.search_options);
                 if !st.search_hits.is_empty() {
                     st.search_idx = Some(0);
                 }
@@ -2555,12 +3093,13 @@ impl Lector {
                 return;
             };
             let q = ui.inner.borrow().search_query.clone();
+            let options = ui.inner.borrow().search_options;
             let extra = ui
                 .inner
                 .borrow()
                 .doc
                 .as_ref()
-                .map(|d| d.find_page(page, &q))
+                .map(|d| d.find_page(page, &q, options))
                 .unwrap_or_default();
             if !extra.is_empty() {
                 let mut st = ui.inner.borrow_mut();
@@ -2574,6 +3113,7 @@ impl Lector {
                     let n_hits = st.search_hits.len();
                     drop(st);
                     ui.search_info.set_text(&format!("{} of {}", i + 1, n_hits));
+                    ui.rebuild_search_results();
                     ui.queue_pages_draw();
                 }
             }
@@ -2592,6 +3132,7 @@ impl Lector {
         };
         if n_hits == 0 {
             self.search_info.set_text("Not found");
+            self.clear_search_results();
         } else if search_idx.is_none() {
             self.inner.borrow_mut().search_idx = Some(0);
             self.jump_search();
@@ -2599,6 +3140,7 @@ impl Lector {
             let index = search_idx.unwrap_or(0);
             self.search_info
                 .set_text(&format!("{} of {}", index + 1, n_hits));
+            self.rebuild_search_results();
             self.queue_pages_draw();
         }
     }
@@ -2631,10 +3173,12 @@ impl Lector {
         };
         self.search_info.set_text(&format!("{} of {}", i + 1, n));
         self.goto_page(page);
+        self.rebuild_search_results();
         self.queue_pages_draw();
     }
 
     fn hide_search(&self) {
+        self.cancel_live_search();
         self.find_bar.set_reveal_child(false);
         {
             let mut st = self.inner.borrow_mut();
@@ -2642,6 +3186,7 @@ impl Lector {
             st.search_idx = None;
             st.search_gen = st.search_gen.wrapping_add(1);
         }
+        self.clear_search_results();
         self.queue_pages_draw();
         self.pages_box.grab_focus();
     }
@@ -2649,6 +3194,197 @@ impl Lector {
     fn show_search(&self) {
         self.find_bar.set_reveal_child(true);
         self.search_entry.grab_focus();
+    }
+
+    fn cancel_live_search(&self) {
+        self.search_debounce_gen
+            .set(self.search_debounce_gen.get().wrapping_add(1));
+    }
+
+    fn queue_live_search(&self) {
+        let gen = self.search_debounce_gen.get().wrapping_add(1);
+        self.search_debounce_gen.set(gen);
+        let h = Handle(self.me.borrow().clone());
+        glib::timeout_add_local(Duration::from_millis(LIVE_SEARCH_MS), move || {
+            let Some(ui) = h.get() else {
+                return glib::ControlFlow::Break;
+            };
+            if ui.search_debounce_gen.get() != gen {
+                return glib::ControlFlow::Break;
+            }
+            let query = ui.search_entry.text();
+            ui.search(&query);
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn rerun_visible_search(&self) {
+        if !self.find_bar.reveals_child() {
+            return;
+        }
+        let query = self.search_entry.text();
+        if query.is_empty() {
+            return;
+        }
+        self.cancel_live_search();
+        self.search(&query);
+    }
+
+    fn clear_search_results(&self) {
+        self.ignore_search_results.set(true);
+        while let Some(child) = self.search_results.first_child() {
+            self.search_results.remove(&child);
+        }
+        self.search_results_sw.set_visible(false);
+        self.ignore_search_results.set(false);
+    }
+
+    fn rebuild_search_results(&self) {
+        let (rows, selected) = {
+            let st = self.inner.borrow();
+            if st.search_hits.is_empty() {
+                (Vec::new(), None)
+            } else {
+                let query = st.search_query.clone();
+                let case_sensitive = st.search_options.case_sensitive;
+                let labels = st
+                    .doc
+                    .as_ref()
+                    .map(|doc| doc.labels.clone())
+                    .unwrap_or_default();
+                let mut texts = HashMap::new();
+                if let Some(doc) = st.doc.as_ref() {
+                    for (page, _) in &st.search_hits {
+                        texts.entry(*page).or_insert_with(|| {
+                            doc.page(*page)
+                                .and_then(|page| page.text().map(|text| text.to_string()))
+                                .unwrap_or_default()
+                        });
+                    }
+                }
+                let rows = st
+                    .search_hits
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (page, _))| {
+                        let label = display_page_label(&labels, *page);
+                        let snippet = texts
+                            .get(page)
+                            .map(|text| search_snippet(text, &query, case_sensitive))
+                            .unwrap_or_default();
+                        (index, search_result_row_text(&label, &snippet))
+                    })
+                    .collect::<Vec<_>>();
+                (rows, st.search_idx)
+            }
+        };
+        if rows.is_empty() {
+            self.clear_search_results();
+            return;
+        }
+        self.ignore_search_results.set(true);
+        while let Some(child) = self.search_results.first_child() {
+            self.search_results.remove(&child);
+        }
+        let mut selected_row = None;
+        for (index, caption) in rows {
+            let label = Label::new(Some(&caption));
+            label.set_xalign(0.0);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_hexpand(true);
+            let row = gtk::ListBoxRow::new();
+            row.set_widget_name(&format!("s{index}"));
+            row.set_child(Some(&label));
+            self.search_results.append(&row);
+            if selected == Some(index) {
+                selected_row = Some(row);
+            }
+        }
+        if let Some(row) = selected_row {
+            self.search_results.select_row(Some(&row));
+        }
+        self.search_results_sw.set_visible(true);
+        self.ignore_search_results.set(false);
+    }
+
+    fn hide_file_banner(&self) {
+        self.file_change_gen
+            .set(self.file_change_gen.get().wrapping_add(1));
+        self.pending_disk_change.set(None);
+        self.file_banner.set_reveal_child(false);
+    }
+
+    fn show_file_banner(&self, change: DiskChange) {
+        match change {
+            DiskChange::Modified => {
+                self.file_banner_label
+                    .set_text("This file has changed on disk.");
+                self.file_reload_btn.set_sensitive(true);
+                self.file_reload_btn.set_visible(true);
+            }
+            DiskChange::Removed => {
+                self.file_banner_label
+                    .set_text("This file was removed from disk.");
+                self.file_reload_btn.set_sensitive(false);
+                self.file_reload_btn.set_visible(false);
+            }
+        }
+        self.file_banner.set_reveal_child(true);
+    }
+
+    fn note_disk_change(&self, change: DiskChange) {
+        if self
+            .file_watch_ignore_until
+            .get()
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        let pending = match (self.pending_disk_change.get(), change) {
+            (Some(DiskChange::Removed), _) | (_, DiskChange::Removed) => DiskChange::Removed,
+            _ => DiskChange::Modified,
+        };
+        self.pending_disk_change.set(Some(pending));
+        let gen = self.file_change_gen.get().wrapping_add(1);
+        self.file_change_gen.set(gen);
+        let h = Handle(self.me.borrow().clone());
+        glib::timeout_add_local(Duration::from_millis(FILE_CHANGE_MS), move || {
+            let Some(ui) = h.get() else {
+                return glib::ControlFlow::Break;
+            };
+            if ui.file_change_gen.get() != gen {
+                return glib::ControlFlow::Break;
+            }
+            if let Some(change) = ui.pending_disk_change.get() {
+                ui.show_file_banner(change);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn watch_open_document(&self) {
+        self.hide_file_banner();
+        let path = self.inner.borrow().doc.as_ref().map(|doc| doc.path.clone());
+        let Some(path) = path else {
+            *self.doc_monitor.borrow_mut() = None;
+            return;
+        };
+        let file = gio::File::for_path(&path);
+        let monitor = file
+            .monitor_file(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+            .ok();
+        if let Some(monitor) = monitor.as_ref() {
+            let h = Handle(self.me.borrow().clone());
+            monitor.connect_changed(move |_, _, _, event| {
+                if let (Some(ui), Some(change)) = (h.get(), classify_document_event(event)) {
+                    ui.note_disk_change(change);
+                }
+            });
+        }
+        *self.doc_monitor.borrow_mut() = monitor;
+        self.file_watch_ignore_until.set(Some(
+            Instant::now() + Duration::from_millis(FILE_WATCH_GRACE_MS),
+        ));
     }
 
     fn link_at_view(&self, x: f64, y: f64) -> Option<DocumentLink> {
@@ -2671,7 +3407,7 @@ impl Lector {
 
     fn follow_link(&self, link: DocumentLink) {
         match link {
-            DocumentLink::GotoPage(page) => self.goto_page(page),
+            DocumentLink::GotoPage(page) => self.navigate_to_page(page),
             DocumentLink::Uri(uri) => {
                 if !external_uri_allowed(&uri) {
                     self.alert(
@@ -3329,9 +4065,12 @@ impl Lector {
     fn persist(&self) {
         let result = {
             let mut st = self.inner.borrow_mut();
-            let remember = st.doc.as_ref().map(|d| (d.path.clone(), st.page, st.zoom));
-            if let Some((path, page, zoom)) = remember {
-                remember_document_state(&mut st.session, &path, page, zoom);
+            let remember = st
+                .doc
+                .as_ref()
+                .map(|d| (d.path.clone(), st.page, st.zoom, st.rotation));
+            if let Some((path, page, zoom, rotation)) = remember {
+                remember_document_state(&mut st.session, &path, page, zoom, rotation);
             }
             st.session.invert = st.pdf_mode == PdfMode::Inverted;
             st.session.pdf_mode = st.pdf_mode.key().into();
@@ -3376,11 +4115,17 @@ impl Lector {
         self.zoom_in_btn.set_sensitive(has_doc);
         self.zoom_drop.set_sensitive(has_doc);
         self.find_btn.set_sensitive(has_doc);
+        for item in self.document_menu_items.borrow().iter() {
+            item.set_sensitive(has_doc);
+        }
         if let Some(doc) = st.doc.as_ref() {
             self.window.set_title(Some(&doc.title));
             self.title_label.set_text(&doc.title);
             self.page_total.set_text(&format!("/ {}", doc.n_pages));
-            self.page_entry.set_text(&format!("{}", st.page + 1));
+            if !self.page_entry.has_focus() {
+                self.page_entry
+                    .set_text(&display_page_label(&doc.labels, st.page));
+            }
         } else {
             self.window.set_title(Some(""));
             self.title_label.set_text("Open a document");
@@ -3388,12 +4133,21 @@ impl Lector {
             self.page_entry.set_text("");
         }
         drop(st);
+        self.update_navigation_buttons();
         self.update_annotation_actions();
     }
 
     fn key(&self, key: Key, mods: gdk::ModifierType) -> glib::Propagation {
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+
+        if let Some(direction) = navigation_shortcut(key, mods) {
+            match direction {
+                HistoryDirection::Back => self.navigate_back(),
+                HistoryDirection::Forward => self.navigate_forward(),
+            }
+            return glib::Propagation::Stop;
+        }
 
         if self.search_entry.has_focus() && !ctrl {
             if key == Key::Escape {
@@ -3853,6 +4607,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_shortcuts_are_recognized_before_focused_entry_input() {
+        assert_eq!(
+            navigation_shortcut(Key::Left, gdk::ModifierType::ALT_MASK),
+            Some(HistoryDirection::Back)
+        );
+        assert_eq!(
+            navigation_shortcut(Key::Right, gdk::ModifierType::ALT_MASK),
+            Some(HistoryDirection::Forward)
+        );
+        assert_eq!(
+            navigation_shortcut(Key::Left, gdk::ModifierType::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn outline_toggle_changes_visible_rows() {
+        let items = vec![
+            crate::doc::OutlineItem {
+                title: "Chapter".into(),
+                page: Some(0),
+                depth: 0,
+            },
+            crate::doc::OutlineItem {
+                title: "Section".into(),
+                page: Some(1),
+                depth: 1,
+            },
+        ];
+        let mut collapsed = HashSet::new();
+
+        assert!(toggle_outline_collapsed(&items, &mut collapsed, 0));
+        assert_eq!(
+            crate::doc::visible_outline_indices(&items, &collapsed),
+            vec![0]
+        );
+        assert!(toggle_outline_collapsed(&items, &mut collapsed, 0));
+        assert_eq!(
+            crate::doc::visible_outline_indices(&items, &collapsed),
+            vec![0, 1]
+        );
+        assert!(!toggle_outline_collapsed(&items, &mut collapsed, 1));
+    }
+
+    #[test]
+    fn navigation_history_moves_backward_and_forward_without_duplicates() {
+        let first = ViewLocation::new(2, 0.0, 320.0);
+        let second = ViewLocation::new(8, 0.0, 910.0);
+        let third = ViewLocation::new(13, 0.0, 1450.0);
+        let mut history = NavigationHistory::default();
+
+        history.visit(first, second);
+        history.visit(second, third);
+        history.visit(third, third);
+
+        assert_eq!(history.back(third), Some(second));
+        assert_eq!(history.back(second), Some(first));
+        assert_eq!(history.forward(first), Some(second));
+        assert_eq!(history.forward(second), Some(third));
+        assert_eq!(history.forward(third), None);
+    }
+
+    #[test]
     fn pinch_updates_reuse_the_gesture_start_anchor() {
         let anchor = ViewportAnchor {
             content_x: 500.0,
@@ -3894,6 +4711,53 @@ mod tests {
         ] {
             assert!(!external_uri_allowed(uri), "{uri}");
         }
+    }
+
+    #[test]
+    fn search_snippet_centers_the_query_and_collapses_whitespace() {
+        let text = "Preface\n\nThe Needle sits in the middle of this paragraph about search.";
+        assert_eq!(
+            search_snippet(text, "needle", false),
+            "The Needle sits in the middle of this paragraph…"
+        );
+        assert_eq!(
+            search_snippet(text, "Needle", true),
+            search_snippet(text, "needle", false)
+        );
+        assert!(search_snippet(text, "Needle", true).contains("Needle"));
+        assert!(search_snippet("no match here", "zzz", false).starts_with("no match"));
+        assert_eq!(
+            search_result_row_text("iv", "The Needle sits…"),
+            "iv  The Needle sits…"
+        );
+    }
+
+    #[test]
+    fn document_monitor_events_distinguish_edits_from_removal() {
+        assert_eq!(
+            classify_document_event(gio::FileMonitorEvent::ChangesDoneHint),
+            Some(DiskChange::Modified)
+        );
+        assert_eq!(
+            classify_document_event(gio::FileMonitorEvent::Changed),
+            Some(DiskChange::Modified)
+        );
+        assert_eq!(
+            classify_document_event(gio::FileMonitorEvent::Renamed),
+            Some(DiskChange::Modified)
+        );
+        assert_eq!(
+            classify_document_event(gio::FileMonitorEvent::Deleted),
+            Some(DiskChange::Removed)
+        );
+        assert_eq!(
+            classify_document_event(gio::FileMonitorEvent::MovedOut),
+            Some(DiskChange::Removed)
+        );
+        assert_eq!(
+            classify_document_event(gio::FileMonitorEvent::AttributeChanged),
+            None
+        );
     }
 
     #[test]
@@ -4030,12 +4894,13 @@ mod tests {
     fn outgoing_document_state_is_available_to_a_same_file_reload() {
         let mut session = Session::default();
         let path = Path::new("/documents/reload.pdf");
-        remember_document_state(&mut session, path, 6, Zoom::Custom(1.4));
+        remember_document_state(&mut session, path, 6, Zoom::Custom(1.4), 270);
 
         let restored = session
             .restore(path)
             .expect("state remembered before reload");
         assert_eq!(restored.page, 6);
+        assert_eq!(restored.rotation, 270);
         assert_eq!(
             session::parse_zoom(&restored.zoom, restored.custom),
             Zoom::Custom(1.4)

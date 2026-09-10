@@ -264,6 +264,20 @@ dropdown popover row:selected label {{
   padding: 5px 10px;
   border-bottom: 1px solid alpha({fg}, 0.10);
 }}
+.lector-file-banner {{
+  padding: 5px 10px;
+  border-bottom: 1px solid alpha({fg}, 0.10);
+  background-color: {dark};
+  color: {fg};
+}}
+.lector-search-results {{
+  background: transparent;
+  padding: 2px 0 4px;
+}}
+.lector-search-results row {{
+  padding: 2px 4px;
+  border-radius: {r}px;
+}}
 .lector-sidebar {{
   background-color: {dark};
   border-right: 1px solid alpha({fg}, 0.08);

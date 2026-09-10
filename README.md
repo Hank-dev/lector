@@ -28,16 +28,18 @@ colored diagrams.
 
 - Continuous, single, and dual page
 - Fit width / page / height, explicit zoom, pinch-to-zoom, Ctrl+scroll, two-finger pan
-- Thumbnails and outline in the side pane (F9)
-- Find (Ctrl+F), text selection and copy
+- Thumbnails and an expandable outline in the side pane (F9)
+- Find (Ctrl+F), live results, match-case and whole-word options, text selection and copy
 - Persistent yellow highlights and text notes attached to selected regions
 - Reading History dialog with the latest 20 documents, page positions, and missing-file status
-- Clickable internal and external links
+- Clickable internal and external links with Back/Forward navigation
 - Normal, inverted, or Omarchy-following PDF colors
 - Rotate, fullscreen, presentation (F5)
 - Print and save a copy
 - Encrypted PDFs
-- Remembers page and zoom per file in a private, concurrency-safe session store
+- PDF page labels such as “iv” or “A-3” in the page box
+- Remembers page, zoom, and rotation per file in a private, concurrency-safe session store
+- Offers Reload when the open file changes on disk
 - Live Omarchy theme follow
 
 ## Install
@@ -92,6 +94,7 @@ atomic/private persistence, stale-writer merging, deletion, and all page rotatio
 | c / d / s | Continuous / Dual / Single |
 | w / a | Fit width / Fit page |
 | Ctrl++ − 0 | Zoom in / out / 100% |
+| Alt+← / Alt+→ | Back / forward |
 | n p | Next / previous page |
 | ↑ / ↓ | Scroll up / down in continuous view |
 | Ctrl+I | Invert |

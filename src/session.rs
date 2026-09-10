@@ -46,6 +46,8 @@ pub struct FileState {
     pub page: i32,
     pub zoom: String,
     pub custom: f64,
+    #[serde(default)]
+    pub rotation: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +64,7 @@ impl Default for FileState {
             page: 0,
             zoom: "fit-width".into(),
             custom: 1.0,
+            rotation: 0,
         }
     }
 }
@@ -160,6 +163,9 @@ impl Session {
     }
 
     fn normalize(&mut self) {
+        for state in self.files.values_mut() {
+            state.rotation = state.rotation.rem_euclid(360) / 90 * 90;
+        }
         let mut seen = HashSet::new();
         let mut recent = self
             .recent
@@ -181,7 +187,12 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub fn remember(&mut self, path: &Path, page: i32, zoom: Zoom) {
+        self.remember_with_rotation(path, page, zoom, 0);
+    }
+
+    pub fn remember_with_rotation(&mut self, path: &Path, page: i32, zoom: Zoom, rotation: i32) {
         let key = path.to_string_lossy().into_owned();
         if self.suppressed_history_path.as_deref() == Some(key.as_str()) {
             return;
@@ -196,6 +207,7 @@ impl Session {
                     Zoom::Custom(s) => s,
                     _ => 1.0,
                 },
+                rotation: rotation.rem_euclid(360) / 90 * 90,
             },
         );
         self.dirty_files.insert(key.clone());
@@ -502,6 +514,40 @@ mod tests {
             .is_some());
         assert_eq!(session.files.len(), MAX_FILES);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn loaded_rotation_is_normalized_before_restore() {
+        let path = test_path("loaded-rotation");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "sidebar = \"\"\ninvert = false\npdf_mode = \"\"\nlayout = \"\"\nrecent = [\"/documents/a.pdf\"]\nhistory_generation = 0\n\n[files.\"/documents/a.pdf\"]\npage = 0\nzoom = \"actual\"\ncustom = 1.0\nrotation = 450\n",
+        )
+        .unwrap();
+
+        let session = Session::load_from_path(&path);
+        assert_eq!(
+            session
+                .restore(Path::new("/documents/a.pdf"))
+                .unwrap()
+                .rotation,
+            90
+        );
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn per_document_rotation_is_normalized_and_restored() {
+        let mut session = Session::default();
+        let path = Path::new("/documents/rotated.pdf");
+
+        session.remember_with_rotation(path, 4, Zoom::FitPage, 450);
+
+        let restored = session.restore(path).expect("saved file state");
+        assert_eq!(restored.page, 4);
+        assert_eq!(restored.rotation, 90);
     }
 
     #[test]

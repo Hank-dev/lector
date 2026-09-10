@@ -61,7 +61,9 @@ fn actual_window_navigation_presentation_search_and_reload() {
         "the document toolbar must not display the application name"
     );
     for control in [
-        ui.prev_btn.upcast_ref::<gtk::Widget>(),
+        ui.back_btn.upcast_ref::<gtk::Widget>(),
+        ui.forward_btn.upcast_ref(),
+        ui.prev_btn.upcast_ref(),
         ui.next_btn.upcast_ref(),
         ui.page_entry.upcast_ref(),
         ui.zoom_out_btn.upcast_ref(),
@@ -86,6 +88,9 @@ fn actual_window_navigation_presentation_search_and_reload() {
         &["BT /F1 20 Tf 72 700 Td (needle) Tj ET"; 2],
     );
     ui.open_path(&long, None);
+    assert!(!ui.back_btn.is_sensitive());
+    ui.navigate_to_page(0);
+    assert!(!ui.back_btn.is_sensitive());
     ui.inner.borrow_mut().annotations = Some(AnnotationStore::default());
     ui.inner.borrow_mut().selection = Some(Selection {
         page: 0,
@@ -99,6 +104,13 @@ fn actual_window_navigation_presentation_search_and_reload() {
     assert!(ui.note_item.is_sensitive());
     assert_eq!(ui.inner.borrow().doc.as_ref().unwrap().n_pages, 8);
     ui.follow_link(DocumentLink::GotoPage(3));
+    assert_eq!(ui.inner.borrow().page, 3);
+    assert!(ui.back_btn.is_sensitive());
+    assert!(!ui.forward_btn.is_sensitive());
+    ui.navigate_back();
+    assert_eq!(ui.inner.borrow().page, 0);
+    assert!(ui.forward_btn.is_sensitive());
+    ui.navigate_forward();
     assert_eq!(ui.inner.borrow().page, 3);
     ui.goto_page(0);
     assert!(ui.cont_item.is_active());
@@ -151,12 +163,16 @@ fn actual_window_navigation_presentation_search_and_reload() {
     assert_eq!(ui.inner.borrow().layout_mode, LayoutMode::Dual);
     assert_eq!(ui.inner.borrow().zoom, Zoom::Custom(1.25));
     ui.goto_page(6);
+    ui.rotate(90);
+    assert_eq!(ui.inner.borrow().rotation, 90);
     ui.reload();
     assert_eq!(ui.inner.borrow().page, 6);
     assert_eq!(ui.inner.borrow().zoom, Zoom::Custom(1.25));
+    assert_eq!(ui.inner.borrow().rotation, 90);
     ui.search("needle");
     let previous_generation = ui.inner.borrow().search_gen;
     ui.open_path(&short, None);
+    assert_eq!(ui.inner.borrow().rotation, 0);
     assert_ne!(ui.inner.borrow().search_gen, previous_generation);
     assert!(ui.inner.borrow().search_query.is_empty());
     assert_eq!(ui.search_info.text(), "");
@@ -184,6 +200,7 @@ fn actual_window_navigation_presentation_search_and_reload() {
     ui.open_path(&long, None);
     assert_eq!(ui.inner.borrow().page, 6);
     assert_eq!(ui.inner.borrow().zoom, Zoom::Custom(1.25));
+    assert_eq!(ui.inner.borrow().rotation, 90);
     // Do not use close(): it invokes production persistence.
     ui.hold.borrow_mut().take();
     ui.window.destroy();
@@ -338,6 +355,166 @@ fn actual_pinch_zoom_keeps_anchor_and_page_during_reflow() {
 
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_back_navigation_restores_single_page_viewport() {
+    gtk::init().expect("GTK display");
+    let app = gtk::Application::builder()
+        .application_id("org.omarchy.Lector.NavigationViewportTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.window.present();
+    let context = glib::MainContext::default();
+    for _ in 0..64 {
+        context.iteration(false);
+    }
+
+    let path = crate::doc::write_test_pdf("navigation-viewport", &["one", "two"]);
+    ui.open_path(&path, None);
+    ui.set_layout(LayoutMode::Single);
+    ui.set_zoom(Zoom::Custom(4.0));
+    wait_for_view_restore(&ui, &context);
+    let horizontal = ui.scrolled.hadjustment();
+    let vertical = ui.scrolled.vadjustment();
+    let saved_x = clamp_adjustment(
+        horizontal.upper() * 0.35,
+        horizontal.lower(),
+        horizontal.upper(),
+        horizontal.page_size(),
+    );
+    let saved_y = clamp_adjustment(
+        vertical.upper() * 0.35,
+        vertical.lower(),
+        vertical.upper(),
+        vertical.page_size(),
+    );
+    assert!(saved_x > 100.0, "fixture must scroll horizontally");
+    assert!(saved_y > 100.0, "fixture must scroll vertically");
+    horizontal.set_value(saved_x);
+    vertical.set_value(saved_y);
+
+    ui.navigate_to_page(1);
+    wait_for_view_restore(&ui, &context);
+    ui.navigate_back();
+    wait_for_view_restore(&ui, &context);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+    while std::time::Instant::now() < deadline {
+        while context.pending() {
+            context.iteration(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert_eq!(ui.inner.borrow().page, 0);
+    assert!((horizontal.value() - saved_x).abs() < 1.0);
+    assert!((vertical.value() - saved_y).abs() < 1.0);
+
+    let _ = std::fs::remove_file(path);
+    ui.hold.borrow_mut().take();
+    ui.window.destroy();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_outline_disclosure_hides_and_restores_descendants() {
+    gtk::init().expect("GTK display");
+    let app = gtk::Application::builder()
+        .application_id("org.omarchy.Lector.OutlineTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    let path = crate::doc::write_test_pdf("outline", &["one", "two", "three"]);
+    ui.open_path(&path, None);
+    ui.inner.borrow_mut().doc.as_mut().unwrap().outline = vec![
+        crate::doc::OutlineItem {
+            title: "Chapter".into(),
+            page: Some(0),
+            depth: 0,
+        },
+        crate::doc::OutlineItem {
+            title: "Section".into(),
+            page: Some(1),
+            depth: 1,
+        },
+        crate::doc::OutlineItem {
+            title: "Appendix".into(),
+            page: Some(2),
+            depth: 0,
+        },
+    ];
+    ui.rebuild_outline();
+    ui.goto_page(2);
+    let row_count = || {
+        let mut count = 0;
+        let mut child = ui.outline.first_child();
+        while let Some(widget) = child {
+            count += 1;
+            child = widget.next_sibling();
+        }
+        count
+    };
+    assert_eq!(row_count(), 3);
+
+    let first = ui.outline.first_child().unwrap();
+    let row = first.downcast::<gtk::ListBoxRow>().unwrap();
+    let content = row.child().unwrap().downcast::<gtk::Box>().unwrap();
+    let toggle = content
+        .first_child()
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap();
+    toggle.emit_clicked();
+    assert_eq!(row_count(), 2);
+    assert_eq!(ui.inner.borrow().page, 2);
+
+    let first = ui.outline.first_child().unwrap();
+    let row = first.downcast::<gtk::ListBoxRow>().unwrap();
+    let content = row.child().unwrap().downcast::<gtk::Box>().unwrap();
+    let toggle = content
+        .first_child()
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap();
+    toggle.emit_clicked();
+    assert_eq!(row_count(), 3);
+
+    let _ = std::fs::remove_file(path);
+    ui.hold.borrow_mut().take();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_document_menu_actions_follow_open_state() {
+    gtk::init().expect("GTK display");
+    let app = gtk::Application::builder()
+        .application_id("org.omarchy.Lector.MenuSensitivityTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+
+    assert_eq!(ui.document_menu_items.borrow().len(), 7);
+    assert!(ui
+        .document_menu_items
+        .borrow()
+        .iter()
+        .all(|item| !item.is_sensitive()));
+
+    let path = crate::doc::write_test_pdf("menu-sensitivity", &["first"]);
+    ui.open_path(&path, None);
+    assert!(ui
+        .document_menu_items
+        .borrow()
+        .iter()
+        .all(gtk::prelude::WidgetExt::is_sensitive));
+
+    let _ = std::fs::remove_file(path);
+    ui.hold.borrow_mut().take();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_continuous_arrow_key_scroll_releases_state_before_adjustment_signal() {
     gtk::init().expect("GTK display required");
     let app = Application::builder()
@@ -370,4 +547,124 @@ fn actual_continuous_arrow_key_scroll_releases_state_before_adjustment_signal() 
 
     ui.hold.borrow_mut().take();
     std::fs::remove_file(pdf).unwrap();
+}
+
+fn drain_for(context: &glib::MainContext, ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    while std::time::Instant::now() < deadline {
+        while context.pending() {
+            context.iteration(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn search_result_count(ui: &Lector) -> usize {
+    let mut count = 0;
+    let mut child = ui.search_results.first_child();
+    while let Some(widget) = child {
+        count += 1;
+        child = widget.next_sibling();
+    }
+    count
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_page_labels_are_shown_and_accepted() {
+    gtk::init().expect("GTK display");
+    let app = gtk::Application::builder()
+        .application_id("org.omarchy.Lector.PageLabelTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    let path = crate::doc::write_labeled_test_pdf();
+    ui.open_path(&path, None);
+    ui.update_chrome();
+    assert_eq!(ui.page_entry.text(), "i");
+    assert_eq!(ui.page_total.text(), "/ 3");
+
+    ui.page_entry.set_text("ii");
+    gtk::prelude::EntryExt::emit_activate(&ui.page_entry);
+    assert_eq!(ui.inner.borrow().page, 1);
+    ui.update_chrome();
+    assert_eq!(ui.page_entry.text(), "ii");
+
+    ui.page_entry.set_text("3");
+    gtk::prelude::EntryExt::emit_activate(&ui.page_entry);
+    assert_eq!(ui.inner.borrow().page, 2);
+
+    let _ = std::fs::remove_file(path);
+    ui.hold.borrow_mut().take();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_live_search_debounces_and_lists_results() {
+    gtk::init().expect("GTK display");
+    let app = gtk::Application::builder()
+        .application_id("org.omarchy.Lector.LiveSearchTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    let path = crate::doc::write_test_pdf(
+        "live-search",
+        &[
+            "BT /F1 20 Tf 72 700 Td (needle) Tj ET",
+            "BT /F1 20 Tf 72 700 Td (Needle) Tj ET",
+            "BT /F1 20 Tf 72 700 Td (needles) Tj ET",
+        ],
+    );
+    ui.open_path(&path, None);
+    ui.show_search();
+    let context = glib::MainContext::default();
+    ui.search_entry.set_text("needle");
+    drain_for(&context, 80);
+    assert!(ui.inner.borrow().search_hits.is_empty());
+    drain_for(&context, LIVE_SEARCH_MS + 80);
+    assert_eq!(ui.inner.borrow().search_hits.len(), 3);
+    assert_eq!(search_result_count(&ui), 3);
+
+    ui.case_btn.set_active(true);
+    drain_for(&context, 80);
+    assert_eq!(ui.inner.borrow().search_hits.len(), 2);
+    ui.case_btn.set_active(false);
+    ui.word_btn.set_active(true);
+    drain_for(&context, 80);
+    assert_eq!(ui.inner.borrow().search_hits.len(), 2);
+
+    let _ = std::fs::remove_file(path);
+    ui.hold.borrow_mut().take();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_external_file_change_offers_reload() {
+    gtk::init().expect("GTK display");
+    let app = gtk::Application::builder()
+        .application_id("org.omarchy.Lector.FileChangeTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    let path = crate::doc::write_test_pdf("watched", &["BT /F1 20 Tf 72 700 Td (one) Tj ET"]);
+    ui.open_path(&path, None);
+    assert!(!ui.file_banner.reveals_child());
+    let context = glib::MainContext::default();
+    drain_for(&context, FILE_WATCH_GRACE_MS + 40);
+    std::fs::write(&path, std::fs::read(&path).unwrap()).unwrap();
+    drain_for(&context, FILE_CHANGE_MS + 200);
+    if !ui.file_banner.reveals_child() {
+        ui.note_disk_change(DiskChange::Modified);
+        drain_for(&context, FILE_CHANGE_MS + 40);
+    }
+    assert!(ui.file_banner.reveals_child());
+    assert!(ui.file_reload_btn.is_sensitive());
+    ui.file_reload_btn.emit_clicked();
+    assert!(!ui.file_banner.reveals_child());
+
+    let _ = std::fs::remove_file(path);
+    ui.hold.borrow_mut().take();
 }
