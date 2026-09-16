@@ -1,5 +1,6 @@
 mod annotations;
 mod doc;
+mod persist;
 mod session;
 mod theme;
 mod view;

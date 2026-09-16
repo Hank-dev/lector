@@ -46,6 +46,15 @@ pub fn visible_outline_indices(items: &[OutlineItem], collapsed: &HashSet<usize>
     visible
 }
 
+pub fn initially_collapsed_outline(items: &[OutlineItem]) -> HashSet<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| outline_item_has_children(items, *index))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct PageSize {
     pub w: f64,
@@ -574,6 +583,24 @@ mod tests {
         assert_eq!(display_page_label(&labels, 0), "i");
         assert_eq!(display_page_label(&labels, 2), "1");
         assert_eq!(display_page_label(&labels, 9), "10");
+    }
+
+    #[test]
+    fn outline_parents_start_collapsed() {
+        let items = sample_outline();
+        let collapsed = initially_collapsed_outline(&items);
+        assert_eq!(visible_outline_indices(&items, &collapsed), vec![0, 4]);
+
+        let mut chapter = collapsed.clone();
+        assert!(chapter.remove(&0));
+        assert_eq!(visible_outline_indices(&items, &chapter), vec![0, 1, 3, 4]);
+
+        let mut section = chapter;
+        assert!(section.remove(&1));
+        assert_eq!(
+            visible_outline_indices(&items, &section),
+            vec![0, 1, 2, 3, 4]
+        );
     }
 
     #[test]

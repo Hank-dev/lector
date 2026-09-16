@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Native PDF viewer for Omarchy — Evince-class features, live theme follow"
-repository = "https://github.com/omarchy/lector"
+repository = "https://github.com/Hank-dev/lector"
 authors = ["hanky"]
 
 [dependencies]

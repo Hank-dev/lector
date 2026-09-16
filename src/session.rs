@@ -1,15 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::persist::{open_lock_file, write_private_atomic};
 use crate::view::{LayoutMode, Zoom};
 
 const MAX_FILES: usize = 200;
-static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Session {
@@ -289,77 +287,11 @@ fn zoom_key(z: Zoom) -> String {
 }
 
 fn session_path() -> PathBuf {
-    app_session_path("lector")
+    crate::persist::user_config_file("lector", "session.toml")
 }
 
 fn legacy_session_path() -> PathBuf {
-    app_session_path("omadoc")
-}
-
-fn app_session_path(app_name: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".config")
-        .join(app_name)
-        .join("session.toml")
-}
-
-fn open_lock_file(path: &Path) -> Result<fs::File, String> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|e| format!("open session lock {}: {e}", path.display()))
-}
-
-fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("session path {} has no parent", path.display()))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("session.toml");
-    let mut created = None;
-    for _ in 0..128 {
-        let id = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!(".{name}.{}-{id}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&temp) {
-            Ok(file) => {
-                created = Some((temp, file));
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("create temporary session file: {e}")),
-        }
-    }
-    let Some((temp, mut file)) = created else {
-        return Err("could not create a unique temporary session file".into());
-    };
-    let result = (|| {
-        file.write_all(contents)
-            .map_err(|e| format!("write temporary session {}: {e}", temp.display()))?;
-        file.sync_all()
-            .map_err(|e| format!("sync temporary session {}: {e}", temp.display()))?;
-        drop(file);
-        fs::rename(&temp, path).map_err(|e| format!("replace session {}: {e}", path.display()))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    crate::persist::user_config_file("omadoc", "session.toml")
 }
 
 #[cfg(test)]

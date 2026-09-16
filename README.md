@@ -17,10 +17,10 @@ colored diagrams.
 │ [side] [open] [‹] page / N [›]  title  [−] [zoom▾] [+] [find] [☰]       │
 ├────────────┬─────────────────────────────────────────────────────────────┤
 │            │  Find: [        ]   2 of 14   [↑] [↓] [x]                  │
-│ thumbnails ├─────────────────────────────────────────────────────────────┤
+│ outline    ├─────────────────────────────────────────────────────────────┤
 │            │                                                             │
-│ [Thumbs]   │              PDF pages                                      │
-│ [Outline]  │                                                             │
+│ [Outline]  │              PDF pages                                      │
+│ [Thumbs]   │                                                             │
 └────────────┴─────────────────────────────────────────────────────────────┘
 ```
 
@@ -28,9 +28,9 @@ colored diagrams.
 
 - Continuous, single, and dual page
 - Fit width / page / height, explicit zoom, pinch-to-zoom, Ctrl+scroll, two-finger pan
-- Thumbnails and an expandable outline in the side pane (F9)
-- Find (Ctrl+F), live results, match-case and whole-word options, text selection and copy
-- Persistent yellow highlights and text notes attached to selected regions
+- Thumbnails, an expandable outline, and a Marks list in the side pane (F9)
+- Find (Ctrl+F), live results that scroll to the match, match-case and whole-word options, text selection and copy
+- Persistent yellow highlights (one mark per selection, including multi-line) and editable text notes; listed in the Marks pane
 - Reading History dialog with the latest 20 documents, page positions, and missing-file status
 - Clickable internal and external links with Back/Forward navigation
 - Normal, inverted, or Omarchy-following PDF colors
@@ -47,7 +47,7 @@ colored diagrams.
 Needs `gtk4`, `poppler-glib`, and a Rust toolchain (all present on Omarchy).
 
 ```bash
-cd ~/Projects/lector
+cd ~/Projects/omadoc
 make install
 # optional: take over PDF files
 make default
@@ -102,10 +102,13 @@ atomic/private persistence, stale-writer merging, deletion, and all page rotatio
 | Ctrl+P | Print |
 
 Menu: Open, Save a Copy, Print, highlight selection, add/delete annotations,
-Side Pane, Continuous, Dual, Single page, PDF colors (Normal, Follow Omarchy,
+Side Pane (Outline / Thumbnails / Marks), Continuous, Dual, Single page, PDF colors (Normal, Follow Omarchy,
 or Inverted), Rotate, Fullscreen,
 Presentation, Reload, Reading History, Properties, Keyboard shortcuts, and About Lector.
 
-Annotations are stored by Lector in `~/.config/lector/annotations.toml`, never beside
-the PDF. Both annotation and reading-state files are atomically replaced and private
-to the user (`0600` on Unix). Clearing Reading History does not remove annotations.
+Annotations are stored by Lector in `$XDG_CONFIG_HOME/lector/annotations.toml`
+(falling back to `~/.config/lector/annotations.toml`), never beside the PDF.
+Print includes the current rotation and marks; Save a Copy writes the original PDF
+without them. Both annotation and reading-state files are atomically replaced and
+private to the user (`0600` on Unix). Clearing Reading History does not remove
+annotations.

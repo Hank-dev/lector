@@ -100,6 +100,8 @@ pub const PAGE_PAD: f64 = 16.0;
 pub const MAX_ZOOM: f64 = 16.0;
 pub const VIEW_PAGE_PAD: f64 = 400.0;
 pub const THUMB_CSS_WIDTH: f64 = 180.0;
+pub const MAX_RASTER_EDGE: i32 = 4096;
+pub const SEARCH_HIT_MARGIN: f64 = 24.0;
 
 pub fn pages_intersecting_view(
     pages: &[PageGeom],
@@ -123,6 +125,36 @@ pub fn page_at_content_y(pages: &[PageGeom], y: f64) -> i32 {
         }
     }
     pages.last().map(|page| page.index).unwrap_or(0)
+}
+
+pub fn page_in_view(pages: &[PageGeom], view_top: f64, _view_h: f64) -> i32 {
+    // Match goto_page / page_scroll_y: the page at the top of the viewport,
+    // not the midpoint. A tall window at 50% zoom must not skip ahead.
+    page_at_content_y(pages, view_top)
+}
+
+pub fn layout_content_size(pages: &[PageGeom]) -> (f64, f64) {
+    let mut width = PAGE_PAD;
+    let mut height = PAGE_PAD;
+    for page in pages {
+        width = width.max(page.x + page.w);
+        height = height.max(page.y + page.h);
+    }
+    (width.max(1.0), height.max(1.0))
+}
+
+pub fn raster_pixel_size(css_w: f64, css_h: f64, dpr: f64) -> (i32, i32) {
+    let dpr = dpr.max(1.0);
+    let mut width = (css_w.max(1.0) * dpr).ceil().max(1.0);
+    let mut height = (css_h.max(1.0) * dpr).ceil().max(1.0);
+    let edge = width.max(height);
+    let max_edge = MAX_RASTER_EDGE as f64;
+    if edge > max_edge {
+        let scale = max_edge / edge;
+        width = (width * scale).floor().max(1.0);
+        height = (height * scale).floor().max(1.0);
+    }
+    (width as i32, height as i32)
 }
 
 pub fn page_scroll_y(pages: &[PageGeom], page: i32) -> f64 {
@@ -178,10 +210,11 @@ impl RasterKey {
         dpr: f64,
     ) -> Self {
         let dpr = dpr.max(1.0);
+        let (width, height) = raster_pixel_size(geom.w, geom.h, dpr);
         Self {
             index: geom.index,
-            width: (geom.w * dpr).ceil().max(1.0) as i32,
-            height: (geom.h * dpr).ceil().max(1.0) as i32,
+            width,
+            height,
             rotation,
             pdf_mode,
             palette: if pdf_mode == PdfMode::Omarchy {
@@ -214,14 +247,19 @@ impl RasterCache {
         Some(surf)
     }
 
-    pub fn get_page(&mut self, index: i32) -> Option<ImageSurface> {
+    pub fn get_page(&mut self, wanted: &RasterKey) -> Option<(ImageSurface, i32)> {
         let key = self
             .lru
             .iter()
             .rev()
-            .find(|key| key.index == index)
+            .find(|key| {
+                key.index == wanted.index
+                    && key.pdf_mode == wanted.pdf_mode
+                    && key.palette == wanted.palette
+            })
             .copied()?;
         self.get(&key)
+            .map(|surface| (surface, (wanted.rotation - key.rotation).rem_euclid(360)))
     }
 
     pub fn contains(&self, key: &RasterKey) -> bool {
@@ -272,7 +310,7 @@ pub fn raster_page(
     let mut surf = ImageSurface::create(Format::ARgb32, key.width, key.height).ok()?;
     {
         let cr = Context::new(&surf).ok()?;
-        cr.scale(dpr, dpr);
+        cr.scale(key.width as f64 / geom.w, key.height as f64 / geom.h);
         draw_one_page(
             &cr,
             PageDrawing {
@@ -388,39 +426,50 @@ pub fn draw_annotations(cr: &Context, drawing: AnnotationDrawing<'_>) {
         .iter()
         .filter(|annotation| annotation.page == drawing.page)
     {
-        let bounds = annotation_render_bounds(
-            annotation.rect,
-            drawing.page_width,
-            drawing.page_height,
-            drawing.rotation,
-            drawing.scale,
-        );
+        let fragments = annotation
+            .fragments()
+            .map(|rect| {
+                annotation_render_bounds(
+                    rect,
+                    drawing.page_width,
+                    drawing.page_height,
+                    drawing.rotation,
+                    drawing.scale,
+                )
+            })
+            .collect::<Vec<_>>();
         match annotation.kind {
             AnnotationKind::Highlight => cr.set_source_rgba(1.0, 0.82, 0.08, 0.34),
             AnnotationKind::Note { .. } => cr.set_source_rgba(1.0, 0.82, 0.08, 0.16),
         }
-        cr.rectangle(bounds.x, bounds.y, bounds.width, bounds.height);
-        cr.fill().ok();
+        for bounds in &fragments {
+            cr.rectangle(bounds.x, bounds.y, bounds.width, bounds.height);
+            cr.fill().ok();
+        }
 
         if matches!(annotation.kind, AnnotationKind::Note { .. }) {
-            let marker_x = bounds.x + bounds.width;
-            let marker_y = bounds.y;
-            cr.set_source_rgb(1.0, 0.72, 0.0);
-            cr.arc(marker_x, marker_y, 7.0, 0.0, PI * 2.0);
-            cr.fill().ok();
-            cr.set_source_rgb(0.22, 0.16, 0.0);
-            cr.set_line_width(1.5);
-            cr.move_to(marker_x, marker_y - 3.5);
-            cr.line_to(marker_x, marker_y + 1.5);
-            cr.stroke().ok();
-            cr.arc(marker_x, marker_y + 4.0, 0.8, 0.0, PI * 2.0);
-            cr.fill().ok();
+            if let Some(bounds) = fragments.first() {
+                let marker_x = bounds.x + bounds.width;
+                let marker_y = bounds.y;
+                cr.set_source_rgb(1.0, 0.72, 0.0);
+                cr.arc(marker_x, marker_y, 7.0, 0.0, PI * 2.0);
+                cr.fill().ok();
+                cr.set_source_rgb(0.22, 0.16, 0.0);
+                cr.set_line_width(1.5);
+                cr.move_to(marker_x, marker_y - 3.5);
+                cr.line_to(marker_x, marker_y + 1.5);
+                cr.stroke().ok();
+                cr.arc(marker_x, marker_y + 4.0, 0.8, 0.0, PI * 2.0);
+                cr.fill().ok();
+            }
         }
         if drawing.targeted == Some(annotation.id.as_str()) {
             cr.set_source_rgba(0.25, 0.55, 1.0, 0.9);
             cr.set_line_width(2.0);
-            cr.rectangle(bounds.x, bounds.y, bounds.width, bounds.height);
-            cr.stroke().ok();
+            for bounds in &fragments {
+                cr.rectangle(bounds.x, bounds.y, bounds.width, bounds.height);
+                cr.stroke().ok();
+            }
         }
     }
 }
@@ -681,6 +730,41 @@ fn apply_page_transform(cr: &Context, geom: &PageGeom, rotation: i32, doc: &Open
     let _ = (pw, ph);
 }
 
+pub fn print_content_size(page_w: f64, page_h: f64, rotation: i32) -> (f64, f64) {
+    match rotation.rem_euclid(360) {
+        90 | 270 => (page_h, page_w),
+        _ => (page_w, page_h),
+    }
+}
+
+pub fn apply_print_page_transform(
+    cr: &Context,
+    page_w: f64,
+    page_h: f64,
+    rotation: i32,
+    ctx_w: f64,
+    ctx_h: f64,
+) {
+    let (dw, dh) = print_content_size(page_w, page_h, rotation);
+    let scale = (ctx_w / dw.max(1.0)).min(ctx_h / dh.max(1.0)).max(0.01);
+    match rotation.rem_euclid(360) {
+        90 => {
+            cr.translate(dw * scale, 0.0);
+            cr.rotate(PI / 2.0);
+        }
+        180 => {
+            cr.translate(dw * scale, dh * scale);
+            cr.rotate(PI);
+        }
+        270 => {
+            cr.translate(0.0, dh * scale);
+            cr.rotate(-PI / 2.0);
+        }
+        _ => {}
+    }
+    cr.scale(scale, scale);
+}
+
 pub fn display_point_to_document(
     doc: &OpenDoc,
     page: i32,
@@ -736,7 +820,52 @@ pub fn selected_text(doc: &OpenDoc, rotation: i32, sel: Selection) -> Option<Str
         .filter(|s| !s.is_empty())
 }
 
-fn pdf_rect_to_view(
+pub fn selection_highlight_rects(
+    doc: &OpenDoc,
+    rotation: i32,
+    sel: Selection,
+) -> Vec<DocumentRect> {
+    let Some(page) = doc.page(sel.page) else {
+        return Vec::new();
+    };
+    let mut r = selection_rect(doc, sel.page, rotation, sel);
+    const REGION_SCALE: f64 = 8.0;
+    let region = page.selected_region(REGION_SCALE, SelectionStyle::Glyph, &mut r);
+    let mut rects = Vec::new();
+    if let Some(region) = region {
+        for index in 0..region.num_rectangles() {
+            let rectangle = region.rectangle(index);
+            let width = rectangle.width() as f64 / REGION_SCALE;
+            let height = rectangle.height() as f64 / REGION_SCALE;
+            if width <= 0.5 || height <= 0.5 {
+                continue;
+            }
+            rects.push(DocumentRect {
+                x: rectangle.x() as f64 / REGION_SCALE,
+                y: rectangle.y() as f64 / REGION_SCALE,
+                width,
+                height,
+            });
+        }
+    }
+    if rects.is_empty() {
+        let (page_width, page_height) = doc.size(sel.page, 0);
+        if let Some(rect) = crate::annotations::display_rect_to_document(
+            sel.x1,
+            sel.y1,
+            sel.x2,
+            sel.y2,
+            page_width,
+            page_height,
+            rotation,
+        ) {
+            rects.push(rect);
+        }
+    }
+    rects
+}
+
+pub fn pdf_rect_to_view(
     geom: &PageGeom,
     doc: &OpenDoc,
     rotation: i32,
@@ -763,6 +892,40 @@ fn pdf_rect_to_view(
         dw * geom.scale,
         dh * geom.scale,
     )
+}
+
+pub fn search_hit_scroll_y(
+    pages: &[PageGeom],
+    doc: &OpenDoc,
+    rotation: i32,
+    page: i32,
+    rect: &Rectangle,
+    view: (f64, f64),
+    margin: f64,
+) -> f64 {
+    let (view_top, view_h) = view;
+    let Some(geom) = pages.iter().copied().find(|geom| geom.index == page) else {
+        return page_scroll_y(pages, page);
+    };
+    let local = PageGeom {
+        x: 0.0,
+        y: 0.0,
+        ..geom
+    };
+    let (_, y, _, height) = pdf_rect_to_view(&local, doc, rotation, rect);
+    let hit_top = geom.y + y;
+    let hit_bottom = hit_top + height;
+    let view_h = view_h.max(1.0);
+    let margin = margin.max(0.0);
+    let visible_top = view_top + margin;
+    let visible_bottom = view_top + view_h - margin;
+    if hit_top >= visible_top && hit_bottom <= visible_bottom {
+        return view_top.max(0.0);
+    }
+    if hit_top < visible_top || height + margin * 2.0 >= view_h {
+        return hit_top.max(0.0) - margin.min(hit_top.max(0.0));
+    }
+    (hit_bottom + margin - view_h).max(0.0)
 }
 
 pub fn thumbnail_pixel_size(page_w: f64, page_h: f64, css_width: f64, dpr: f64) -> (i32, i32) {
@@ -815,6 +978,146 @@ pub fn thumbnail(
 mod tests {
     use super::*;
     use crate::theme::PdfPalette;
+
+    #[test]
+    fn print_content_size_follows_page_rotation() {
+        assert_eq!(print_content_size(612.0, 792.0, 0), (612.0, 792.0));
+        assert_eq!(print_content_size(612.0, 792.0, 90), (792.0, 612.0));
+        assert_eq!(print_content_size(612.0, 792.0, 180), (612.0, 792.0));
+        assert_eq!(print_content_size(612.0, 792.0, 270), (792.0, 612.0));
+        assert_eq!(print_content_size(612.0, 792.0, 450), (792.0, 612.0));
+    }
+
+    #[test]
+    fn print_transform_matches_on_screen_rotation() {
+        let path = crate::doc::write_test_pdf(
+            "print-rotation",
+            &["1 0 0 rg 0 0 306 396 re f 0 1 0 rg 306 0 306 396 re f 0 0 1 rg 0 396 306 396 re f 0 0 0 rg 306 396 306 396 re f"],
+        );
+        let doc = OpenDoc::open(&path, None).unwrap();
+        fn corners(surface: &mut ImageSurface) -> Vec<[u8; 4]> {
+            let (w, h, s) = (
+                surface.width() as usize,
+                surface.height() as usize,
+                surface.stride() as usize,
+            );
+            let data = surface.data().unwrap();
+            [
+                (w / 10, h / 10),
+                (w * 9 / 10, h / 10),
+                (w / 10, h * 9 / 10),
+                (w * 9 / 10, h * 9 / 10),
+            ]
+            .iter()
+            .map(|(x, y)| data[y * s + x * 4..y * s + x * 4 + 4].try_into().unwrap())
+            .collect()
+        }
+        for rotation in [0, 90, 180, 270] {
+            let (w, h) = doc.size(0, rotation);
+            let geom = PageGeom {
+                index: 0,
+                x: 0.0,
+                y: 0.0,
+                w,
+                h,
+                scale: 1.0,
+            };
+            let mut screen = raster_page(
+                &doc,
+                &geom,
+                rotation,
+                PdfMode::Normal,
+                PdfPalette::default(),
+                1.0,
+            )
+            .unwrap();
+            let page = doc.page(0).unwrap();
+            let (pw, ph) = page.size();
+            let (dw, dh) = print_content_size(pw, ph, rotation);
+            let mut paper =
+                ImageSurface::create(Format::ARgb32, dw.round() as i32, dh.round() as i32).unwrap();
+            {
+                let cr = Context::new(&paper).unwrap();
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.paint().unwrap();
+                apply_print_page_transform(&cr, pw, ph, rotation, dw, dh);
+                page.render_for_printing(&cr);
+            }
+            paper.flush();
+            assert_eq!(
+                corners(&mut paper),
+                corners(&mut screen),
+                "rotation={rotation}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn capped_raster_preserves_corner_pixels_at_all_rotations_and_dprs() {
+        let path = crate::doc::write_test_pdf("capped-corners", &["1 0 0 rg 0 0 306 396 re f 0 1 0 rg 306 0 306 396 re f 0 0 1 rg 0 396 306 396 re f 0 0 0 rg 306 396 306 396 re f"]);
+        let doc = OpenDoc::open(&path, None).unwrap();
+        for rotation in [0, 90, 180, 270] {
+            let (w, h) = doc.size(0, rotation);
+            for dpr in [1.0, 2.0, 3.0] {
+                let reference = PageGeom {
+                    index: 0,
+                    x: 0.0,
+                    y: 0.0,
+                    w,
+                    h,
+                    scale: 1.0,
+                };
+                let big = PageGeom {
+                    w: w * 8.0,
+                    h: h * 8.0,
+                    scale: 8.0,
+                    ..reference
+                };
+                let mut small = raster_page(
+                    &doc,
+                    &reference,
+                    rotation,
+                    PdfMode::Normal,
+                    PdfPalette::default(),
+                    1.0,
+                )
+                .unwrap();
+                let mut capped = raster_page(
+                    &doc,
+                    &big,
+                    rotation,
+                    PdfMode::Normal,
+                    PdfPalette::default(),
+                    dpr,
+                )
+                .unwrap();
+                fn corners(surface: &mut ImageSurface) -> Vec<[u8; 4]> {
+                    let (w, h, s) = (
+                        surface.width() as usize,
+                        surface.height() as usize,
+                        surface.stride() as usize,
+                    );
+                    let data = surface.data().unwrap();
+                    [
+                        (w / 10, h / 10),
+                        (w * 9 / 10, h / 10),
+                        (w / 10, h * 9 / 10),
+                        (w * 9 / 10, h * 9 / 10),
+                    ]
+                    .iter()
+                    .map(|(x, y)| data[y * s + x * 4..y * s + x * 4 + 4].try_into().unwrap())
+                    .collect()
+                }
+                assert_eq!(
+                    corners(&mut capped),
+                    corners(&mut small),
+                    "rotation={rotation} dpr={dpr}"
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn pdf_modes_keep_normal_invert_and_omarchy_distinct() {
@@ -956,7 +1259,58 @@ mod tests {
                 Some("TOPMARK"),
                 "rotation {rotation}"
             );
+            let rects = selection_highlight_rects(&doc, rotation, selection);
+            assert_eq!(rects.len(), 1, "rotation {rotation}");
+            let rect = rects[0];
+            assert!(
+                rect.height < 36.0,
+                "rotation {rotation}: highlight must hug glyphs, height {}",
+                rect.height
+            );
+            assert!(
+                rect.x > 50.0 && rect.x < 90.0,
+                "rotation {rotation}: document x {}",
+                rect.x
+            );
+            assert!(
+                rect.y > 50.0 && rect.y < 95.0,
+                "rotation {rotation}: document y {}",
+                rect.y
+            );
         }
+        std::fs::remove_file(path).expect("remove test PDF");
+    }
+
+    #[test]
+    fn highlight_rects_follow_glyphs_not_the_drag_box() {
+        let path = crate::doc::write_test_pdf(
+            "highlight-snap",
+            &["BT /F1 20 Tf 72 700 Td (TOPMARK) Tj ET"],
+        );
+        let doc = OpenDoc::open(&path, None).expect("open test PDF");
+        let drag = Selection {
+            page: 0,
+            x1: 20.0,
+            y1: 20.0,
+            x2: 280.0,
+            y2: 180.0,
+        };
+        assert_eq!(selected_text(&doc, 0, drag).as_deref(), Some("TOPMARK"));
+        let rects = selection_highlight_rects(&doc, 0, drag);
+        assert_eq!(rects.len(), 1);
+        let rect = rects[0];
+        assert!(
+            rect.height < 36.0,
+            "highlight must hug the glyphs, height {}",
+            rect.height
+        );
+        assert!(
+            rect.width < 120.0,
+            "highlight must hug the glyphs, width {}",
+            rect.width
+        );
+        assert!(rect.x > 50.0 && rect.x < 90.0, "x {}", rect.x);
+        assert!(rect.y > 50.0 && rect.y < 95.0, "y {}", rect.y);
         std::fs::remove_file(path).expect("remove test PDF");
     }
 
@@ -998,6 +1352,17 @@ mod tests {
                 );
             }
         }
+        let stacked = stacked_pages(1, 792.0);
+        let mut bottom = Rectangle::new();
+        bottom.set_x1(72.0);
+        bottom.set_y1(20.0);
+        bottom.set_x2(172.0);
+        bottom.set_y2(40.0);
+        let y = search_hit_scroll_y(&stacked, &doc, 0, 0, &bottom, (0.0, 400.0), 24.0);
+        assert!(
+            y > stacked[0].y + 100.0,
+            "a hit near the page bottom must scroll past page top, got {y}"
+        );
         std::fs::remove_file(path).expect("remove test PDF");
     }
 
@@ -1094,10 +1459,37 @@ mod tests {
         cache.insert(key, surface);
 
         let fallback = cache
-            .get_page(7)
+            .get_page(&key)
             .expect("old-scale page raster should remain available");
-        assert_eq!((fallback.width(), fallback.height()), (100, 200));
-        assert!(cache.get_page(8).is_none());
+        assert_eq!((fallback.0.width(), fallback.0.height()), (100, 200));
+        assert!(cache.get_page(&RasterKey { index: 8, ..key }).is_none());
+        let scaled = RasterKey {
+            width: 200,
+            height: 400,
+            ..key
+        };
+        assert_eq!(cache.get_page(&scaled).unwrap().0.width(), 100);
+        for rotation in [0, 90, 180, 270] {
+            assert_eq!(
+                cache.get_page(&RasterKey { rotation, ..scaled }).unwrap().1,
+                rotation
+            );
+        }
+        assert!(cache
+            .get_page(&RasterKey {
+                pdf_mode: PdfMode::Inverted,
+                ..key
+            })
+            .is_none());
+        assert!(cache
+            .get_page(&RasterKey {
+                palette: PdfPalette {
+                    paper: [1, 2, 3],
+                    ink: [4, 5, 6]
+                },
+                ..key
+            })
+            .is_none());
     }
 
     #[test]
@@ -1165,6 +1557,29 @@ mod tests {
         assert_eq!(page_at_content_y(&pages, 2500.0), 3);
         assert_eq!(page_scroll_y(&pages, 3), (pages[3].y - 8.0).max(0.0));
         assert_eq!(page_scroll_y(&pages, 99), 0.0);
+        assert_eq!(page_in_view(&pages, pages[3].y - 20.0, 400.0), 2);
+        assert_eq!(page_in_view(&pages, pages[2].y + 10.0, 400.0), 2);
+        assert_eq!(
+            page_in_view(&pages, page_scroll_y(&pages, 0), 2000.0),
+            0,
+            "a viewport taller than two pages must keep page 0 after goto_page(0)"
+        );
+        let band = pages_intersecting_view(&pages, 10_000.0, 900.0, VIEW_PAGE_PAD);
+        assert!(band.len() < 20);
+        assert!(!band.contains(&0));
+    }
+
+    #[test]
+    fn raster_pixel_size_caps_extreme_zoom() {
+        let letter = raster_pixel_size(612.0 * 16.0, 792.0 * 16.0, 2.0);
+        assert!(letter.0 <= MAX_RASTER_EDGE);
+        assert!(letter.1 <= MAX_RASTER_EDGE);
+        assert!(letter.0 > 1000 && letter.1 > 1000);
+        assert_eq!(raster_pixel_size(100.5, 200.0, 1.0), (101, 200));
+        assert_eq!(raster_pixel_size(100.5, 200.0, 2.0), (201, 400));
+        let (w, h) = layout_content_size(&stacked_pages(3, 800.0));
+        assert!(w >= 200.0);
+        assert!(h >= stacked_pages(3, 800.0)[2].y + 800.0);
     }
 
     #[test]
@@ -1265,6 +1680,7 @@ mod tests {
                     width: 30.0,
                     height: 10.0,
                 },
+                rects: Vec::new(),
                 kind: AnnotationKind::Highlight,
             };
             draw_annotations(

@@ -1,6 +1,324 @@
 //! Display-backed checks run explicitly; no windows are presented or sessions saved.
 use super::*;
 
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_adoption_invalidates_raster_lifetime() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorRasterLifetime")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    let path = crate::doc::write_test_pdf("raster-lifetime", &[""]);
+    ui.open_path(&path, None);
+    let key = {
+        let st = ui.inner.borrow();
+        RasterKey::from_geom(
+            &st.view.layout.pages[0],
+            st.view.rotation,
+            st.view.pdf_mode,
+            st.theme.pdf_palette(),
+            ui.page_dpr(),
+        )
+    };
+    let old_gen = ui.inner.borrow().raster_gen;
+    ui.inner.borrow_mut().raster.insert(
+        key,
+        gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 2, 2).unwrap(),
+    );
+    ui.raster_pending.borrow_mut().insert(999);
+    ui.open_path(&path, None);
+    assert!(
+        !ui.inner.borrow().raster.contains(&key),
+        "same-path reload retained old pixels"
+    );
+    assert_ne!(ui.inner.borrow().raster_gen, old_gen);
+    assert!(!ui.raster_pending.borrow().contains(&999));
+    let pending = ui.raster_pending.borrow().clone();
+    ui.raster_one(old_gen);
+    assert_eq!(
+        *ui.raster_pending.borrow(),
+        pending,
+        "stale callback consumed live work"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_sidebar_population_is_lazy_and_reused() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorLazySidebar")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    ui.set_sidebar_visible(false);
+    let path = crate::doc::write_test_pdf("lazy-sidebar", &[""; 1000]);
+    let start = std::time::Instant::now();
+    ui.open_path(&path, None);
+    let mut rows = 0;
+    let mut child = ui.thumbs.first_child();
+    while let Some(row) = child {
+        rows += 1;
+        child = row.next_sibling();
+    }
+    eprintln!(
+        "synthetic unpresented 1000-page open: {:?}; thumbnail rows={rows}",
+        start.elapsed()
+    );
+    assert_eq!(rows, 0, "hidden pane must construct no thumbnail rows");
+    ui.set_sidebar_visible(true);
+    assert_eq!(ui.inner.borrow().pane.sidebar, Sidebar::Outline);
+    assert!(ui.thumbs.first_child().is_none());
+    ui.stack.set_visible_child_name("thumbs");
+    let first = ui.thumbs.first_child().expect("thumbnail tab populated");
+    assert!(ui.thumbs.row_at_index(999).is_some());
+    ui.stack.set_visible_child_name("marks");
+    ui.stack.set_visible_child_name("thumbs");
+    assert_eq!(
+        ui.thumbs.first_child().unwrap(),
+        first,
+        "tab switching rebuilt rows"
+    );
+    ui.set_sidebar_visible(false);
+    ui.set_sidebar_visible(true);
+    ui.stack.set_visible_child_name("thumbs");
+    assert_eq!(ui.thumbs.first_child().unwrap(), first);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_marks_selection_follows_target_after_sidebar_reuse() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorMarksReuse")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.inner.borrow_mut().annotations = Some(AnnotationStore::default());
+    let path = crate::doc::write_test_pdf("marks-reuse", &[""]);
+    ui.open_path(&path, None);
+    let annotation = new_annotation(
+        0,
+        DocumentRect {
+            x: 10.0,
+            y: 10.0,
+            width: 40.0,
+            height: 20.0,
+        },
+        AnnotationKind::Highlight,
+    );
+    let id = annotation.id.clone();
+    {
+        let mut st = ui.inner.borrow_mut();
+        st.annotations.as_mut().unwrap().add(&path, annotation);
+    }
+    ui.set_sidebar_visible(true);
+    ui.stack.set_visible_child_name("marks");
+    ui.activate_mark(&id);
+    assert_eq!(
+        ui.marks
+            .selected_row()
+            .map(|row| row.widget_name().to_string()),
+        Some(id.clone())
+    );
+    ui.set_sidebar_visible(false);
+    {
+        let mut st = ui.inner.borrow_mut();
+        let inner = &mut *st;
+        begin_selection_state(
+            &mut inner.view.selection,
+            &mut inner.pane.targeted_annotation,
+            Some((0, 12.0, 12.0)),
+        );
+    }
+    ui.set_sidebar_visible(true);
+    ui.stack.set_visible_child_name("marks");
+    assert!(
+        ui.marks.selected_row().is_none(),
+        "reused Marks pane kept a row selected after targeting was cleared"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_raster_queue_prunes_obsolete_and_cached_work() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorRasterQueue")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Continuous);
+    let path = crate::doc::write_test_pdf("raster-queue", &[""; 20]);
+    ui.open_path(&path, None);
+    ui.raster_pending.borrow_mut().extend(0..20);
+    ui.ensure_visible_rasters();
+    let needed = pages_intersecting_view(
+        &ui.inner.borrow().view.layout.pages,
+        ui.scrolled.vadjustment().value(),
+        ui.scrolled.height() as f64,
+        VIEW_PAGE_PAD,
+    );
+    eprintln!(
+        "obsolete work: queued 20, retained {} for {} needed pages",
+        ui.raster_pending.borrow().len(),
+        needed.len()
+    );
+    assert!(ui
+        .raster_pending
+        .borrow()
+        .iter()
+        .all(|p| needed.contains(p)));
+    let index = needed[0];
+    let key = {
+        let st = ui.inner.borrow();
+        RasterKey::from_geom(
+            &st.view.layout.page_geom(index).unwrap(),
+            st.view.rotation,
+            st.view.pdf_mode,
+            st.theme.pdf_palette(),
+            ui.page_dpr(),
+        )
+    };
+    let sentinel = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 2, 2).unwrap();
+    ui.inner.borrow_mut().raster.insert(key, sentinel);
+    ui.raster_pending.borrow_mut().clear();
+    ui.raster_pending.borrow_mut().insert(index);
+    let gen = ui.inner.borrow().raster_gen;
+    ui.raster_one(gen);
+    assert_eq!(
+        ui.inner.borrow_mut().raster.get(&key).unwrap().width(),
+        2,
+        "cache hit was redundantly rasterized by Poppler"
+    );
+    ui.raster_pending.borrow_mut().insert(19);
+    assert_eq!(
+        ui.take_next_raster_index(),
+        None,
+        "idle must recheck live viewport"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_rotation_feedback_reuses_correctly_oriented_pixels() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorRotationFeedback")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    let path = crate::doc::write_test_pdf("rotation-feedback", &["1 0 0 rg 0 0 306 396 re f 0 1 0 rg 306 0 306 396 re f 0 0 1 rg 0 396 306 396 re f 0 0 0 rg 306 396 306 396 re f"]);
+    ui.open_path(&path, None);
+    ui.set_zoom(Zoom::Custom(1.0));
+    let gen = ui.inner.borrow().raster_gen;
+    ui.raster_one(gen);
+    fn corners(surface: &mut gtk::cairo::ImageSurface) -> Vec<[u8; 4]> {
+        let (w, h, s) = (
+            surface.width() as usize,
+            surface.height() as usize,
+            surface.stride() as usize,
+        );
+        let data = surface.data().unwrap();
+        [
+            (w / 10, h / 10),
+            (w * 9 / 10, h / 10),
+            (w / 10, h * 9 / 10),
+            (w * 9 / 10, h * 9 / 10),
+        ]
+        .iter()
+        .map(|(x, y)| data[y * s + x * 4..y * s + x * 4 + 4].try_into().unwrap())
+        .collect()
+    }
+    for rotation in [90, 180, 270, 0] {
+        let start = std::time::Instant::now();
+        ui.rotate(90);
+        let (geom, mut expected) = {
+            let st = ui.inner.borrow();
+            let geom = st.view.layout.page_geom(0).unwrap();
+            let expected = raster_page(
+                st.view.doc.as_ref().unwrap(),
+                &geom,
+                rotation,
+                st.view.pdf_mode,
+                st.theme.pdf_palette(),
+                1.0,
+            )
+            .unwrap();
+            (geom, expected)
+        };
+        let mut actual = gtk::cairo::ImageSurface::create(
+            gtk::cairo::Format::ARgb32,
+            geom.w as i32,
+            geom.h as i32,
+        )
+        .unwrap();
+        {
+            let cr = gtk::cairo::Context::new(&actual).unwrap();
+            ui.draw_page(&cr, 0, 1.0);
+        }
+        eprintln!(
+            "rotation {rotation}: synchronous feedback+reference {:?}; no raster idle dispatched",
+            start.elapsed()
+        );
+        assert_eq!(
+            corners(&mut actual),
+            corners(&mut expected),
+            "rotation={rotation}"
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_layout_transition_keeps_reusable_page_widget() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorWidgetReuse")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    let path = crate::doc::write_test_pdf("widget-reuse", &[""; 2]);
+    ui.open_path(&path, None);
+    let first = ui.page_widgets.borrow()[0].1.clone();
+    ui.set_layout(LayoutMode::Continuous);
+    assert_eq!(
+        ui.page_widgets
+            .borrow()
+            .iter()
+            .find(|(i, _)| *i == 0)
+            .unwrap()
+            .1,
+        first,
+        "layout transition recreated unchanged page widget"
+    );
+    ui.set_layout(LayoutMode::Single);
+    assert_eq!(ui.page_widgets.borrow()[0].1, first);
+    std::fs::remove_file(path).unwrap();
+}
+
 fn widget_tree_has_label(widget: &gtk::Widget, expected: &str) -> bool {
     if widget
         .downcast_ref::<Label>()
@@ -92,7 +410,7 @@ fn actual_window_navigation_presentation_search_and_reload() {
     ui.navigate_to_page(0);
     assert!(!ui.back_btn.is_sensitive());
     ui.inner.borrow_mut().annotations = Some(AnnotationStore::default());
-    ui.inner.borrow_mut().selection = Some(Selection {
+    ui.inner.borrow_mut().view.selection = Some(Selection {
         page: 0,
         x1: 70.0,
         y1: 70.0,
@@ -102,43 +420,43 @@ fn actual_window_navigation_presentation_search_and_reload() {
     ui.update_annotation_actions();
     assert!(ui.highlight_item.is_sensitive());
     assert!(ui.note_item.is_sensitive());
-    assert_eq!(ui.inner.borrow().doc.as_ref().unwrap().n_pages, 8);
+    assert_eq!(ui.inner.borrow().view.doc.as_ref().unwrap().n_pages, 8);
     ui.follow_link(DocumentLink::GotoPage(3));
-    assert_eq!(ui.inner.borrow().page, 3);
+    assert_eq!(ui.inner.borrow().view.page, 3);
     assert!(ui.back_btn.is_sensitive());
     assert!(!ui.forward_btn.is_sensitive());
     ui.navigate_back();
-    assert_eq!(ui.inner.borrow().page, 0);
+    assert_eq!(ui.inner.borrow().view.page, 0);
     assert!(ui.forward_btn.is_sensitive());
     ui.navigate_forward();
-    assert_eq!(ui.inner.borrow().page, 3);
+    assert_eq!(ui.inner.borrow().view.page, 3);
     ui.goto_page(0);
     assert!(ui.cont_item.is_active());
     assert!(!ui.dual_item.is_active());
     assert!(!ui.single_item.is_active());
     assert_eq!(
         ui.invert_item.is_active(),
-        ui.inner.borrow().pdf_mode == PdfMode::Inverted,
+        ui.inner.borrow().view.pdf_mode == PdfMode::Inverted,
         "inverted menu state must reflect the active preference"
     );
     assert_eq!(
         ui.normal_item.is_active(),
-        ui.inner.borrow().pdf_mode == PdfMode::Normal,
+        ui.inner.borrow().view.pdf_mode == PdfMode::Normal,
         "normal menu state must reflect the active preference"
     );
     assert_eq!(
         ui.omarchy_item.is_active(),
-        ui.inner.borrow().pdf_mode == PdfMode::Omarchy,
+        ui.inner.borrow().view.pdf_mode == PdfMode::Omarchy,
         "Omarchy menu state must reflect the active preference"
     );
     ui.dual_item.set_active(true);
-    assert_eq!(ui.inner.borrow().layout_mode, LayoutMode::Dual);
+    assert_eq!(ui.inner.borrow().view.layout_mode, LayoutMode::Dual);
     ui.omarchy_item.set_active(true);
-    assert_eq!(ui.inner.borrow().pdf_mode, PdfMode::Omarchy);
+    assert_eq!(ui.inner.borrow().view.pdf_mode, PdfMode::Omarchy);
     ui.normal_item.set_active(true);
-    assert_eq!(ui.inner.borrow().pdf_mode, PdfMode::Normal);
+    assert_eq!(ui.inner.borrow().view.pdf_mode, PdfMode::Normal);
     ui.invert_item.set_active(true);
-    assert_eq!(ui.inner.borrow().pdf_mode, PdfMode::Inverted);
+    assert_eq!(ui.inner.borrow().view.pdf_mode, PdfMode::Inverted);
     ui.set_layout(LayoutMode::Single);
     assert!(ui.single_item.is_active());
     assert!(!ui.cont_item.is_active());
@@ -157,24 +475,24 @@ fn actual_window_navigation_presentation_search_and_reload() {
     ui.set_zoom(Zoom::Custom(1.25));
     ui.toggle_presentation();
     assert!(ui.inner.borrow().presentation);
-    assert_eq!(ui.inner.borrow().layout_mode, LayoutMode::Single);
+    assert_eq!(ui.inner.borrow().view.layout_mode, LayoutMode::Single);
     ui.toggle_presentation();
     assert!(!ui.inner.borrow().presentation);
-    assert_eq!(ui.inner.borrow().layout_mode, LayoutMode::Dual);
-    assert_eq!(ui.inner.borrow().zoom, Zoom::Custom(1.25));
+    assert_eq!(ui.inner.borrow().view.layout_mode, LayoutMode::Dual);
+    assert_eq!(ui.inner.borrow().view.zoom, Zoom::Custom(1.25));
     ui.goto_page(6);
     ui.rotate(90);
-    assert_eq!(ui.inner.borrow().rotation, 90);
+    assert_eq!(ui.inner.borrow().view.rotation, 90);
     ui.reload();
-    assert_eq!(ui.inner.borrow().page, 6);
-    assert_eq!(ui.inner.borrow().zoom, Zoom::Custom(1.25));
-    assert_eq!(ui.inner.borrow().rotation, 90);
+    assert_eq!(ui.inner.borrow().view.page, 6);
+    assert_eq!(ui.inner.borrow().view.zoom, Zoom::Custom(1.25));
+    assert_eq!(ui.inner.borrow().view.rotation, 90);
     ui.search("needle");
-    let previous_generation = ui.inner.borrow().search_gen;
+    let previous_generation = ui.inner.borrow().search.gen;
     ui.open_path(&short, None);
-    assert_eq!(ui.inner.borrow().rotation, 0);
-    assert_ne!(ui.inner.borrow().search_gen, previous_generation);
-    assert!(ui.inner.borrow().search_query.is_empty());
+    assert_eq!(ui.inner.borrow().view.rotation, 0);
+    assert_ne!(ui.inner.borrow().search.gen, previous_generation);
+    assert!(ui.inner.borrow().search.query.is_empty());
     assert_eq!(ui.search_info.text(), "");
     let context = glib::MainContext::default();
     for _ in 0..128 {
@@ -183,7 +501,7 @@ fn actual_window_navigation_presentation_search_and_reload() {
         }
         context.iteration(false);
     }
-    assert!(ui.inner.borrow().search_hits.is_empty());
+    assert!(ui.inner.borrow().search.hits.is_empty());
     ui.search("needle");
     for _ in 0..128 {
         if ui.search_info.text() == "1 of 2" {
@@ -191,16 +509,20 @@ fn actual_window_navigation_presentation_search_and_reload() {
         }
         context.iteration(false);
     }
-    assert_eq!(ui.inner.borrow().search_hits.len(), 2);
+    assert_eq!(ui.inner.borrow().search.hits.len(), 2);
     assert_eq!(ui.search_info.text(), "1 of 2");
     ui.set_layout(LayoutMode::Continuous);
     assert!(ui.pages_box.first_child().unwrap().is::<DrawingArea>());
     ui.set_layout(LayoutMode::Dual);
-    assert!(ui.pages_box.first_child().unwrap().is::<GtkBox>());
+    assert!(ui.pages_box.first_child().unwrap().is::<DrawingArea>());
+    assert!(
+        ui.page_widgets.borrow().len() <= 2,
+        "dual view must not instantiate every document page"
+    );
     ui.open_path(&long, None);
-    assert_eq!(ui.inner.borrow().page, 6);
-    assert_eq!(ui.inner.borrow().zoom, Zoom::Custom(1.25));
-    assert_eq!(ui.inner.borrow().rotation, 90);
+    assert_eq!(ui.inner.borrow().view.page, 6);
+    assert_eq!(ui.inner.borrow().view.zoom, Zoom::Custom(1.25));
+    assert_eq!(ui.inner.borrow().view.rotation, 90);
     // Do not use close(): it invokes production persistence.
     ui.hold.borrow_mut().take();
     ui.window.destroy();
@@ -325,21 +647,21 @@ fn actual_pinch_zoom_keeps_anchor_and_page_during_reflow() {
     ui.goto_page(15);
     wait_for_view_restore(&ui, &context);
 
-    let page_before = ui.inner.borrow().page;
-    let start_scale = ui.inner.borrow().layout.scale;
+    let page_before = ui.inner.borrow().view.page;
+    let start_scale = ui.inner.borrow().view.layout.scale;
     let anchor = ui.capture_anchor(Some((300.0, 260.0)));
     let (first_zoom, first_restore) = pinch_zoom_update(start_scale, 1.2, anchor);
     ui.set_zoom_restore(first_zoom, first_restore);
     assert_eq!(
-        ui.inner.borrow().page,
+        ui.inner.borrow().view.page,
         page_before,
         "temporary adjustment signals during pinch reflow must not change pages"
     );
     let (final_zoom, final_restore) = pinch_zoom_update(start_scale, 1.5, anchor);
     ui.set_zoom_restore(final_zoom, final_restore);
     wait_for_view_restore(&ui, &context);
-    let final_scale = ui.inner.borrow().layout.scale;
-    let (_, expected_y) = restored_scroll(anchor, final_scale);
+    let pages = ui.inner.borrow().view.layout.pages.clone();
+    let (_, expected_y) = restored_scroll(anchor, &pages);
     let v = ui.scrolled.vadjustment();
     let expected_y = clamp_adjustment(expected_y, v.lower(), v.upper(), v.page_size());
     assert!(
@@ -350,6 +672,36 @@ fn actual_pinch_zoom_keeps_anchor_and_page_during_reflow() {
 
     ui.hold.borrow_mut().take();
     ui.window.destroy();
+    std::fs::remove_file(pdf).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_zoom_button_keeps_the_current_page() {
+    gtk::init().expect("GTK display required");
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorZoomButtonRegression")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    let context = glib::MainContext::default();
+    let pdf =
+        crate::doc::write_test_pdf("zoom-button", &["BT /F1 20 Tf 72 700 Td (zoom) Tj ET"; 20]);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Continuous);
+    ui.open_path(&pdf, None);
+    ui.goto_page(8);
+    wait_for_view_restore(&ui, &context);
+    let page_before = ui.inner.borrow().view.page;
+    ui.zoom_in_btn.emit_clicked();
+    wait_for_view_restore(&ui, &context);
+    assert_eq!(
+        ui.inner.borrow().view.page,
+        page_before,
+        "toolbar zoom must not jump to another page"
+    );
+    ui.hold.borrow_mut().take();
     std::fs::remove_file(pdf).unwrap();
 }
 
@@ -405,7 +757,7 @@ fn actual_back_navigation_restores_single_page_viewport() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
-    assert_eq!(ui.inner.borrow().page, 0);
+    assert_eq!(ui.inner.borrow().view.page, 0);
     assert!((horizontal.value() - saved_x).abs() < 1.0);
     assert!((vertical.value() - saved_y).abs() < 1.0);
 
@@ -426,7 +778,7 @@ fn actual_outline_disclosure_hides_and_restores_descendants() {
     let ui = Lector::new(&app);
     let path = crate::doc::write_test_pdf("outline", &["one", "two", "three"]);
     ui.open_path(&path, None);
-    ui.inner.borrow_mut().doc.as_mut().unwrap().outline = vec![
+    ui.inner.borrow_mut().view.doc.as_mut().unwrap().outline = vec![
         crate::doc::OutlineItem {
             title: "Chapter".into(),
             page: Some(0),
@@ -443,6 +795,10 @@ fn actual_outline_disclosure_hides_and_restores_descendants() {
             depth: 0,
         },
     ];
+    let collapsed = crate::doc::initially_collapsed_outline(
+        &ui.inner.borrow().view.doc.as_ref().unwrap().outline,
+    );
+    ui.inner.borrow_mut().pane.outline_collapsed = collapsed;
     ui.rebuild_outline();
     ui.goto_page(2);
     let row_count = || {
@@ -454,7 +810,19 @@ fn actual_outline_disclosure_hides_and_restores_descendants() {
         }
         count
     };
+    assert_eq!(row_count(), 2);
+
+    let first = ui.outline.first_child().unwrap();
+    let row = first.downcast::<gtk::ListBoxRow>().unwrap();
+    let content = row.child().unwrap().downcast::<gtk::Box>().unwrap();
+    let toggle = content
+        .first_child()
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap();
+    toggle.emit_clicked();
     assert_eq!(row_count(), 3);
+    assert_eq!(ui.inner.borrow().view.page, 2);
 
     let first = ui.outline.first_child().unwrap();
     let row = first.downcast::<gtk::ListBoxRow>().unwrap();
@@ -466,18 +834,6 @@ fn actual_outline_disclosure_hides_and_restores_descendants() {
         .unwrap();
     toggle.emit_clicked();
     assert_eq!(row_count(), 2);
-    assert_eq!(ui.inner.borrow().page, 2);
-
-    let first = ui.outline.first_child().unwrap();
-    let row = first.downcast::<gtk::ListBoxRow>().unwrap();
-    let content = row.child().unwrap().downcast::<gtk::Box>().unwrap();
-    let toggle = content
-        .first_child()
-        .unwrap()
-        .downcast::<gtk::Button>()
-        .unwrap();
-    toggle.emit_clicked();
-    assert_eq!(row_count(), 3);
 
     let _ = std::fs::remove_file(path);
     ui.hold.borrow_mut().take();
@@ -587,13 +943,13 @@ fn actual_page_labels_are_shown_and_accepted() {
 
     ui.page_entry.set_text("ii");
     gtk::prelude::EntryExt::emit_activate(&ui.page_entry);
-    assert_eq!(ui.inner.borrow().page, 1);
+    assert_eq!(ui.inner.borrow().view.page, 1);
     ui.update_chrome();
     assert_eq!(ui.page_entry.text(), "ii");
 
     ui.page_entry.set_text("3");
     gtk::prelude::EntryExt::emit_activate(&ui.page_entry);
-    assert_eq!(ui.inner.borrow().page, 2);
+    assert_eq!(ui.inner.borrow().view.page, 2);
 
     let _ = std::fs::remove_file(path);
     ui.hold.borrow_mut().take();
@@ -622,18 +978,18 @@ fn actual_live_search_debounces_and_lists_results() {
     let context = glib::MainContext::default();
     ui.search_entry.set_text("needle");
     drain_for(&context, 80);
-    assert!(ui.inner.borrow().search_hits.is_empty());
+    assert!(ui.inner.borrow().search.hits.is_empty());
     drain_for(&context, LIVE_SEARCH_MS + 80);
-    assert_eq!(ui.inner.borrow().search_hits.len(), 3);
+    assert_eq!(ui.inner.borrow().search.hits.len(), 3);
     assert_eq!(search_result_count(&ui), 3);
 
     ui.case_btn.set_active(true);
     drain_for(&context, 80);
-    assert_eq!(ui.inner.borrow().search_hits.len(), 2);
+    assert_eq!(ui.inner.borrow().search.hits.len(), 2);
     ui.case_btn.set_active(false);
     ui.word_btn.set_active(true);
     drain_for(&context, 80);
-    assert_eq!(ui.inner.borrow().search_hits.len(), 2);
+    assert_eq!(ui.inner.borrow().search.hits.len(), 2);
 
     let _ = std::fs::remove_file(path);
     ui.hold.borrow_mut().take();
@@ -667,4 +1023,36 @@ fn actual_external_file_change_offers_reload() {
 
     let _ = std::fs::remove_file(path);
     ui.hold.borrow_mut().take();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+fn actual_zoom_dropdown_shows_the_applied_percent() {
+    gtk::init().expect("GTK display");
+    let app = gtk::Application::builder()
+        .application_id("org.omarchy.Lector.ZoomChromeTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    let path = crate::doc::write_test_pdf("zoom-chrome", &["BT /F1 20 Tf 72 700 Td (one) Tj ET"]);
+    ui.open_path(&path, None);
+    ui.set_zoom(Zoom::Custom(1.37));
+    assert_eq!(selected_zoom_label(&ui.zoom_drop), "137%");
+    ui.set_zoom(Zoom::Actual);
+    assert_eq!(selected_zoom_label(&ui.zoom_drop), "100%");
+    ui.zoom_by(1.15);
+    assert_eq!(selected_zoom_label(&ui.zoom_drop), "115%");
+
+    let _ = std::fs::remove_file(path);
+    ui.hold.borrow_mut().take();
+}
+
+fn selected_zoom_label(drop: &DropDown) -> String {
+    let idx = drop.selected();
+    drop.model()
+        .and_downcast::<gtk::StringList>()
+        .and_then(|list| list.string(idx))
+        .map(|value| value.to_string())
+        .unwrap_or_default()
 }

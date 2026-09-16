@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::persist::{open_lock_file, write_private_atomic};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DocumentRect {
@@ -120,8 +121,47 @@ pub struct Annotation {
     pub id: String,
     pub page: i32,
     pub rect: DocumentRect,
+    /// Extra fragments after `rect`. Empty means the mark is a single rectangle
+    /// (legacy files, notes). A multi-line highlight is one annotation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rects: Vec<DocumentRect>,
     #[serde(flatten)]
     pub kind: AnnotationKind,
+}
+
+impl Annotation {
+    pub fn fragments(&self) -> impl Iterator<Item = DocumentRect> + '_ {
+        std::iter::once(self.rect).chain(self.rects.iter().copied())
+    }
+}
+
+pub fn union_rects(rects: &[DocumentRect]) -> Option<DocumentRect> {
+    let first = *rects.first()?;
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x + first.width;
+    let mut max_y = first.y + first.height;
+    for rect in rects.iter().skip(1) {
+        min_x = min_x.min(rect.x);
+        min_y = min_y.min(rect.y);
+        max_x = max_x.max(rect.x + rect.width);
+        max_y = max_y.max(rect.y + rect.height);
+    }
+    Some(DocumentRect {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    })
+}
+
+fn rect_is_valid(rect: DocumentRect) -> bool {
+    rect.x.is_finite()
+        && rect.y.is_finite()
+        && rect.width.is_finite()
+        && rect.height.is_finite()
+        && rect.width > 0.0
+        && rect.height > 0.0
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -134,21 +174,38 @@ pub struct AnnotationStore {
     deleted: HashMap<String, HashSet<String>>,
 }
 
-static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ANNOTATION_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn new_annotation(page: i32, rect: DocumentRect, kind: AnnotationKind) -> Annotation {
+    new_annotation_from_rects(page, vec![rect], kind)
+        .expect("a single finite rectangle is a valid annotation")
+}
+
+pub fn new_annotation_from_rects(
+    page: i32,
+    rects: Vec<DocumentRect>,
+    kind: AnnotationKind,
+) -> Option<Annotation> {
+    let mut rects = rects
+        .into_iter()
+        .filter(|rect| rect_is_valid(*rect))
+        .collect::<Vec<_>>();
+    if rects.is_empty() {
+        return None;
+    }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let sequence = NEXT_ANNOTATION_ID.fetch_add(1, Ordering::Relaxed);
-    Annotation {
+    let rect = rects.remove(0);
+    Some(Annotation {
         id: format!("{}-{timestamp}-{sequence}", std::process::id()),
         page,
         rect,
+        rects,
         kind,
-    }
+    })
 }
 
 impl AnnotationStore {
@@ -264,15 +321,9 @@ impl AnnotationStore {
                 return Err("annotation store contains an empty document path".into());
             }
             for annotation in annotations {
-                let rect = annotation.rect;
                 if annotation.id.is_empty()
                     || annotation.page < 0
-                    || !rect.x.is_finite()
-                    || !rect.y.is_finite()
-                    || !rect.width.is_finite()
-                    || !rect.height.is_finite()
-                    || rect.width <= 0.0
-                    || rect.height <= 0.0
+                    || !annotation.fragments().all(rect_is_valid)
                 {
                     return Err(format!("invalid annotation in {document}"));
                 }
@@ -293,70 +344,7 @@ impl AnnotationStore {
 }
 
 fn annotation_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".config")
-        .join("lector")
-        .join("annotations.toml")
-}
-
-fn open_lock_file(path: &Path) -> Result<fs::File, String> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|error| format!("open annotation lock {}: {error}", path.display()))
-}
-
-fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("annotation path {} has no parent", path.display()))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("annotations.toml");
-    let mut created = None;
-    for _ in 0..128 {
-        let id = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!(".{name}.{}-{id}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&temp) {
-            Ok(file) => {
-                created = Some((temp, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("create temporary annotation file: {error}")),
-        }
-    }
-    let Some((temp, mut file)) = created else {
-        return Err("could not create a unique temporary annotation file".into());
-    };
-    let result = (|| {
-        file.write_all(contents)
-            .map_err(|error| format!("write temporary annotation {}: {error}", temp.display()))?;
-        file.sync_all()
-            .map_err(|error| format!("sync temporary annotation {}: {error}", temp.display()))?;
-        drop(file);
-        fs::rename(&temp, path)
-            .map_err(|error| format!("replace annotation store {}: {error}", path.display()))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    crate::persist::user_config_file("lector", "annotations.toml")
 }
 
 #[cfg(test)]
@@ -387,6 +375,7 @@ mod tests {
                 width: 30.0,
                 height: 12.0,
             },
+            rects: Vec::new(),
             kind: AnnotationKind::Highlight,
         }
     }
@@ -426,6 +415,7 @@ mod tests {
                 width: 33.0,
                 height: 44.0,
             },
+            rects: Vec::new(),
             kind: AnnotationKind::Note {
                 text: "Revisit this assumption.".into(),
             },
@@ -558,6 +548,85 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(store_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn multi_fragment_highlight_is_one_annotation() {
+        let store_path = test_path("multi-rect");
+        let document = Path::new("/documents/paper.pdf");
+        let first = DocumentRect {
+            x: 10.0,
+            y: 20.0,
+            width: 80.0,
+            height: 12.0,
+        };
+        let second = DocumentRect {
+            x: 10.0,
+            y: 36.0,
+            width: 40.0,
+            height: 12.0,
+        };
+        let annotation =
+            new_annotation_from_rects(2, vec![first, second], AnnotationKind::Highlight).unwrap();
+        assert_eq!(annotation.rect, first);
+        assert_eq!(annotation.rects, vec![second]);
+        assert_eq!(
+            annotation.fragments().collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            union_rects(&annotation.fragments().collect::<Vec<_>>()),
+            Some(DocumentRect {
+                x: 10.0,
+                y: 20.0,
+                width: 80.0,
+                height: 28.0,
+            })
+        );
+
+        let mut store = AnnotationStore::default();
+        store.add(document, annotation.clone());
+        store.save_to(&store_path).unwrap();
+        let loaded = AnnotationStore::load_from_path(&store_path)
+            .unwrap()
+            .for_document(document)
+            .to_vec();
+        assert_eq!(loaded, vec![annotation.clone()]);
+
+        let text = fs::read_to_string(&store_path).unwrap();
+        assert!(text.contains("rects"), "extra fragments must persist");
+
+        let mut deleting = AnnotationStore::load_from_path(&store_path).unwrap();
+        assert!(deleting.remove(document, &annotation.id));
+        deleting.save_to(&store_path).unwrap();
+        assert!(AnnotationStore::load_from_path(&store_path)
+            .unwrap()
+            .for_document(document)
+            .is_empty());
+        fs::remove_dir_all(store_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_single_rect_files_still_load() {
+        let store_path = test_path("legacy-rect");
+        let document = Path::new("/documents/old.pdf");
+        let mut store = AnnotationStore::default();
+        store.add(
+            document,
+            new_annotation(1, highlight("legacy", 1).rect, AnnotationKind::Highlight),
+        );
+        store.save_to(&store_path).unwrap();
+        let text = fs::read_to_string(&store_path).unwrap();
+        assert!(
+            !text.contains("rects"),
+            "a single fragment must not write extra rects: {text}"
+        );
+        let loaded = AnnotationStore::load_from_path(&store_path).unwrap();
+        let marks = loaded.for_document(document);
+        assert_eq!(marks.len(), 1);
+        assert!(marks[0].rects.is_empty());
+        assert_eq!(marks[0].fragments().count(), 1);
         fs::remove_dir_all(store_path.parent().unwrap()).unwrap();
     }
 }

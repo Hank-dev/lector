@@ -8,10 +8,12 @@ Cairo for drawing, and Rust 2021 edition.
 ## Source layout
 
 - `src/main.rs` — application ID and open/activate handling.
-- `src/window.rs` — GTK widgets, actions, navigation, search, printing, and UI state.
+- `src/window/` — GTK window: construction, canvas, navigation, search, annotations UI, dialogs.
+- `src/window/state.rs` — document, search, and sidebar state inside the session RefCell.
 - `src/view.rs` — page geometry, rendering, selection, search highlighting, and thumbnails.
 - `src/doc.rs` — Poppler document access, metadata, outline extraction, and PDF fixtures for tests.
 - `src/session.rs` — persistent reading state and concurrent session-file merging.
+- `src/persist.rs` — XDG config paths and atomic private file writes.
 - `src/theme.rs` — Omarchy theme loading and generated GTK CSS.
 - `share/` — desktop entry and SVG icon.
 
