@@ -26,7 +26,7 @@ colored diagrams.
 
 ## Features
 
-- Continuous, single, and dual page
+- Continuous, single, and dual page (optional separate cover so spreads start after page 1)
 - Fit width / page / height, explicit zoom, pinch-to-zoom, Ctrl+scroll, two-finger pan
 - Thumbnails, an expandable outline, and a Marks list in the side pane (F9)
 - Find (Ctrl+F), live results that scroll to the match, match-case and whole-word options, text selection and copy

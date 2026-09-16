@@ -21,6 +21,8 @@ pub struct Session {
     #[serde(default)]
     pub pdf_mode: String,
     pub layout: String,
+    #[serde(default)]
+    pub dual_cover: bool,
     #[serde(skip)]
     dirty_files: HashSet<String>,
     #[serde(skip)]
@@ -37,6 +39,8 @@ pub struct Session {
     loaded_pdf_mode: String,
     #[serde(skip)]
     loaded_layout: String,
+    #[serde(skip)]
+    loaded_dual_cover: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -147,6 +151,9 @@ impl Session {
         if dirty.layout != dirty.loaded_layout {
             self.layout = dirty.layout.clone();
         }
+        if dirty.dual_cover != dirty.loaded_dual_cover {
+            self.dual_cover = dirty.dual_cover;
+        }
         self.normalize();
     }
 
@@ -158,6 +165,7 @@ impl Session {
         self.loaded_invert = self.invert;
         self.loaded_pdf_mode = self.pdf_mode.clone();
         self.loaded_layout = self.layout.clone();
+        self.loaded_dual_cover = self.dual_cover;
     }
 
     fn normalize(&mut self) {
@@ -420,8 +428,20 @@ mod tests {
 
     #[test]
     fn renamed_session_paths_use_lector_and_keep_omadoc_as_legacy() {
-        assert!(session_path().ends_with(".config/lector/session.toml"));
-        assert!(legacy_session_path().ends_with(".config/omadoc/session.toml"));
+        let home = Path::new("/home/u");
+        assert_eq!(
+            crate::persist::config_dir(None, home, "lector").join("session.toml"),
+            PathBuf::from("/home/u/.config/lector/session.toml")
+        );
+        assert_eq!(
+            crate::persist::config_dir(None, home, "omadoc").join("session.toml"),
+            PathBuf::from("/home/u/.config/omadoc/session.toml")
+        );
+        let xdg = Path::new("/xdg/config");
+        assert_eq!(
+            crate::persist::config_dir(Some(xdg), home, "lector").join("session.toml"),
+            PathBuf::from("/xdg/config/lector/session.toml")
+        );
     }
 
     #[test]
@@ -516,6 +536,26 @@ mod tests {
         second.layout = "dual".into();
         second.save_to(&path).unwrap();
         assert!(Session::load_from_path(&path).invert);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn dual_cover_is_persisted_and_merged_as_a_preference() {
+        let path = test_path("dual-cover");
+        let mut first = Session::load_from_path(&path);
+        first.dual_cover = true;
+        first.save_to(&path).unwrap();
+        assert!(Session::load_from_path(&path).dual_cover);
+
+        let mut stale = Session::load_from_path(&path);
+        let mut newer = Session::load_from_path(&path);
+        newer.layout = "single".into();
+        newer.save_to(&path).unwrap();
+        stale.dual_cover = false;
+        stale.save_to(&path).unwrap();
+        let merged = Session::load_from_path(&path);
+        assert!(!merged.dual_cover);
+        assert_eq!(merged.layout, "single");
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

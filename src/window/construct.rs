@@ -44,6 +44,7 @@ impl Lector {
             let mut st = inner.borrow_mut();
             st.view.pdf_mode = PdfMode::parse(&st.session.pdf_mode, st.session.invert);
             st.view.layout_mode = session::parse_layout(&st.session.layout);
+            st.view.dual_cover = st.session.dual_cover;
             st.pane.sidebar = parse_sidebar(&st.session.sidebar);
         }
 
@@ -88,6 +89,7 @@ impl Lector {
 
         let cont_item = menu_check_row("Continuous", "c");
         let dual_item = menu_check_row("Dual", "d");
+        let cover_item = menu_check_row("Separate cover page", "");
         let single_item = menu_check_row("Single page", "s");
         dual_item.set_group(Some(&cont_item));
         single_item.set_group(Some(&cont_item));
@@ -118,6 +120,8 @@ impl Lector {
             let st = inner.borrow();
             cont_item.set_active(st.view.layout_mode == LayoutMode::Continuous);
             dual_item.set_active(st.view.layout_mode == LayoutMode::Dual);
+            cover_item.set_active(st.view.dual_cover);
+            cover_item.set_sensitive(st.view.layout_mode == LayoutMode::Dual);
             single_item.set_active(st.view.layout_mode == LayoutMode::Single);
             normal_item.set_active(st.view.pdf_mode == PdfMode::Normal);
             omarchy_item.set_active(st.view.pdf_mode == PdfMode::Omarchy);
@@ -318,6 +322,7 @@ impl Lector {
             find_btn: find_btn.clone(),
             cont_item: cont_item.clone(),
             dual_item: dual_item.clone(),
+            cover_item: cover_item.clone(),
             single_item: single_item.clone(),
             normal_item: normal_item.clone(),
             omarchy_item: omarchy_item.clone(),
@@ -408,6 +413,7 @@ impl Lector {
         ));
         menu_col.append(&cont_item);
         menu_col.append(&dual_item);
+        menu_col.append(&cover_item);
         menu_col.append(&single_item);
         menu_col.append(&menu_sep());
         menu_col.append(&menu_heading("PDF COLORS"));
@@ -518,6 +524,18 @@ impl Lector {
                 }
                 pop.popdown();
                 ui.set_layout(mode);
+            });
+        }
+        {
+            let h = h.clone();
+            let pop = menu_pop.clone();
+            cover_item.connect_toggled(move |item| {
+                let Some(ui) = h.get() else { return };
+                if ui.inner.borrow().ignore_menu_checks {
+                    return;
+                }
+                pop.popdown();
+                ui.set_dual_cover(item.is_active());
             });
         }
         for (item, mode) in [

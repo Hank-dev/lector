@@ -443,6 +443,7 @@ impl Lector {
                 st.view.page,
                 st.view.view_w.max(200.0),
                 st.view.view_h.max(200.0),
+                st.view.dual_cover,
             );
             let reset = raster_cache_needs_reset(
                 old_scale,

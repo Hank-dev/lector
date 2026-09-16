@@ -7,7 +7,7 @@ static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn config_dir(xdg_config_home: Option<&Path>, home: &Path, app: &str) -> PathBuf {
     match xdg_config_home {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(app),
+        Some(dir) if dir.is_absolute() => dir.join(app),
         _ => home.join(".config").join(app),
     }
 }
@@ -23,7 +23,7 @@ pub fn user_config_file(app: &str, name: &str) -> PathBuf {
 fn xdg_config_home() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
+        .filter(|path| path.is_absolute())
 }
 
 fn home_dir() -> PathBuf {
@@ -120,6 +120,18 @@ mod tests {
         assert_eq!(
             config_dir(Some(Path::new("")), Path::new("/home/u"), "omadoc"),
             PathBuf::from("/home/u/.config/omadoc")
+        );
+    }
+
+    #[test]
+    fn relative_xdg_config_home_is_ignored() {
+        assert_eq!(
+            config_dir(
+                Some(Path::new("relative/config")),
+                Path::new("/home/u"),
+                "lector"
+            ),
+            PathBuf::from("/home/u/.config/lector")
         );
     }
 }

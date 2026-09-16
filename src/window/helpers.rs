@@ -604,6 +604,10 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                     keys: "d",
                 },
                 ShortcutRow {
+                    action: "Separate cover page",
+                    keys: "",
+                },
+                ShortcutRow {
                     action: "Single page",
                     keys: "s",
                 },

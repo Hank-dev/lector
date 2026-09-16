@@ -726,6 +726,7 @@ impl Lector {
                 LayoutMode::Dual => "dual".into(),
                 LayoutMode::Continuous => "continuous".into(),
             };
+            st.session.dual_cover = st.view.dual_cover;
             st.session.sidebar = match st.pane.sidebar {
                 Sidebar::Hidden => "hidden".into(),
                 Sidebar::Thumbs => "thumbs".into(),

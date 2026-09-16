@@ -221,7 +221,21 @@ impl Lector {
         };
         self.cont_item.set_active(mode == LayoutMode::Continuous);
         self.dual_item.set_active(mode == LayoutMode::Dual);
+        self.cover_item.set_sensitive(mode == LayoutMode::Dual);
         self.single_item.set_active(mode == LayoutMode::Single);
+        self.inner.borrow_mut().ignore_menu_checks = false;
+        self.reflow();
+        self.goto_page(page);
+    }
+
+    pub(crate) fn set_dual_cover(&self, cover: bool) {
+        let page = {
+            let mut st = self.inner.borrow_mut();
+            st.view.dual_cover = cover;
+            st.ignore_menu_checks = true;
+            st.view.page
+        };
+        self.cover_item.set_active(cover);
         self.inner.borrow_mut().ignore_menu_checks = false;
         self.reflow();
         self.goto_page(page);

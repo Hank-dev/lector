@@ -103,6 +103,22 @@ pub const THUMB_CSS_WIDTH: f64 = 180.0;
 pub const MAX_RASTER_EDGE: i32 = 4096;
 pub const SEARCH_HIT_MARGIN: f64 = 24.0;
 
+pub fn dual_spread(current: i32, n_pages: i32, cover: bool) -> (i32, i32) {
+    if n_pages <= 0 {
+        return (0, 0);
+    }
+    let current = current.clamp(0, n_pages - 1);
+    if cover {
+        if current == 0 {
+            return (0, 0);
+        }
+        let a = current - ((current - 1) % 2);
+        return (a, (a + 1).min(n_pages - 1));
+    }
+    let a = current - (current % 2);
+    (a, (a + 1).min(n_pages - 1))
+}
+
 pub fn pages_intersecting_view(
     pages: &[PageGeom],
     view_top: f64,
@@ -475,6 +491,7 @@ pub fn draw_annotations(cr: &Context, drawing: AnnotationDrawing<'_>) {
 }
 
 impl Layout {
+    #[allow(clippy::too_many_arguments)]
     pub fn compute(
         doc: &OpenDoc,
         mode: LayoutMode,
@@ -483,6 +500,7 @@ impl Layout {
         current: i32,
         view_w: f64,
         view_h: f64,
+        dual_cover: bool,
     ) -> Self {
         let n = doc.n_pages;
         if n <= 0 {
@@ -521,8 +539,7 @@ impl Layout {
                 }
             }
             LayoutMode::Dual => {
-                let a = current - (current % 2);
-                let b = (a + 1).min(n - 1);
+                let (a, b) = dual_spread(current, n, dual_cover);
                 let (aw, ah) = doc.size(a, rotation);
                 let (bw, bh) = if b != a {
                     doc.size(b, rotation)
@@ -978,6 +995,23 @@ pub fn thumbnail(
 mod tests {
     use super::*;
     use crate::theme::PdfPalette;
+
+    #[test]
+    fn dual_spread_pairs_even_pages_without_cover() {
+        assert_eq!(dual_spread(0, 5, false), (0, 1));
+        assert_eq!(dual_spread(1, 5, false), (0, 1));
+        assert_eq!(dual_spread(2, 5, false), (2, 3));
+        assert_eq!(dual_spread(4, 5, false), (4, 4));
+    }
+
+    #[test]
+    fn dual_spread_keeps_cover_alone_then_pairs_the_rest() {
+        assert_eq!(dual_spread(0, 5, true), (0, 0));
+        assert_eq!(dual_spread(1, 5, true), (1, 2));
+        assert_eq!(dual_spread(2, 5, true), (1, 2));
+        assert_eq!(dual_spread(3, 5, true), (3, 4));
+        assert_eq!(dual_spread(4, 5, true), (3, 4));
+    }
 
     #[test]
     fn print_content_size_follows_page_rotation() {

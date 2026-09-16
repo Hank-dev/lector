@@ -87,6 +87,7 @@ pub struct Lector {
     find_btn: Button,
     cont_item: CheckButton,
     dual_item: CheckButton,
+    cover_item: CheckButton,
     single_item: CheckButton,
     normal_item: CheckButton,
     omarchy_item: CheckButton,
