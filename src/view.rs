@@ -150,13 +150,31 @@ pub fn page_in_view(pages: &[PageGeom], view_top: f64, _view_h: f64) -> i32 {
 }
 
 pub fn layout_content_size(pages: &[PageGeom]) -> (f64, f64) {
-    let mut width = PAGE_PAD;
-    let mut height = PAGE_PAD;
-    for page in pages {
-        width = width.max(page.x + page.w);
-        height = height.max(page.y + page.h);
+    if pages.is_empty() {
+        return (PAGE_PAD.max(1.0), PAGE_PAD.max(1.0));
     }
-    (width.max(1.0), height.max(1.0))
+    let mut left = f64::INFINITY;
+    let mut top = f64::INFINITY;
+    let mut right: f64 = 0.0;
+    let mut bottom: f64 = 0.0;
+    for page in pages {
+        left = left.min(page.x);
+        top = top.min(page.y);
+        right = right.max(page.x + page.w);
+        bottom = bottom.max(page.y + page.h);
+    }
+    (
+        (right + left.max(0.0)).max(1.0),
+        (bottom + top.max(0.0)).max(1.0),
+    )
+}
+
+fn canvas_extent(inner: f64, view: f64) -> f64 {
+    view.max(inner + PAGE_PAD * 2.0)
+}
+
+fn centered_origin(inner: f64, canvas: f64) -> f64 {
+    ((canvas - inner) / 2.0).max(0.0)
 }
 
 pub fn raster_pixel_size(css_w: f64, css_h: f64, dpr: f64) -> (i32, i32) {
@@ -524,8 +542,8 @@ impl Layout {
                 );
                 let w = pw * scale;
                 let h = ph * scale;
-                let x = ((view_w - w) / 2.0).max(PAGE_PAD / 2.0);
-                let y = PAGE_PAD;
+                let x = centered_origin(w, canvas_extent(w, view_w));
+                let y = centered_origin(h, canvas_extent(h, view_h));
                 Self {
                     pages: vec![PageGeom {
                         index: current,
@@ -555,13 +573,15 @@ impl Layout {
                     view_w - PAGE_PAD * 2.0,
                     view_h - PAGE_PAD * 2.0,
                 );
+                let spread_w = pair_w * scale;
+                let spread_h = pair_h * scale;
+                let mut x = centered_origin(spread_w, canvas_extent(spread_w, view_w));
+                let y0 = centered_origin(spread_h, canvas_extent(spread_h, view_h));
                 let mut pages = Vec::new();
-                let mut x = ((view_w - pair_w * scale) / 2.0).max(PAGE_PAD / 2.0);
-                let y = PAGE_PAD;
                 pages.push(PageGeom {
                     index: a,
                     x,
-                    y,
+                    y: y0 + (spread_h - ah * scale) / 2.0,
                     w: aw * scale,
                     h: ah * scale,
                     scale,
@@ -571,7 +591,7 @@ impl Layout {
                     pages.push(PageGeom {
                         index: b,
                         x,
-                        y,
+                        y: y0 + (spread_h - bh * scale) / 2.0,
                         w: bw * scale,
                         h: bh * scale,
                         scale,
@@ -589,16 +609,23 @@ impl Layout {
                     view_w - PAGE_PAD * 2.0,
                     view_h - PAGE_PAD * 2.0,
                 );
+                let sizes: Vec<(f64, f64)> = (0..n)
+                    .map(|i| {
+                        let (pw, ph) = doc.size(i, rotation);
+                        (pw * scale, ph * scale)
+                    })
+                    .collect();
+                let max_w = sizes.iter().map(|(w, _)| *w).fold(0.0, f64::max);
+                let stack_h: f64 =
+                    sizes.iter().map(|(_, h)| *h).sum::<f64>() + PAGE_GAP * (n - 1).max(0) as f64;
+                let canvas_w = canvas_extent(max_w, view_w);
+                let canvas_h = canvas_extent(stack_h, view_h);
+                let mut y = centered_origin(stack_h, canvas_h);
                 let mut pages = Vec::new();
-                let mut y = PAGE_PAD;
-                for i in 0..n {
-                    let (pw, ph) = doc.size(i, rotation);
-                    let w = pw * scale;
-                    let h = ph * scale;
-                    let x = ((view_w - w) / 2.0).max(PAGE_PAD / 2.0);
+                for (i, (w, h)) in sizes.into_iter().enumerate() {
                     pages.push(PageGeom {
-                        index: i,
-                        x,
+                        index: i as i32,
+                        x: centered_origin(w, canvas_w),
                         y,
                         w,
                         h,
@@ -1011,6 +1038,101 @@ mod tests {
         assert_eq!(dual_spread(2, 5, true), (1, 2));
         assert_eq!(dual_spread(3, 5, true), (3, 4));
         assert_eq!(dual_spread(4, 5, true), (3, 4));
+    }
+
+    fn assert_axis_centered(origin: f64, size: f64, view: f64, axis: &str) {
+        let center = origin + size / 2.0;
+        assert!(
+            (center - view / 2.0).abs() < 0.51,
+            "{axis} center {center} should match viewport mid {}",
+            view / 2.0
+        );
+    }
+
+    #[test]
+    fn pages_are_centered_in_the_viewport() {
+        let path = crate::doc::write_test_pdf("centered-pages", &["one", "two", "three"]);
+        let doc = OpenDoc::open(&path, None).unwrap();
+        let view_w = 1200.0;
+        let view_h = 1100.0;
+
+        let single = Layout::compute(
+            &doc,
+            LayoutMode::Single,
+            Zoom::Custom(1.0),
+            0,
+            0,
+            view_w,
+            view_h,
+            false,
+        );
+        let page = &single.pages[0];
+        assert_axis_centered(page.x, page.w, view_w, "single horizontal");
+        assert_axis_centered(page.y, page.h, view_h, "single vertical");
+        let (canvas_w, canvas_h) = layout_content_size(&single.pages);
+        assert!(
+            (canvas_w - view_w).abs() < 1.0,
+            "canvas width {canvas_w} must fill the viewport so GTK centering cannot shift the page"
+        );
+        assert!(
+            (canvas_h - view_h).abs() < 1.0,
+            "canvas height {canvas_h} must fill the viewport so the page sits in the middle"
+        );
+
+        let dual = Layout::compute(
+            &doc,
+            LayoutMode::Dual,
+            Zoom::Custom(1.0),
+            0,
+            0,
+            1600.0,
+            view_h,
+            false,
+        );
+        assert_eq!(dual.pages.len(), 2);
+        let left = &dual.pages[0];
+        let right = &dual.pages[1];
+        let pair_w = (right.x + right.w) - left.x;
+        assert_axis_centered(left.x, pair_w, 1600.0, "dual spread horizontal");
+        assert_axis_centered(left.y, left.h, view_h, "dual vertical");
+        assert_axis_centered(right.y, right.h, view_h, "dual facing vertical");
+
+        let continuous = Layout::compute(
+            &doc,
+            LayoutMode::Continuous,
+            Zoom::Custom(1.0),
+            0,
+            0,
+            view_w,
+            2500.0,
+            false,
+        );
+        assert_eq!(continuous.pages.len(), 3);
+        for page in &continuous.pages {
+            assert_axis_centered(page.x, page.w, view_w, "continuous horizontal");
+        }
+        let first = continuous.pages[0];
+        let last = *continuous.pages.last().unwrap();
+        let stack_mid = (first.y + last.y + last.h) / 2.0;
+        assert!(
+            (stack_mid - 1250.0).abs() < 0.51,
+            "short continuous stack mid {stack_mid} should sit in the viewport"
+        );
+
+        let zoomed = Layout::compute(
+            &doc,
+            LayoutMode::Single,
+            Zoom::Custom(4.0),
+            0,
+            0,
+            800.0,
+            600.0,
+            false,
+        );
+        assert!(zoomed.pages[0].x >= PAGE_PAD - 0.01);
+        assert!(zoomed.pages[0].y >= PAGE_PAD - 0.01);
+
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

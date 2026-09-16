@@ -289,7 +289,7 @@ dropdown popover row:selected label {{
 }}
 .lector-canvas {{
   background-color: {darker};
-  padding: 16px 0;
+  padding: 0;
 }}
 .lector-page {{
   background-color: #ffffff;
