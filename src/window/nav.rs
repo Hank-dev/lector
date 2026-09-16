@@ -285,6 +285,7 @@ impl Lector {
             self.window.unfullscreen();
             self.toolbar.set_visible(true);
             if ended_presentation {
+                self.window.remove_css_class("lector-presentation");
                 self.sync_sidebar();
                 let layout = self.inner.borrow().view.layout_mode;
                 self.set_layout(layout);
@@ -312,6 +313,7 @@ impl Lector {
             self.find_bar.set_reveal_child(false);
             self.sidebar_revealer.set_reveal_child(false);
             self.toolbar.set_visible(false);
+            self.window.add_css_class("lector-presentation");
             self.window.fullscreen();
         } else {
             {
@@ -327,6 +329,7 @@ impl Lector {
                 );
                 inner.pres_restore = restore;
             }
+            self.window.remove_css_class("lector-presentation");
             self.toolbar.set_visible(true);
             self.window.unfullscreen();
             self.sync_sidebar();

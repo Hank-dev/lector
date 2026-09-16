@@ -139,6 +139,12 @@ window.lector-window {{
   font-family: "{font}";
   font-size: {px}px;
 }}
+window.lector-window.lector-presentation,
+window.lector-window.lector-presentation scrolledwindow,
+window.lector-window.lector-presentation viewport,
+window.lector-window.lector-presentation .lector-canvas {{
+  background-color: {darker};
+}}
 .lector-toolbar {{
   background-color: {bg};
   color: {fg};
@@ -292,7 +298,7 @@ dropdown popover row:selected label {{
   padding: 0;
 }}
 .lector-page {{
-  background-color: #ffffff;
+  background-color: transparent;
   opacity: 1;
   box-shadow: 0 2px 10px alpha(#000000, 0.40);
 }}
@@ -876,5 +882,28 @@ mod tests {
         let palette = theme.pdf_palette();
         assert_eq!(palette.paper, PdfPalette::default().paper);
         assert_eq!(palette.ink, [0xab, 0xcd, 0xef]);
+    }
+
+    #[test]
+    fn presentation_css_fills_the_letterbox_with_canvas_dark() {
+        let theme = Theme {
+            background: "#aabbcc".into(),
+            darker_background: "#010203".into(),
+            ..Theme::default()
+        };
+        let css = theme.css();
+        let idx = css
+            .find("lector-presentation")
+            .expect("presentation letterbox rule");
+        let rest = &css[idx..];
+        let around = &rest[..rest.find('}').expect("presentation block") + 1];
+        assert!(
+            around.contains("#010203"),
+            "presentation surround must be the canvas dark, got {around}"
+        );
+        assert!(
+            !around.contains("#aabbcc"),
+            "window chrome color must not letterbox the page, got {around}"
+        );
     }
 }

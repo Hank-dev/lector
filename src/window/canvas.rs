@@ -1,7 +1,14 @@
 use super::*;
 
 impl Lector {
-    pub(crate) fn draw_page(&self, cr: &gtk::cairo::Context, index: i32, dpr: f64) {
+    pub(crate) fn draw_page(
+        &self,
+        cr: &gtk::cairo::Context,
+        index: i32,
+        dpr: f64,
+        width: i32,
+        height: i32,
+    ) {
         let view_top = self.scrolled.vadjustment().value();
         let view_h = self.scrolled.height() as f64;
         let dpr = dpr.max(1.0);
@@ -52,8 +59,11 @@ impl Lector {
         if let Some((surf, delta)) = visible_raster {
             // Rotate in normalized page coordinates before fitting the new CSS geometry.
             // No new surface or Poppler rendering is needed for immediate feedback.
+            let (dest_w, dest_h) = page_paint_size(&geom);
+            let dest_w = (width as f64).max(dest_w);
+            let dest_h = (height as f64).max(dest_h);
             cr.save().ok();
-            cr.scale(geom.w, geom.h);
+            cr.scale(dest_w, dest_h);
             match delta {
                 90 => cr.translate(1.0, 0.0),
                 180 => cr.translate(1.0, 1.0),
@@ -63,9 +73,6 @@ impl Lector {
             cr.rotate((delta as f64).to_radians());
             paint_raster(cr, &surf, 1.0, 1.0);
             cr.restore().ok();
-        } else {
-            cr.set_source_rgb(1.0, 1.0, 1.0);
-            cr.paint().ok();
         }
         if near && !exact_raster {
             self.queue_raster(index);
@@ -545,8 +552,7 @@ impl Lector {
         let widgets = self.page_widgets.borrow();
         for geom in &pages {
             if let Some((_, da)) = widgets.iter().find(|(i, _)| *i == geom.index) {
-                let pw = geom.w.ceil().max(1.0) as i32;
-                let ph = geom.h.ceil().max(1.0) as i32;
+                let (pw, ph) = page_alloc_size(geom);
                 da.set_content_width(pw);
                 da.set_content_height(ph);
                 da.set_size_request(pw, ph);
@@ -568,8 +574,7 @@ impl Lector {
 
     pub(crate) fn make_page_da(&self, geom: crate::view::PageGeom, h: &Handle) -> DrawingArea {
         let da = DrawingArea::new();
-        let pw = geom.w.ceil().max(1.0) as i32;
-        let ph = geom.h.ceil().max(1.0) as i32;
+        let (pw, ph) = page_alloc_size(&geom);
         da.set_content_width(pw);
         da.set_content_height(ph);
         da.set_size_request(pw, ph);
@@ -581,10 +586,7 @@ impl Lector {
             let h = h.clone();
             move |da, cr, width, height| {
                 if let Some(ui) = h.get() {
-                    ui.draw_page(cr, index, da.scale_factor() as f64);
-                } else if width > 0 && height > 0 {
-                    cr.set_source_rgb(1.0, 1.0, 1.0);
-                    let _ = cr.paint();
+                    ui.draw_page(cr, index, da.scale_factor() as f64, width, height);
                 }
             }
         });

@@ -29,11 +29,12 @@ use crate::session::{self, Session};
 use crate::theme::{self, Theme};
 use crate::view::{
     apply_print_page_transform, display_point_to_document, draw_annotations, draw_page_overlays,
-    layout_content_size, page_in_view, page_scroll_y, pages_intersecting_view, paint_raster,
-    print_content_size, raster_cache_needs_clear, raster_cache_needs_reset, raster_idle_is_stale,
-    raster_page, search_hit_scroll_y, selected_text, selection_highlight_rects, thumbnail,
-    thumbnail_css_size, AnnotationDrawing, Layout, LayoutMode, PageDrawing, PdfMode, RasterCache,
-    RasterKey, Selection, Zoom, MAX_ZOOM, SEARCH_HIT_MARGIN, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
+    layout_content_size, page_alloc_size, page_in_view, page_paint_size, page_scroll_y,
+    pages_intersecting_view, paint_raster, print_content_size, raster_cache_needs_clear,
+    raster_cache_needs_reset, raster_idle_is_stale, raster_page, search_hit_scroll_y,
+    selected_text, selection_highlight_rects, thumbnail, thumbnail_css_size, AnnotationDrawing,
+    Layout, LayoutMode, PageDrawing, PdfMode, RasterCache, RasterKey, Selection, Zoom, MAX_ZOOM,
+    SEARCH_HIT_MARGIN, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
 };
 
 mod annotations_ui;

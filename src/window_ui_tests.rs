@@ -273,7 +273,7 @@ fn actual_rotation_feedback_reuses_correctly_oriented_pixels() {
         .unwrap();
         {
             let cr = gtk::cairo::Context::new(&actual).unwrap();
-            ui.draw_page(&cr, 0, 1.0);
+            ui.draw_page(&cr, 0, 1.0, geom.w as i32, geom.h as i32);
         }
         eprintln!(
             "rotation {rotation}: synchronous feedback+reference {:?}; no raster idle dispatched",
@@ -475,9 +475,14 @@ fn actual_window_navigation_presentation_search_and_reload() {
     ui.set_zoom(Zoom::Custom(1.25));
     ui.toggle_presentation();
     assert!(ui.inner.borrow().presentation);
+    assert!(
+        ui.window.has_css_class("lector-presentation"),
+        "presentation letterbox uses the canvas dark class"
+    );
     assert_eq!(ui.inner.borrow().view.layout_mode, LayoutMode::Single);
     ui.toggle_presentation();
     assert!(!ui.inner.borrow().presentation);
+    assert!(!ui.window.has_css_class("lector-presentation"));
     assert_eq!(ui.inner.borrow().view.layout_mode, LayoutMode::Dual);
     assert_eq!(ui.inner.borrow().view.zoom, Zoom::Custom(1.25));
     ui.goto_page(6);

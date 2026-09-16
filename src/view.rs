@@ -170,11 +170,24 @@ pub fn layout_content_size(pages: &[PageGeom]) -> (f64, f64) {
 }
 
 fn canvas_extent(inner: f64, view: f64) -> f64 {
-    view.max(inner + PAGE_PAD * 2.0)
+    view.max(inner + PAGE_PAD * 2.0).round()
 }
 
 fn centered_origin(inner: f64, canvas: f64) -> f64 {
-    ((canvas - inner) / 2.0).max(0.0)
+    ((canvas - inner) / 2.0).max(0.0).round()
+}
+
+fn snap_size(v: f64) -> f64 {
+    v.round().max(1.0)
+}
+
+pub fn page_alloc_size(geom: &PageGeom) -> (i32, i32) {
+    (geom.w.ceil().max(1.0) as i32, geom.h.ceil().max(1.0) as i32)
+}
+
+pub fn page_paint_size(geom: &PageGeom) -> (f64, f64) {
+    let (w, h) = page_alloc_size(geom);
+    (w as f64, h as f64)
 }
 
 pub fn raster_pixel_size(css_w: f64, css_h: f64, dpr: f64) -> (i32, i32) {
@@ -432,7 +445,10 @@ pub fn paint_raster(cr: &Context, surf: &ImageSurface, css_w: f64, css_h: f64) {
     }
     cr.save().ok();
     cr.scale(css_w / sw, css_h / sh);
-    cr.set_source_surface(surf, 0.0, 0.0).ok();
+    let pattern = cairo::SurfacePattern::create(surf);
+    pattern.set_filter(cairo::Filter::Good);
+    pattern.set_extend(cairo::Extend::Pad);
+    cr.set_source(pattern).ok();
     cr.paint().ok();
     cr.restore().ok();
 }
@@ -540,8 +556,8 @@ impl Layout {
                     view_w - PAGE_PAD * 2.0,
                     view_h - PAGE_PAD * 2.0,
                 );
-                let w = pw * scale;
-                let h = ph * scale;
+                let w = snap_size(pw * scale);
+                let h = snap_size(ph * scale);
                 let x = centered_origin(w, canvas_extent(w, view_w));
                 let y = centered_origin(h, canvas_extent(h, view_h));
                 Self {
@@ -573,27 +589,31 @@ impl Layout {
                     view_w - PAGE_PAD * 2.0,
                     view_h - PAGE_PAD * 2.0,
                 );
-                let spread_w = pair_w * scale;
-                let spread_h = pair_h * scale;
+                let aw_s = snap_size(aw * scale);
+                let ah_s = snap_size(ah * scale);
+                let bw_s = if b != a { snap_size(bw * scale) } else { 0.0 };
+                let bh_s = if b != a { snap_size(bh * scale) } else { 0.0 };
+                let spread_w = aw_s + if b != a { bw_s + PAGE_GAP } else { 0.0 };
+                let spread_h = ah_s.max(bh_s);
                 let mut x = centered_origin(spread_w, canvas_extent(spread_w, view_w));
                 let y0 = centered_origin(spread_h, canvas_extent(spread_h, view_h));
                 let mut pages = Vec::new();
                 pages.push(PageGeom {
                     index: a,
                     x,
-                    y: y0 + (spread_h - ah * scale) / 2.0,
-                    w: aw * scale,
-                    h: ah * scale,
+                    y: y0 + ((spread_h - ah_s) / 2.0).round(),
+                    w: aw_s,
+                    h: ah_s,
                     scale,
                 });
                 if b != a {
-                    x += aw * scale + PAGE_GAP;
+                    x += aw_s + PAGE_GAP;
                     pages.push(PageGeom {
                         index: b,
                         x,
-                        y: y0 + (spread_h - bh * scale) / 2.0,
-                        w: bw * scale,
-                        h: bh * scale,
+                        y: y0 + ((spread_h - bh_s) / 2.0).round(),
+                        w: bw_s,
+                        h: bh_s,
                         scale,
                     });
                 }
@@ -612,7 +632,7 @@ impl Layout {
                 let sizes: Vec<(f64, f64)> = (0..n)
                     .map(|i| {
                         let (pw, ph) = doc.size(i, rotation);
-                        (pw * scale, ph * scale)
+                        (snap_size(pw * scale), snap_size(ph * scale))
                     })
                     .collect();
                 let max_w = sizes.iter().map(|(w, _)| *w).fold(0.0, f64::max);
@@ -1132,6 +1152,45 @@ mod tests {
         assert!(zoomed.pages[0].x >= PAGE_PAD - 0.01);
         assert!(zoomed.pages[0].y >= PAGE_PAD - 0.01);
 
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn page_paint_covers_the_widget_including_fractional_css() {
+        let geom = PageGeom {
+            index: 0,
+            x: 10.3,
+            y: 8.7,
+            w: 100.4,
+            h: 50.2,
+            scale: 1.0,
+        };
+        assert_eq!(page_alloc_size(&geom), (101, 51));
+        assert_eq!(page_paint_size(&geom), (101.0, 51.0));
+    }
+
+    #[test]
+    fn layout_snaps_page_edges_to_pixels() {
+        let path = crate::doc::write_test_pdf("pixel-snap", &["one"]);
+        let doc = OpenDoc::open(&path, None).unwrap();
+        let layout = Layout::compute(
+            &doc,
+            LayoutMode::Single,
+            Zoom::Custom(1.0),
+            0,
+            0,
+            1001.0,
+            1100.0,
+            false,
+        );
+        let page = layout.pages[0];
+        for (name, value) in [("x", page.x), ("y", page.y), ("w", page.w), ("h", page.h)] {
+            assert_eq!(
+                value,
+                value.round(),
+                "{name}={value} must sit on a pixel edge to avoid a bright seam"
+            );
+        }
         std::fs::remove_file(path).ok();
     }
 
