@@ -134,7 +134,7 @@ impl Theme {
         format!(
             r#"
 window.lector-window {{
-  background-color: {bg};
+  background-color: {darker};
   color: {fg};
   font-family: "{font}";
   font-size: {px}px;
@@ -142,6 +142,7 @@ window.lector-window {{
 window.lector-window.lector-presentation,
 window.lector-window.lector-presentation scrolledwindow,
 window.lector-window.lector-presentation viewport,
+window.lector-window.lector-presentation viewport.view,
 window.lector-window.lector-presentation .lector-canvas {{
   background-color: {darker};
 }}
@@ -432,6 +433,12 @@ label {{
 scrolledwindow {{
   background: transparent;
   border: none;
+}}
+window.lector-window scrolledwindow,
+window.lector-window viewport,
+window.lector-window viewport.view,
+window.lector-window .lector-canvas {{
+  background-color: {darker};
 }}
 scrollbar {{
   background: transparent;
@@ -904,6 +911,47 @@ mod tests {
         assert!(
             !around.contains("#aabbcc"),
             "window chrome color must not letterbox the page, got {around}"
+        );
+    }
+
+    #[test]
+    fn document_surround_uses_edge_dark_in_every_view() {
+        let theme = Theme {
+            background: "#aabbcc".into(),
+            darker_background: "#010203".into(),
+            ..Theme::default()
+        };
+        let css = theme.css();
+        let window = css
+            .split("window.lector-window {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("window rule");
+        assert!(
+            window.contains("#010203"),
+            "reading window must be the edge dark, got {window}"
+        );
+        assert!(
+            !window.contains("#aabbcc"),
+            "palette background must not fill empty space around pages, got {window}"
+        );
+        let canvas = css
+            .split(".lector-canvas {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("canvas rule");
+        assert!(
+            canvas.contains("#010203"),
+            "canvas surround must be the edge dark, got {canvas}"
+        );
+        let toolbar = css
+            .split(".lector-toolbar {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("toolbar rule");
+        assert!(
+            toolbar.contains("#aabbcc"),
+            "toolbar may keep the palette color, got {toolbar}"
         );
     }
 }

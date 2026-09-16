@@ -26,6 +26,7 @@ impl Lector {
             search: SearchState::new(),
             pane: PaneState::new(),
             presentation: false,
+            toolbar_hidden: false,
             theme,
             session: Session::load(),
             annotations,

@@ -42,6 +42,14 @@ fn pinch_begin_does_not_stick_ignore_scroll() {
 }
 
 #[test]
+fn toolbar_stays_hidden_until_toggled_back() {
+    assert!(toolbar_is_shown(false, false));
+    assert!(!toolbar_is_shown(false, true));
+    assert!(!toolbar_is_shown(true, false));
+    assert!(!toolbar_is_shown(true, true));
+}
+
+#[test]
 fn atomic_replace_is_a_reload_when_the_path_still_exists() {
     assert_eq!(
         resolved_disk_change(Some(DiskChange::Removed), true),

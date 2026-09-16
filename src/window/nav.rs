@@ -283,7 +283,7 @@ impl Lector {
                 ended
             };
             self.window.unfullscreen();
-            self.toolbar.set_visible(true);
+            self.sync_toolbar();
             if ended_presentation {
                 self.window.remove_css_class("lector-presentation");
                 self.sync_sidebar();
@@ -312,7 +312,7 @@ impl Lector {
             }
             self.find_bar.set_reveal_child(false);
             self.sidebar_revealer.set_reveal_child(false);
-            self.toolbar.set_visible(false);
+            self.sync_toolbar();
             self.window.add_css_class("lector-presentation");
             self.window.fullscreen();
         } else {
@@ -330,7 +330,7 @@ impl Lector {
                 inner.pres_restore = restore;
             }
             self.window.remove_css_class("lector-presentation");
-            self.toolbar.set_visible(true);
+            self.sync_toolbar();
             self.window.unfullscreen();
             self.sync_sidebar();
         }

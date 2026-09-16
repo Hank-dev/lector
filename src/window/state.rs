@@ -96,6 +96,7 @@ pub(crate) struct Inner {
     pub search: SearchState,
     pub pane: PaneState,
     pub presentation: bool,
+    pub toolbar_hidden: bool,
     pub theme: Theme,
     pub session: Session,
     pub annotations: Option<AnnotationStore>,

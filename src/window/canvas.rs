@@ -515,6 +515,17 @@ impl Lector {
             content_w.ceil().max(1.0) as i32,
             content_h.ceil().max(1.0) as i32,
         );
+        let view_w = self.scrolled.width() as f64;
+        let view_h = self.scrolled.height() as f64;
+        self.pages_box
+            .set_valign(if content_h + 0.5 < view_h.max(1.0) {
+                gtk::Align::Center
+            } else {
+                gtk::Align::Start
+            });
+        if content_w + 0.5 <= view_w.max(1.0) {
+            self.scrolled.hadjustment().set_value(0.0);
+        }
         if pages.is_empty() {
             return;
         }

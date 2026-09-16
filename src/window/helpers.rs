@@ -396,6 +396,10 @@ pub(crate) fn viewport_resize_should_reflow(ignore_scroll: bool) -> bool {
     !ignore_scroll
 }
 
+pub(crate) fn toolbar_is_shown(presentation: bool, user_hidden: bool) -> bool {
+    !presentation && !user_hidden
+}
+
 pub(crate) fn canvas_scroll_response(ctrl: bool, dy: f64, pinch_active: bool) -> glib::Propagation {
     if pinch_active || (ctrl && dy != 0.0) {
         glib::Propagation::Stop
@@ -642,6 +646,10 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ShortcutRow {
                     action: "Fullscreen",
                     keys: "F11",
+                },
+                ShortcutRow {
+                    action: "Hide toolbar",
+                    keys: "F8",
                 },
                 ShortcutRow {
                     action: "Presentation",

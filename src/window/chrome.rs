@@ -33,6 +33,24 @@ impl Lector {
         self.update_annotation_actions();
     }
 
+    pub(crate) fn sync_toolbar(&self) {
+        let st = self.inner.borrow();
+        let show = toolbar_is_shown(st.presentation, st.toolbar_hidden);
+        drop(st);
+        self.toolbar.set_visible(show);
+    }
+
+    pub(crate) fn toggle_toolbar(&self) {
+        if self.inner.borrow().presentation {
+            return;
+        }
+        {
+            let mut st = self.inner.borrow_mut();
+            st.toolbar_hidden = !st.toolbar_hidden;
+        }
+        self.sync_toolbar();
+    }
+
     pub(crate) fn key(&self, key: Key, mods: gdk::ModifierType) -> glib::Propagation {
         let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
@@ -190,6 +208,10 @@ impl Lector {
             }
             Key::F11 => {
                 self.toggle_fullscreen();
+                glib::Propagation::Stop
+            }
+            Key::F8 => {
+                self.toggle_toolbar();
                 glib::Propagation::Stop
             }
             Key::F5 => {
