@@ -1,6 +1,21 @@
 use super::*;
 
 impl Lector {
+    pub(crate) fn canvas_scroll(&self, ctrl: bool, dy: f64) -> glib::Propagation {
+        if canvas_scroll_response(ctrl, dy, self.pinch_active.get()) == glib::Propagation::Stop {
+            if ctrl && dy != 0.0 && !self.pinch_active.get() {
+                self.zoom_by_at(ctrl_scroll_zoom_factor(dy), None);
+            }
+            glib::Propagation::Stop
+        } else {
+            // New user panning wins over the bounded post-layout restore.
+            let mut st = self.inner.borrow_mut();
+            st.layout_gen = st.layout_gen.wrapping_add(1);
+            st.ignore_scroll = false;
+            glib::Propagation::Proceed
+        }
+    }
+
     pub(crate) fn draw_page(
         &self,
         cr: &gtk::cairo::Context,
@@ -252,6 +267,29 @@ impl Lector {
             self.raster_busy.set(false);
             return;
         };
+        // Reuse compatible pixels during a gesture. Poppler and recoloring run
+        // on this thread and would otherwise stall input at every intermediate
+        // scale. Newly exposed pages without a fallback still get rendered.
+        let preview_available = if self.pinch_active.get() {
+            let mut st = self.inner.borrow_mut();
+            let key = st.view.layout.page_geom(index).map(|geom| {
+                RasterKey::from_geom(
+                    &geom,
+                    st.view.rotation,
+                    st.view.pdf_mode,
+                    st.theme.pdf_palette(),
+                    self.page_dpr(),
+                )
+            });
+            key.is_some_and(|key| st.raster.get_page(&key).is_some())
+        } else {
+            false
+        };
+        if preview_available {
+            self.raster_busy.set(false);
+            self.kick_raster_idle();
+            return;
+        }
         let rendered = {
             let st = self.inner.borrow();
             match (st.view.doc.as_ref(), st.view.layout.page_geom(index)) {
@@ -311,6 +349,7 @@ impl Lector {
 
     pub(crate) fn finish_pinch(&self) {
         self.pinch_active.set(false);
+        self.ensure_visible_rasters();
     }
 
     pub(crate) fn page_dpr(&self) -> f64 {
@@ -353,15 +392,30 @@ impl Lector {
                 (self.scrolled.height() as f64 * 0.5).max(0.0),
             )
         });
-        let content_x = self.scrolled.hadjustment().value() + view_x;
-        let content_y = self.scrolled.vadjustment().value() + view_y;
         let pages = self.inner.borrow().view.layout.pages.clone();
+        let (offset_x, offset_y) = self.canvas_center_offset(&pages);
+        let content_x = self.scrolled.hadjustment().value() + view_x - offset_x;
+        let content_y = self.scrolled.vadjustment().value() + view_y - offset_y;
         anchor_from_content(&pages, content_x, content_y, view_x, view_y)
+    }
+
+    fn canvas_center_offset(&self, pages: &[crate::view::PageGeom]) -> (f64, f64) {
+        let (w, h) = layout_content_size(pages);
+        (
+            ((self.scrolled.width() as f64 - w.ceil()) * 0.5)
+                .floor()
+                .max(0.0),
+            ((self.scrolled.height() as f64 - h.ceil()) * 0.5)
+                .floor()
+                .max(0.0),
+        )
     }
 
     pub(crate) fn apply_anchor(&self, anchor: ViewportAnchor) {
         let pages = self.inner.borrow().view.layout.pages.clone();
+        let (offset_x, offset_y) = self.canvas_center_offset(&pages);
         let (x, y) = restored_scroll(anchor, &pages);
+        let (x, y) = (x + offset_x, y + offset_y);
         let h = self.scrolled.hadjustment();
         let v = self.scrolled.vadjustment();
         h.set_value(clamp_adjustment(x, h.lower(), h.upper(), h.page_size()));
@@ -389,6 +443,11 @@ impl Lector {
                 ));
             }
         }
+        // Adjustment callbacks are suppressed during reflow. Reconcile the
+        // virtualized pages explicitly against the restored viewport, not the
+        // old scroll position at which the new layout was initially installed.
+        self.sync_visible_page_widgets();
+        self.ensure_visible_rasters();
     }
 
     pub(crate) fn schedule_view_restore(&self, restore: ViewRestore) {

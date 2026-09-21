@@ -383,8 +383,6 @@ fn pinch_and_factor_zoom_clamp_to_supported_range() {
     assert_eq!(zoom_from_factor(1.0, 1.15), Zoom::Custom(1.15));
     assert_eq!(zoom_from_factor(0.1, 0.5), Zoom::Custom(0.1));
     assert_eq!(zoom_from_factor(10.0, 4.0), Zoom::Custom(MAX_ZOOM));
-    assert!(pinch_scale_is_meaningful(1.0, 1.03));
-    assert!(!pinch_scale_is_meaningful(1.0, 1.01));
     assert_eq!(zoom_chrome(Zoom::Custom(1.37)), ZoomChrome::Percent(137));
     assert_eq!(zoom_chrome(Zoom::Custom(1.15)), ZoomChrome::Percent(115));
     assert_eq!(zoom_chrome(Zoom::Actual), ZoomChrome::Preset(7));

@@ -138,3 +138,6 @@ mod menu_test;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod zoom_tests;

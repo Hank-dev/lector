@@ -676,20 +676,12 @@ impl Lector {
         scroll.connect_scroll({
             let h = h.clone();
             move |c, _dx, dy| {
-                let pinch_active = h.get().is_some_and(|ui| ui.pinch_active.get());
                 let ctrl = c
                     .current_event_state()
                     .contains(gdk::ModifierType::CONTROL_MASK);
-                if canvas_scroll_response(ctrl, dy, pinch_active) == glib::Propagation::Stop {
-                    if ctrl && dy != 0.0 {
-                        if let Some(ui) = h.get() {
-                            ui.zoom_by_at(ctrl_scroll_zoom_factor(dy), None);
-                        }
-                    }
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
+                h.get()
+                    .map(|ui| ui.canvas_scroll(ctrl, dy))
+                    .unwrap_or(glib::Propagation::Proceed)
             }
         });
         scrolled.add_controller(scroll);
@@ -698,16 +690,23 @@ impl Lector {
         pinch.set_propagation_phase(gtk::PropagationPhase::Capture);
         let pinch_start = Rc::new(Cell::new(1.0));
         let pinch_anchor = Rc::new(Cell::new(None::<ViewportAnchor>));
+        let pinch_latest = Rc::new(Cell::new(None::<(Zoom, ViewRestore)>));
+        let pinch_frame_pending = Rc::new(Cell::new(false));
         pinch.connect_begin({
             let h = h.clone();
             let pinch_start = pinch_start.clone();
             let pinch_anchor = pinch_anchor.clone();
+            let pinch_latest = pinch_latest.clone();
             move |gesture, _| {
                 if let Some(ui) = h.get() {
+                    pinch_latest.set(None);
                     ui.pinch_active.set(true);
                     ui.inner.borrow_mut().ignore_scroll = pinch_begin_ignore_scroll();
                     pinch_start.set(ui.inner.borrow().view.layout.scale.max(0.01));
-                    pinch_anchor.set(Some(ui.capture_anchor(gesture.bounding_box_center())));
+                    let focus = gesture
+                        .current_event()
+                        .and_then(|_| gesture.bounding_box_center());
+                    pinch_anchor.set(Some(ui.capture_anchor(focus)));
                 }
             }
         });
@@ -715,29 +714,47 @@ impl Lector {
             let h = h.clone();
             let pinch_start = pinch_start.clone();
             let pinch_anchor = pinch_anchor.clone();
+            let pinch_latest = pinch_latest.clone();
+            let pinch_frame_pending = pinch_frame_pending.clone();
             move |_, scale| {
                 if let Some(ui) = h.get() {
                     let Some(anchor) = pinch_anchor.get() else {
                         return;
                     };
-                    let (zoom, restore) = pinch_zoom_update(pinch_start.get(), scale, anchor);
-                    let Zoom::Custom(target_scale) = zoom else {
-                        return;
-                    };
-                    if !pinch_scale_is_meaningful(ui.inner.borrow().view.layout.scale, target_scale)
-                    {
+                    if !scale.is_finite() || scale <= 0.0 {
                         return;
                     }
-                    ui.set_zoom_restore(zoom, restore);
+                    let (zoom, restore) = pinch_zoom_update(pinch_start.get(), scale, anchor);
+                    pinch_latest.set(Some((zoom, restore)));
+                    // Keep only the latest target and apply once per display frame.
+                    // A scale threshold makes slow pinches visibly staircase instead.
+                    if !pinch_frame_pending.replace(true) {
+                        let h = h.clone();
+                        let latest = pinch_latest.clone();
+                        let pending = pinch_frame_pending.clone();
+                        ui.scrolled.add_tick_callback(move |_, _| {
+                            pending.set(false);
+                            if let Some(ui) = h.get() {
+                                if let Some((zoom, restore)) = latest.take() {
+                                    ui.set_zoom_restore(zoom, restore);
+                                }
+                            }
+                            glib::ControlFlow::Break
+                        });
+                    }
                 }
             }
         });
         let finish_pinch = {
             let h = h.clone();
             let pinch_anchor = pinch_anchor.clone();
+            let pinch_latest = pinch_latest.clone();
             move || {
                 pinch_anchor.set(None);
                 if let Some(ui) = h.get() {
+                    if let Some((zoom, restore)) = pinch_latest.take() {
+                        ui.set_zoom_restore(zoom, restore);
+                    }
                     ui.finish_pinch();
                 }
             }

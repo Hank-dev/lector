@@ -6,7 +6,7 @@ use gtk::{gdk, gio, glib};
 
 use crate::doc::{outline_item_has_children, OpenDoc};
 use crate::session::Session;
-use crate::view::{page_at_content_y, Layout, LayoutMode, Selection, Zoom, MAX_ZOOM};
+use crate::view::{Layout, LayoutMode, PageGeom, Selection, Zoom, MAX_ZOOM};
 
 pub(crate) const ZOOM_LABELS: [&str; 16] = [
     "Automatic",
@@ -285,18 +285,16 @@ pub(crate) struct ViewportAnchor {
 }
 
 pub(crate) fn anchor_from_content(
-    pages: &[crate::view::PageGeom],
+    pages: &[PageGeom],
     content_x: f64,
     content_y: f64,
     view_x: f64,
     view_y: f64,
 ) -> ViewportAnchor {
-    let page = page_at_content_y(pages, content_y);
-    let geom = pages
-        .iter()
-        .copied()
-        .find(|page_geom| page_geom.index == page)
-        .or_else(|| pages.first().copied());
+    // A gutter or margin is not part of a page. Falling through to the first
+    // column treats the fixed page gap as scalable page width.
+    let geom = page_containing_content(pages, content_x, content_y)
+        .or_else(|| page_nearest_content(pages, content_x, content_y));
     let Some(geom) = geom else {
         return ViewportAnchor {
             page: 0,
@@ -309,17 +307,48 @@ pub(crate) fn anchor_from_content(
     ViewportAnchor {
         page: geom.index,
         rel_x: if geom.w > 0.0 {
-            (content_x - geom.x) / geom.w
+            ((content_x - geom.x) / geom.w).clamp(0.0, 1.0)
         } else {
             0.5
         },
         rel_y: if geom.h > 0.0 {
-            (content_y - geom.y) / geom.h
+            ((content_y - geom.y) / geom.h).clamp(0.0, 1.0)
         } else {
             0.0
         },
         view_x,
         view_y,
+    }
+}
+
+fn page_containing_content(pages: &[PageGeom], x: f64, y: f64) -> Option<PageGeom> {
+    pages
+        .iter()
+        .copied()
+        .find(|page| x >= page.x && x <= page.x + page.w && y >= page.y && y <= page.y + page.h)
+}
+
+fn page_nearest_content(pages: &[PageGeom], x: f64, y: f64) -> Option<PageGeom> {
+    pages.iter().copied().min_by(|a, b| {
+        content_distance_sq(*a, x, y)
+            .total_cmp(&content_distance_sq(*b, x, y))
+            .then(a.index.cmp(&b.index))
+    })
+}
+
+fn content_distance_sq(page: PageGeom, x: f64, y: f64) -> f64 {
+    let dx = axis_outside(page.x, page.w, x);
+    let dy = axis_outside(page.y, page.h, y);
+    dx * dx + dy * dy
+}
+
+fn axis_outside(origin: f64, size: f64, point: f64) -> f64 {
+    if point < origin {
+        origin - point
+    } else if point > origin + size {
+        point - (origin + size)
+    } else {
+        0.0
     }
 }
 
@@ -342,10 +371,6 @@ pub(crate) fn zoom_from_factor(current_scale: f64, factor: f64) -> Zoom {
 
 pub(crate) fn pinch_target_scale(start_scale: f64, gesture_scale: f64) -> f64 {
     (start_scale * gesture_scale).clamp(0.1, MAX_ZOOM)
-}
-
-pub(crate) fn pinch_scale_is_meaningful(applied: f64, target: f64) -> bool {
-    (target - applied).abs() / applied.max(0.01) >= 0.02
 }
 
 pub(crate) fn pinch_zoom_update(

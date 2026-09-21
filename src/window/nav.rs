@@ -97,11 +97,12 @@ impl Lector {
             return;
         }
         self.update_chrome();
+        // The adjustment upper can still be the previous canvas until allocation.
+        // One scroll clamps there, so retry the page the same way a layout switch does.
+        // The new generation also replaces any zoom anchor still waiting on that allocation.
         self.inner.borrow_mut().ignore_scroll = true;
-        self.scroll_to_current();
-        self.inner.borrow_mut().ignore_scroll = false;
-        self.sync_visible_page_widgets();
-        self.ensure_visible_rasters();
+        self.apply_view_restore(ViewRestore::CurrentPage);
+        self.schedule_view_restore(ViewRestore::CurrentPage);
     }
 
     pub(crate) fn goto_page_rel(&self, delta: i32) {
@@ -213,19 +214,19 @@ impl Lector {
     }
 
     pub(crate) fn set_layout(&self, mode: LayoutMode) {
-        let page = {
+        {
             let mut st = self.inner.borrow_mut();
             st.view.layout_mode = mode;
             st.ignore_menu_checks = true;
-            st.view.page
-        };
+        }
         self.cont_item.set_active(mode == LayoutMode::Continuous);
         self.dual_item.set_active(mode == LayoutMode::Dual);
         self.cover_item.set_sensitive(mode == LayoutMode::Dual);
         self.single_item.set_active(mode == LayoutMode::Single);
         self.inner.borrow_mut().ignore_menu_checks = false;
-        self.reflow();
-        self.goto_page(page);
+        // The destination may exceed GTK's old canvas bounds until allocation.
+        // Keep the reflow's delayed restore; goto_page would cancel it.
+        self.reflow_restore(ViewRestore::CurrentPage);
     }
 
     pub(crate) fn set_dual_cover(&self, cover: bool) {
