@@ -15,8 +15,13 @@ impl Lector {
             item.set_sensitive(has_doc);
         }
         if let Some(doc) = st.view.doc.as_ref() {
-            self.window.set_title(Some(&doc.title));
-            self.title_label.set_text(&doc.title);
+            let title = if self.pdf_dirty.get() {
+                format!("{} — Unsaved PDF changes", doc.title)
+            } else {
+                doc.title.clone()
+            };
+            self.window.set_title(Some(&title));
+            self.title_label.set_text(&title);
             self.page_total.set_text(&format!("/ {}", doc.n_pages));
             if !self.page_entry.has_focus() {
                 self.page_entry
@@ -31,6 +36,7 @@ impl Lector {
         drop(st);
         self.update_navigation_buttons();
         self.update_annotation_actions();
+        self.sync_edit_bar();
     }
 
     pub(crate) fn sync_toolbar(&self) {
@@ -63,6 +69,26 @@ impl Lector {
             return glib::Propagation::Stop;
         }
 
+        if key == Key::Escape && (self.draw_mode.get() || self.text_placement.get()) {
+            self.finish_edit_mode();
+            self.inner.borrow_mut().view.selection = None;
+            return glib::Propagation::Stop;
+        }
+        if let Some(propagation) = self.handle_inline_text_key(key, mods) {
+            return propagation;
+        }
+        if ctrl
+            && !shift
+            && matches!(key, Key::z | Key::Z)
+            && !self.search_entry.has_focus()
+            && !self.page_entry.has_focus()
+            && (self.draw_mode.get()
+                || self.text_placement.get()
+                || !self.edit_undo.borrow().is_empty())
+        {
+            self.undo_edit();
+            return glib::Propagation::Stop;
+        }
         if self.search_entry.has_focus() && !ctrl {
             if key == Key::Escape {
                 self.hide_search();
@@ -76,6 +102,26 @@ impl Lector {
                 return glib::Propagation::Stop;
             }
             return glib::Propagation::Proceed;
+        }
+
+        if ctrl && shift {
+            match key {
+                Key::t | Key::T => {
+                    self.add_text_dialog();
+                    return glib::Propagation::Stop;
+                }
+                Key::d | Key::D => {
+                    self.toggle_draw();
+                    return glib::Propagation::Stop;
+                }
+                Key::f | Key::F => {
+                    if let Some(dialog) = self.forms_dialog() {
+                        dialog.present();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
         }
 
         if let Some(shortcut) = annotation_shortcut(key, mods) {
@@ -114,7 +160,6 @@ impl Lector {
                     return glib::Propagation::Stop;
                 }
                 Key::w | Key::q => {
-                    self.persist();
                     self.window.close();
                     return glib::Propagation::Stop;
                 }

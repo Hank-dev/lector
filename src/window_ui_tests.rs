@@ -1,6 +1,426 @@
 //! Display-backed checks run explicitly; no windows are presented or sessions saved.
 use super::*;
 
+fn form_widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
+    let mut result = vec![root.clone()];
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        result.extend(form_widgets(&widget));
+        child = widget.next_sibling();
+    }
+    result
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_added_text_manager_deletes_selected_entry() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorRemoveTextTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    let path = crate::doc::write_test_pdf("remove-text-ui", &[""]);
+    ui.open_path(&path, None);
+    let rect = crate::annotations::DocumentRect {
+        x: 72.,
+        y: 150.,
+        width: 228.,
+        height: 80.,
+    };
+    {
+        let st = ui.inner.borrow();
+        let doc = st.view.doc.as_ref().unwrap();
+        doc.add_fill_text(0, rect, "Remove this").unwrap();
+        doc.add_fill_text(0, rect, "Leave this").unwrap();
+    }
+    let manager = form_widgets(ui.window.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Button>().ok())
+        .find(|b| widget_tree_has_label(b.upcast_ref(), "Added Text & Drawings…"))
+        .expect("manager must be reachable from the menu");
+    manager.emit_clicked();
+    let dialog = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Window>().ok())
+        .find(|w| w.title().as_deref() == Some("Added Text & Drawings"))
+        .expect("manager menu action must open its dialog");
+    let buttons = form_widgets(dialog.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Button>().ok())
+        .collect::<Vec<_>>();
+    let remove = buttons
+        .iter()
+        .find(|b| b.tooltip_text().as_deref() == Some("Remove this"))
+        .expect("each text entry should have its own delete action");
+    remove.emit_clicked();
+    assert!(ui.pdf_dirty.get());
+    let copy = path.with_extension("filled.pdf");
+    ui.save_copy_to(&copy).unwrap();
+    let reopened = OpenDoc::open(&copy, None).unwrap();
+    let entries = reopened.free_text_annotations();
+    assert_eq!(entries.len(), 1);
+    use poppler::prelude::*;
+    assert_eq!(entries[0].1.contents().as_deref(), Some("Leave this"));
+    dialog.destroy();
+    ui.hold.borrow_mut().take();
+    std::fs::remove_file(copy).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_form_keyboard_shortcuts() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorFormShortcutTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    let path = crate::form_tests::fixture();
+    ui.open_path(&path, None);
+    let mods = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+    for key in [Key::t, Key::T] {
+        assert_eq!(ui.key(key, mods), glib::Propagation::Stop);
+        assert_eq!(
+            ui.pages_box.cursor().and_then(|c| c.name()).as_deref(),
+            Some("crosshair")
+        );
+        ui.key(Key::Escape, gdk::ModifierType::empty());
+    }
+    for key in [Key::f, Key::F] {
+        assert_eq!(ui.key(key, mods), glib::Propagation::Stop);
+        let dialog = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Fill Form"))
+            .expect("Ctrl+Shift+F must open Fill Form, not Find");
+        dialog.destroy();
+    }
+    for label in ["Ctrl+Shift+T", "Ctrl+Shift+F"] {
+        assert!(widget_tree_has_label(ui.window.upcast_ref(), label));
+        let shortcuts = ui.shortcuts_dialog();
+        assert!(widget_tree_has_label(shortcuts.upcast_ref(), label));
+        shortcuts.destroy();
+    }
+    ui.hold.borrow_mut().take();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_blank_page_drag_opens_text_editor() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorTextPlacementTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    let path = crate::doc::write_test_pdf("blank-drag", &[""]);
+    ui.open_path(&path, None);
+    ui.window.present();
+    drain_for(&glib::MainContext::default(), 300);
+    let button = form_widgets(ui.window.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Button>().ok())
+        .find(|b| widget_tree_has_label(b.upcast_ref(), "Add Text…"))
+        .unwrap();
+    button.emit_clicked();
+    assert_eq!(
+        ui.pages_box.cursor().and_then(|c| c.name()).as_deref(),
+        Some("crosshair"),
+        "Add Text must arm visible placement without requiring an invisible prior selection"
+    );
+    let da = ui.page_widgets.borrow()[0].1.clone();
+    let bounds = da.compute_bounds(&ui.pages_box).unwrap();
+    let scale = ui.inner.borrow().view.layout.page_geom(0).unwrap().scale;
+    let (x, y) = (
+        bounds.x() as f64 + 72. * scale,
+        bounds.y() as f64 + 150. * scale,
+    );
+    ui.drag_begin(x, y);
+    assert!(
+        gtk::Window::list_toplevels().into_iter().all(|w| {
+            w.downcast::<gtk::Window>()
+                .ok()
+                .and_then(|w| w.title())
+                .as_deref()
+                != Some("Add Text")
+        }),
+        "a click must place the caret on the page, not open a text box"
+    );
+    assert_eq!(
+        ui.pages_box.cursor().and_then(|c| c.name()).as_deref(),
+        Some("text")
+    );
+    assert_eq!(
+        ui.key(Key::Escape, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert!(ui.pages_box.cursor().is_none());
+    assert!(ui.text_draft.borrow().is_none());
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_free_text_selection_editor() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorFreeTextTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    let path = crate::doc::write_test_pdf("fill-ui", &[""]);
+    ui.open_path(&path, None);
+    ui.window.present();
+    drain_for(&glib::MainContext::default(), 300);
+    let caret = 12.0 * crate::view::FREE_TEXT_CARET_CENTER;
+    let mut tops = Vec::new();
+    for rotation in [0, 90, 180, 270] {
+        ui.inner.borrow_mut().view.rotation = rotation;
+        ui.reflow();
+        // Page widgets report stale bounds until the reflow is allocated.
+        drain_for(&glib::MainContext::default(), 600);
+        // Separate lines: a click on earlier text would edit it instead.
+        let click_y = 150. + rotation as f64;
+        tops.push(792. - (click_y - caret));
+        let (dx, dy) =
+            crate::annotations::document_point_to_display(72., click_y, 612., 792., rotation);
+        let da = ui.page_widgets.borrow()[0].1.clone();
+        let bounds = da.compute_bounds(&ui.pages_box).unwrap();
+        let scale = ui.inner.borrow().view.layout.page_geom(0).unwrap().scale;
+        let button = form_widgets(ui.window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<Button>().ok())
+            .find(|b| widget_tree_has_label(b.upcast_ref(), "Add Text…"))
+            .expect("Add Text menu action missing");
+        let raster_gen = ui.inner.borrow().raster_gen;
+        button.emit_clicked();
+        ui.drag_begin(
+            bounds.x() as f64 + dx * scale,
+            bounds.y() as f64 + dy * scale,
+        );
+        assert_eq!(
+            ui.key(Key::H, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(
+            ui.key(Key::i, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(
+            ui.key(Key::Return, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(
+            ui.inner
+                .borrow()
+                .view
+                .doc
+                .as_ref()
+                .unwrap()
+                .page(0)
+                .unwrap()
+                .annot_mapping()
+                .len(),
+            (rotation / 90 + 1) as usize
+        );
+        use glib::translate::ToGlibPtr;
+        for mapping in ui
+            .inner
+            .borrow()
+            .view
+            .doc
+            .as_ref()
+            .unwrap()
+            .page(0)
+            .unwrap()
+            .annot_mapping()
+        {
+            let raw: *mut poppler::ffi::PopplerAnnotMapping = mapping.to_glib_none().0;
+            let area = unsafe { &(*raw).area };
+            assert!(
+                (area.x1 - 72.).abs() < 0.5,
+                "rotation {rotation} text must start at the clicked document x, got {}",
+                area.x1
+            );
+            assert!(
+                tops.iter().any(|top| (area.y2 - top).abs() < 0.5),
+                "rotation {rotation}: the caret must be centred on the click, got top {}",
+                area.y2
+            );
+            assert!(area.x2 > area.x1 + 4.0);
+            assert!(area.y2 > area.y1 + 4.0);
+        }
+        assert!(ui.window.title().unwrap().contains("Unsaved"));
+        assert_ne!(ui.inner.borrow().raster_gen, raster_gen);
+    }
+    let other = crate::doc::write_test_pdf("other-fill", &[""]);
+    ui.open_path(&other, None);
+    assert_eq!(ui.inner.borrow().view.doc.as_ref().unwrap().path, path);
+    ui.reload();
+    assert_eq!(
+        ui.inner
+            .borrow()
+            .view
+            .doc
+            .as_ref()
+            .unwrap()
+            .page(0)
+            .unwrap()
+            .annot_mapping()
+            .len(),
+        4
+    );
+    assert!(ui.window.emit_by_name::<bool>("close-request", &[]));
+    for dialog in gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Window>().ok())
+        .filter(|w| w.title().as_deref() == Some("Unsaved PDF changes"))
+    {
+        dialog.destroy();
+    }
+    std::fs::remove_file(other).unwrap();
+    ui.hold.borrow_mut().take();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_form_text_editor() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorFormTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    let path = crate::form_tests::fixture();
+    ui.open_path(&path, None);
+    let button = form_widgets(ui.window.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Button>().ok())
+        .find(|b| widget_tree_has_label(b.upcast_ref(), "Fill Form…"))
+        .expect("Fill Form menu action missing");
+    button.emit_clicked();
+    let dialog = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Window>().ok())
+        .find(|w| w.title().as_deref() == Some("Fill Form"))
+        .expect("form dialog");
+    let entry = form_widgets(dialog.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Entry>().ok())
+        .find(|e| e.widget_name() == "Name")
+        .expect("name editor");
+    entry.set_text("Filled answer");
+    assert_eq!(
+        crate::form_tests::field(ui.inner.borrow().view.doc.as_ref().unwrap(), "Name")
+            .text_get_text()
+            .as_deref(),
+        Some("Filled answer")
+    );
+    let widgets = form_widgets(dialog.upcast_ref());
+    let notes = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk::TextView>())
+        .find(|w| w.widget_name() == "Notes")
+        .expect("multiline editor missing");
+    notes.buffer().set_text("Line one\nLine two");
+    let locked = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<Entry>())
+        .find(|w| w.widget_name() == "Locked")
+        .unwrap();
+    assert!(!locked.is_sensitive());
+    locked.set_text("must not change");
+    let agree = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<CheckButton>())
+        .find(|w| w.widget_name() == "Agree")
+        .expect("checkbox editor");
+    agree.set_active(true);
+    let color = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<DropDown>())
+        .find(|w| w.widget_name() == "Color")
+        .expect("choice editor");
+    color.set_selected(2);
+    let many = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<CheckButton>())
+        .filter(|w| w.widget_name() == "Many")
+        .collect::<Vec<_>>();
+    assert_eq!(many.len(), 3);
+    many[0].set_active(true);
+    many[2].set_active(true);
+    let radios = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<CheckButton>())
+        .filter(|w| w.widget_name() == "Radio")
+        .collect::<Vec<_>>();
+    assert_eq!(radios.len(), 2);
+    radios[1].set_active(true);
+    assert!(!radios[0].is_active());
+    assert!(ui.pdf_dirty.get());
+    assert!(ui.save_copy_to(&path.join("missing/output.pdf")).is_err());
+    assert!(ui.pdf_dirty.get(), "failed save must retain dirty state");
+    let copy = path.with_extension("filled.pdf");
+    ui.save_copy_to(&copy).unwrap();
+    assert!(!ui.pdf_dirty.get());
+    let reopened = OpenDoc::open(&copy, None).unwrap();
+    assert_eq!(
+        crate::form_tests::field(&reopened, "Name")
+            .text_get_text()
+            .as_deref(),
+        Some("Filled answer")
+    );
+    assert_eq!(
+        crate::form_tests::field(&reopened, "Notes")
+            .text_get_text()
+            .as_deref(),
+        Some("Line one\nLine two")
+    );
+    assert_eq!(
+        crate::form_tests::field(&reopened, "Locked")
+            .text_get_text()
+            .as_deref(),
+        Some("Keep")
+    );
+    assert!(crate::form_tests::field(&reopened, "Agree").button_get_state());
+    assert!(crate::form_tests::field(&reopened, "Color").choice_is_item_selected(2));
+    let selected = crate::form_tests::field(&reopened, "Many");
+    assert!(selected.choice_is_item_selected(0));
+    assert!(!selected.choice_is_item_selected(1));
+    assert!(selected.choice_is_item_selected(2));
+    let original = OpenDoc::open(&path, None).unwrap();
+    assert_eq!(
+        crate::form_tests::field(&original, "Name")
+            .text_get_text()
+            .as_deref(),
+        Some("Original")
+    );
+    dialog.destroy();
+    ui.hold.borrow_mut().take();
+    std::fs::remove_file(copy).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_adoption_invalidates_raster_lifetime() {
@@ -855,7 +1275,7 @@ fn actual_document_menu_actions_follow_open_state() {
     app.register(gio::Cancellable::NONE).unwrap();
     let ui = Lector::new(&app);
 
-    assert_eq!(ui.document_menu_items.borrow().len(), 7);
+    assert_eq!(ui.document_menu_items.borrow().len(), 11);
     assert!(ui
         .document_menu_items
         .borrow()
@@ -908,6 +1328,519 @@ fn actual_continuous_arrow_key_scroll_releases_state_before_adjustment_signal() 
 
     ui.hold.borrow_mut().take();
     std::fs::remove_file(pdf).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_draw_stroke_commits_and_can_be_removed() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorDrawTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    let path = crate::doc::write_test_pdf("draw-ui", &[""]);
+    let original = std::fs::read(&path).unwrap();
+    ui.open_path(&path, None);
+    {
+        let mut st = ui.inner.borrow_mut();
+        st.view.pdf_mode = PdfMode::Normal;
+        st.raster.clear();
+    }
+    ui.window.present();
+    drain_for(&glib::MainContext::default(), 300);
+    let button = form_widgets(ui.window.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Button>().ok())
+        .find(|b| widget_tree_has_label(b.upcast_ref(), "Draw…"))
+        .expect("Draw menu action missing");
+    button.emit_clicked();
+    assert!(ui.draw_mode.get());
+    assert_eq!(
+        ui.pages_box.cursor().and_then(|c| c.name()).as_deref(),
+        Some("crosshair")
+    );
+    assert!(ui.edit_bar.revealer.reveals_child());
+    assert_eq!(ui.edit_bar.title.text().as_str(), "Draw");
+    let da = ui.page_widgets.borrow()[0].1.clone();
+    let bounds = da.compute_bounds(&ui.pages_box).unwrap();
+    let scale = ui.inner.borrow().view.layout.page_geom(0).unwrap().scale;
+    let (x, y) = (
+        bounds.x() as f64 + 80. * scale,
+        bounds.y() as f64 + 200. * scale,
+    );
+    ui.drag_begin(x, y);
+    ui.drag_update(x + 160. * scale, y + 30. * scale);
+    let mut surface =
+        gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, da.width(), da.height())
+            .unwrap();
+    {
+        let cr = gtk::cairo::Context::new(&surface).unwrap();
+        cr.set_source_rgb(1., 1., 1.);
+        cr.paint().unwrap();
+        ui.draw_page(&cr, 0, 1., da.width(), da.height());
+    }
+    let stride = surface.stride() as usize;
+    let data = surface.data().unwrap();
+    let paper = data[8] as i32 + data[9] as i32 + data[10] as i32;
+    let x0 = (80.0 * scale).round() as usize;
+    let x1 = (240.0 * scale).round() as usize;
+    let y0 = (196.0 * scale).round() as usize;
+    let y1 = (236.0 * scale).round() as usize;
+    let mut darkest = i32::MAX;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let i = py * stride + px * 4;
+            if i + 2 < data.len() {
+                darkest = darkest.min(data[i] as i32 + data[i + 1] as i32 + data[i + 2] as i32);
+            }
+        }
+    }
+    assert!(
+        paper - darkest > 80,
+        "in-progress stroke must darken the page: darkest={darkest} paper={paper} scale={scale}"
+    );
+    drop(data);
+    let controllers = ui.pages_box.observe_controllers();
+    let drag = (0..controllers.n_items())
+        .filter_map(|i| controllers.item(i).and_downcast::<GestureDrag>())
+        .next()
+        .unwrap();
+    drag.emit_by_name::<()>("drag-end", &[&(160. * scale), &(30. * scale)]);
+    assert_eq!(
+        ui.inner
+            .borrow()
+            .view
+            .doc
+            .as_ref()
+            .unwrap()
+            .ink_annotations()
+            .len(),
+        1
+    );
+    assert!(
+        ui.draw_mode.get(),
+        "drawing stays armed for the next stroke"
+    );
+    assert!(ui.pdf_dirty.get());
+    ui.drag_begin(x, y + 40. * scale);
+    ui.drag_update(x + 80. * scale, y + 40. * scale);
+    drag.emit_by_name::<()>("drag-end", &[&(80. * scale), &0.0_f64]);
+    {
+        let st = ui.inner.borrow();
+        let doc = st.view.doc.as_ref().unwrap();
+        assert_eq!(
+            doc.ink_annotations().len(),
+            1,
+            "strokes on one page form one drawing"
+        );
+        assert_eq!(doc.ink_document_strokes(0).len(), 2);
+    }
+    let copy = path.with_extension("drawn.pdf");
+    ui.save_copy_to(&copy).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let reopened = OpenDoc::open(&copy, None).unwrap();
+    assert_eq!(reopened.ink_annotations().len(), 1);
+    assert_eq!(reopened.ink_document_strokes(0).len(), 2);
+    let manager = form_widgets(ui.window.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Button>().ok())
+        .find(|b| widget_tree_has_label(b.upcast_ref(), "Added Text & Drawings…"))
+        .unwrap();
+    manager.emit_clicked();
+    let dialog = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Window>().ok())
+        .find(|w| w.title().as_deref() == Some("Added Text & Drawings"))
+        .expect("the manager must open from the menu");
+    assert!(widget_tree_has_label(
+        dialog.upcast_ref(),
+        "Drawing — 2 strokes"
+    ));
+    form_widgets(dialog.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Button>().ok())
+        .find(|b| b.label().as_deref() == Some("Remove"))
+        .unwrap()
+        .emit_clicked();
+    assert_eq!(
+        ui.inner
+            .borrow()
+            .view
+            .doc
+            .as_ref()
+            .unwrap()
+            .ink_annotations()
+            .len(),
+        0
+    );
+    dialog.destroy();
+    assert_eq!(
+        ui.key(Key::Escape, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert!(!ui.draw_mode.get());
+    assert!(ui.pages_box.cursor().is_none());
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_add_text_types_on_the_page_and_enter_commits() {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorInlineTextTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    let path = crate::doc::write_test_pdf("inline-text", &[""]);
+    let original = std::fs::read(&path).unwrap();
+    ui.open_path(&path, None);
+    {
+        let mut st = ui.inner.borrow_mut();
+        st.view.pdf_mode = PdfMode::Normal;
+        st.raster.clear();
+    }
+    ui.window.present();
+    drain_for(&glib::MainContext::default(), 300);
+    let button = form_widgets(ui.window.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<Button>().ok())
+        .find(|b| widget_tree_has_label(b.upcast_ref(), "Add Text…"))
+        .expect("Add Text menu action missing");
+    button.emit_clicked();
+    let da = ui.page_widgets.borrow()[0].1.clone();
+    let bounds = da.compute_bounds(&ui.pages_box).unwrap();
+    let scale = ui.inner.borrow().view.layout.page_geom(0).unwrap().scale;
+    let (x, y) = (
+        bounds.x() as f64 + 72. * scale,
+        bounds.y() as f64 + 150. * scale,
+    );
+    ui.drag_begin(x, y);
+    let controllers = ui.pages_box.observe_controllers();
+    let drag = (0..controllers.n_items())
+        .filter_map(|i| controllers.item(i).and_downcast::<GestureDrag>())
+        .next()
+        .unwrap();
+    drag.emit_by_name::<()>("drag-end", &[&0.0_f64, &0.0_f64]);
+    assert!(
+        gtk::Window::list_toplevels().into_iter().all(|w| {
+            w.downcast::<gtk::Window>()
+                .ok()
+                .and_then(|w| w.title())
+                .as_deref()
+                != Some("Add Text")
+        }),
+        "typing must happen on the page, not in an Add Text dialog"
+    );
+    for key in [Key::H, Key::i] {
+        assert_eq!(
+            ui.key(key, gdk::ModifierType::empty()),
+            glib::Propagation::Stop,
+            "letter keys must type into the page"
+        );
+    }
+    assert_eq!(
+        ui.key(Key::space, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert_eq!(
+        ui.inner.borrow().view.page,
+        0,
+        "space must insert a space, not turn the page"
+    );
+    assert_eq!(
+        ui.key(Key::BackSpace, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    let mut surface =
+        gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, da.width(), da.height())
+            .unwrap();
+    {
+        let cr = gtk::cairo::Context::new(&surface).unwrap();
+        ui.draw_page(&cr, 0, 1., da.width(), da.height());
+    }
+    let stride = surface.stride() as usize;
+    let data = surface.data().unwrap();
+    let paper = data[8] as i32 + data[9] as i32 + data[10] as i32;
+    let x0 = (72.0 * scale).round() as usize;
+    let x1 = (110.0 * scale).round() as usize;
+    let y0 = (150.0 * scale).round() as usize;
+    let y1 = (168.0 * scale).round() as usize;
+    let mut darkest = i32::MAX;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let i = py * stride + px * 4;
+            if i + 2 < data.len() {
+                darkest = darkest.min(data[i] as i32 + data[i + 1] as i32 + data[i + 2] as i32);
+            }
+        }
+    }
+    assert!(
+        paper - darkest > 80,
+        "typed text must appear on the page before Enter: darkest={darkest} paper={paper}"
+    );
+    drop(data);
+    assert_eq!(
+        ui.key(Key::Return, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    use poppler::prelude::AnnotExt;
+    let contents = ui
+        .inner
+        .borrow()
+        .view
+        .doc
+        .as_ref()
+        .unwrap()
+        .free_text_annotations()
+        .into_iter()
+        .map(|(_, annot)| annot.contents().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(contents, vec!["Hi".to_string()]);
+    let copy = path.with_extension("filled.pdf");
+    ui.save_copy_to(&copy).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert_eq!(
+        OpenDoc::open(&copy, None)
+            .unwrap()
+            .free_text_annotations()
+            .len(),
+        1
+    );
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(copy).unwrap();
+}
+
+fn markup_window(id: &str, name: &str) -> (Rc<Lector>, std::path::PathBuf) {
+    gtk::init().unwrap();
+    let app = Application::builder()
+        .application_id(id)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    ui.set_layout(LayoutMode::Single);
+    let path = crate::doc::write_test_pdf(name, &[""]);
+    ui.open_path(&path, None);
+    ui.inner.borrow_mut().view.pdf_mode = PdfMode::Normal;
+    ui.window.present();
+    drain_for(&glib::MainContext::default(), 300);
+    (ui, path)
+}
+
+/// Widget point of a document point on page 0 (rotation 0).
+fn page_point(ui: &Lector, x: f64, y: f64) -> (f64, f64) {
+    let da = ui.page_widgets.borrow()[0].1.clone();
+    let bounds = da.compute_bounds(&ui.pages_box).unwrap();
+    let scale = ui.inner.borrow().view.layout.page_geom(0).unwrap().scale;
+    (bounds.x() as f64 + x * scale, bounds.y() as f64 + y * scale)
+}
+
+fn press(ui: &Lector, x: f64, y: f64) {
+    let (x, y) = page_point(ui, x, y);
+    ui.drag_begin(x, y);
+    ui.release_text();
+}
+
+fn type_keys(ui: &Lector, keys: &[Key]) {
+    for key in keys {
+        assert_eq!(
+            ui.key(*key, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+    }
+}
+
+fn texts(ui: &Lector) -> Vec<String> {
+    use poppler::prelude::AnnotExt;
+    ui.inner
+        .borrow()
+        .view
+        .doc
+        .as_ref()
+        .unwrap()
+        .free_text_annotations()
+        .into_iter()
+        .map(|(_, annot)| annot.contents().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn draft_text(ui: &Lector) -> Option<String> {
+    ui.text_draft.borrow().as_ref().map(|d| d.text.clone())
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_text_tool_edits_commits_moves_and_undoes() {
+    let (ui, path) = markup_window("org.omarchy.LectorTextToolTest", "text-tool");
+    let ctrl = gdk::ModifierType::CONTROL_MASK;
+    ui.add_text_dialog();
+    assert!(ui.edit_bar.revealer.reveals_child());
+    press(&ui, 100., 200.);
+    assert!(
+        ui.keys.im_context().is_some(),
+        "typing must go through the IM"
+    );
+    type_keys(&ui, &[Key::H, Key::e, Key::l, Key::o, Key::Left, Key::l]);
+    assert_eq!(draft_text(&ui).as_deref(), Some("Hello"));
+    ui.im.emit_by_name::<()>("commit", &[&"ø"]);
+    assert_eq!(
+        draft_text(&ui).as_deref(),
+        Some("Helløo"),
+        "IM commits insert at the caret"
+    );
+    type_keys(&ui, &[Key::BackSpace, Key::End]);
+    ui.pages_box.clipboard().set_text(" world");
+    assert_eq!(ui.key(Key::v, ctrl), glib::Propagation::Stop);
+    drain_for(&glib::MainContext::default(), 200);
+    assert_eq!(draft_text(&ui).as_deref(), Some("Hello world"));
+    type_keys(&ui, &[Key::BackSpace; 6]);
+
+    // Clicking elsewhere keeps the text instead of dropping it.
+    press(&ui, 100., 400.);
+    assert_eq!(texts(&ui), vec!["Hello"]);
+    assert_eq!(draft_text(&ui).as_deref(), Some(""));
+    assert_eq!(
+        ui.key(Key::Escape, gdk::ModifierType::empty()),
+        glib::Propagation::Stop
+    );
+    assert!(!ui.text_placement.get());
+    assert!(ui.keys.im_context().is_none());
+    assert_eq!(texts(&ui), vec!["Hello"]);
+
+    // Clicking added text reopens it for editing.
+    ui.add_text_dialog();
+    press(&ui, 104., 200.);
+    assert_eq!(draft_text(&ui).as_deref(), Some("Hello"));
+    assert!(
+        texts(&ui).is_empty(),
+        "the original is out of the PDF while edited"
+    );
+    type_keys(&ui, &[Key::End, Key::exclam]);
+    ui.key(Key::Escape, gdk::ModifierType::empty());
+    assert_eq!(texts(&ui), vec!["Hello!"]);
+    assert_eq!(ui.key(Key::z, ctrl), glib::Propagation::Stop);
+    assert_eq!(
+        texts(&ui),
+        vec!["Hello"],
+        "undo restores the text before the edit"
+    );
+    ui.key(Key::z, ctrl);
+    assert!(texts(&ui).is_empty(), "undo removes added text");
+
+    // Dragging a box moves it; the moved text is placed on release.
+    ui.add_text_dialog();
+    press(&ui, 100., 300.);
+    type_keys(&ui, &[Key::M, Key::o, Key::v, Key::e, Key::Return]);
+    let (x, y) = page_point(&ui, 102., 300.);
+    ui.drag_begin(x, y);
+    let (x2, y2) = page_point(&ui, 202., 320.);
+    ui.drag_update(x2, y2);
+    ui.release_text();
+    assert!(ui.text_draft.borrow().is_none());
+    {
+        let st = ui.inner.borrow();
+        let doc = st.view.doc.as_ref().unwrap();
+        let (_, spec) = doc
+            .free_text_at(0, 205., 320.)
+            .expect("text moved by the drag");
+        assert_eq!(spec.text, "Move");
+        assert!((spec.rect.x - 200.).abs() < 1.0, "x {}", spec.rect.x);
+    }
+    ui.finish_edit_mode();
+
+    // Merely opening saved text for editing is not an unsaved change.
+    let copy = path.with_extension("tool.pdf");
+    ui.save_copy_to(&copy).unwrap();
+    ui.open_path(&copy, None);
+    assert!(!ui.pdf_dirty.get());
+    ui.add_text_dialog();
+    press(&ui, 205., 320.);
+    assert_eq!(draft_text(&ui).as_deref(), Some("Move"));
+    ui.key(Key::Escape, gdk::ModifierType::empty());
+    assert_eq!(texts(&ui), vec!["Move"]);
+    assert!(
+        !ui.pdf_dirty.get(),
+        "an unchanged edit must not mark the PDF unsaved"
+    );
+
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(copy).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_draw_tool_groups_by_pen_and_undoes_strokes() {
+    let (ui, path) = markup_window("org.omarchy.LectorDrawToolTest", "draw-tool");
+    let ctrl = gdk::ModifierType::CONTROL_MASK;
+    let stroke = |ui: &Lector, y: f64| {
+        let (x0, y0) = page_point(ui, 80., y);
+        let (x1, y1) = page_point(ui, 200., y + 20.);
+        ui.drag_begin(x0, y0);
+        ui.drag_update(x1, y1);
+        ui.finish_ink_stroke();
+    };
+    let counts = |ui: &Lector| {
+        let st = ui.inner.borrow();
+        let doc = st.view.doc.as_ref().unwrap();
+        (
+            doc.ink_annotations().len(),
+            doc.ink_document_strokes(0).len(),
+        )
+    };
+    ui.toggle_draw();
+    stroke(&ui, 100.);
+    stroke(&ui, 150.);
+    assert_eq!(counts(&ui), (1, 2));
+    let red = ui
+        .edit_bar
+        .colors
+        .iter()
+        .find(|(color, _)| *color == crate::window::edit_bar::PenColor::Red)
+        .map(|(_, button)| button.clone())
+        .unwrap();
+    red.set_active(true);
+    stroke(&ui, 200.);
+    assert_eq!(counts(&ui), (2, 3), "a new pen starts a new drawing");
+    let red_strokes = ui
+        .inner
+        .borrow()
+        .view
+        .doc
+        .as_ref()
+        .unwrap()
+        .ink_document_strokes(0)
+        .into_iter()
+        .filter(|(style, _)| style.rgb.0 > 0.5)
+        .count();
+    assert_eq!(red_strokes, 1);
+    assert_eq!(ui.key(Key::z, ctrl), glib::Propagation::Stop);
+    assert_eq!(counts(&ui), (1, 2));
+    ui.key(Key::z, ctrl);
+    assert_eq!(counts(&ui), (1, 1));
+    ui.key(Key::z, ctrl);
+    assert_eq!(counts(&ui), (0, 0));
+    assert!(!ui.edit_bar.undo.is_sensitive());
+    ui.key(Key::Escape, gdk::ModifierType::empty());
+    assert!(!ui.draw_mode.get());
+    assert!(!ui.edit_bar.revealer.reveals_child());
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
 }
 
 fn drain_for(context: &glib::MainContext, ms: u64) {

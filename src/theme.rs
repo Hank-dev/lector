@@ -120,6 +120,12 @@ impl Theme {
         t
     }
 
+    /// Accent as Cairo RGB for editing chrome painted over pages.
+    pub fn accent_rgb(&self) -> (f64, f64, f64) {
+        let [r, g, b] = parse_hex_rgb(&self.accent).unwrap_or([0x3b, 0x82, 0xf6]);
+        (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
+    }
+
     pub fn pdf_palette(&self) -> PdfPalette {
         let fallback = PdfPalette::default();
         PdfPalette {
@@ -271,6 +277,35 @@ dropdown popover row:selected label {{
   padding: 5px 10px;
   border-bottom: 1px solid alpha({fg}, 0.10);
 }}
+.lector-editbar {{
+  padding: 3px 10px;
+  border-bottom: 1px solid alpha({fg}, 0.10);
+  background-color: {dark};
+  color: {fg};
+}}
+.lector-editbar-title {{
+  font-weight: bold;
+}}
+.lector-editbar button {{
+  min-height: 24px;
+  padding: 2px 8px;
+}}
+.lector-editbar button.lector-swatch {{
+  min-width: 22px;
+  padding: 2px;
+}}
+.lector-editbar button.lector-swatch:checked {{
+  border-color: {accent};
+}}
+.lector-swatch-dot {{
+  min-width: 12px;
+  min-height: 12px;
+  border-radius: 999px;
+  border: 1px solid alpha({fg}, 0.35);
+}}
+.lector-swatch-dot.black {{ background-color: #1a1a1a; }}
+.lector-swatch-dot.blue {{ background-color: #1742a8; }}
+.lector-swatch-dot.red {{ background-color: #c71f1f; }}
 .lector-file-banner {{
   padding: 5px 10px;
   border-bottom: 1px solid alpha({fg}, 0.10);

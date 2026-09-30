@@ -126,6 +126,59 @@ impl Lector {
                 current_hit: search_idx,
             },
         );
+        let pdf_mode = st.view.pdf_mode;
+        let palette = st.theme.pdf_palette();
+        let accent = st.theme.accent_rgb();
+        let ink = |rgb| preview_rgb(rgb, pdf_mode, palette);
+        if !exact_raster {
+            // Until Poppler re-renders, keep committed ink visible.
+            for (style, stroke) in doc.ink_display_strokes(index, rotation) {
+                paint_ink_polyline(cr, &stroke, geom.scale, ink(style.rgb), style.width);
+            }
+        }
+        if let Some(stroke) = self.ink_stroke.borrow().as_ref() {
+            if stroke.page == index {
+                let pen = self.pen.get();
+                let smooth = crate::doc::smooth_polyline(&stroke.points);
+                paint_ink_polyline(
+                    cr,
+                    &smooth,
+                    geom.scale,
+                    ink(pen.color.rgb()),
+                    pen.width.points(),
+                );
+            }
+        }
+        if self.text_placement.get() {
+            paint_free_text_frames(
+                cr,
+                &doc.free_text_rects(index),
+                page_width,
+                page_height,
+                rotation,
+                geom.scale,
+                accent,
+            );
+        }
+        if let Some(draft) = self.text_draft.borrow().as_ref() {
+            if draft.page == index {
+                paint_free_text_draft(
+                    cr,
+                    TextPreview {
+                        rect: draft.rect(doc),
+                        text: &draft.text,
+                        cursor: draft.cursor,
+                        size: draft.size,
+                        rgb: ink(draft.rgb),
+                        accent,
+                        page_width,
+                        page_height,
+                        rotation,
+                        scale: geom.scale,
+                    },
+                );
+            }
+        }
     }
 
     pub(crate) fn on_resize(&self, w: f64, h: f64) {
