@@ -35,12 +35,52 @@ colored diagrams.
 - Clickable internal and external links with Back/Forward navigation
 - Normal, inverted, or Omarchy-following PDF colors
 - Rotate, fullscreen, presentation (F5)
+- Fill existing AcroForms, add embedded answer text, and draw freehand ink (signatures and marks) on nonfillable pages
 - Print and save a copy
 - Encrypted PDFs
 - PDF page labels such as “iv” or “A-3” in the page box
 - Remembers page, zoom, and rotation per file in a private, concurrency-safe session store
 - Offers Reload when the open file changes on disk
 - Live Omarchy theme follow
+
+## Fill out a PDF
+
+- **Existing interactive fields:** choose **☰ → Fill Form…**. Edit text (including
+  multiline), checkboxes, radio groups, and choice lists. Read-only fields stay
+  disabled. Changes apply immediately; close the dialog when finished.
+- **Flat/nonfillable answer sheets:** choose **☰ → Add Text…** (Ctrl+Shift+T)
+  and click where the text should go. The caret is centred on the click, so
+  clicking on an answer line puts the text on it. Type on the page: arrows,
+  Home/End, Delete, Ctrl+Backspace, Ctrl+V and input methods (dead keys,
+  compose) work. Enter places the text; Shift+Enter adds a line. Clicking
+  elsewhere also places it and starts new text. Click existing added text to
+  edit it, or drag it to move it. The preview uses the same font and line
+  layout that is embedded, so text does not shift when placed.
+- **Handwritten marks and signatures:** choose **☰ → Draw…** (Ctrl+Shift+D) and
+  drag on the page. Strokes are smoothed and all strokes made on a page in one
+  Draw session (with one pen) form a single drawing, so a signature is one
+  object. Strokes are embedded ink annotations, not cryptographic digital
+  signatures and not Lector sidecar notes.
+- While drawing or adding text, a bar under the toolbar sets the colour
+  (black, blue, red), pen width or text size, and has **Undo** (Ctrl+Z) and
+  **Done** (Esc). Esc keeps what you wrote and leaves the tool. Ctrl+Z undoes
+  the last stroke or text change, including edits of existing text.
+- Choose **Save a Copy… (Ctrl+S)** and a **different filename**. This embeds
+  form values, added text, and drawings in the PDF while retaining the underlying
+  document and selectable text. The original remains unchanged. Reopen the
+  saved copy to continue from it. An “Unsaved PDF changes” title and a discard
+  confirmation protect edits before opening another file, reloading, or closing;
+  text still being typed counts as an edit.
+
+Limitations: XFA, digital signatures, JavaScript calculations/validation and
+submit/reset buttons are not supported. Radio widgets use the PDF field name
+and widget ID; consult the PDF for each option's meaning. Added text is
+Helvetica. Editing free text created by another program rewrites it in
+Lector's style. **☰ → Added Text & Drawings…** lists every added text and
+drawing by page with **Go to** and **Remove**; this also works after reopening
+a saved copy, and clears the Undo history. These are PDF-embedded annotations,
+not Lector's separate sidecar notes; the Delete key still removes only targeted
+sidecar marks.
 
 ## Install
 
@@ -71,7 +111,14 @@ Run it separately from the headless tests so GTK stays on a single test thread:
 
 ```bash
 cargo test --offline --release actual_window_navigation_presentation_search_and_reload -- --ignored --test-threads=1
+cargo test --offline --release actual_form_text_editor -- --ignored --test-threads=1
+cargo test --offline --release actual_free_text_selection_editor -- --ignored --test-threads=1
+cargo test --offline --release actual_text_tool_edits_commits_moves_and_undoes -- --ignored --test-threads=1
+cargo test --offline --release actual_draw_tool_groups_by_pen_and_undoes_strokes -- --ignored --test-threads=1
 ```
+
+To run them without a desktop session, start `gtk4-broadwayd :7` and prefix each
+command with `GDK_BACKEND=broadway BROADWAY_DISPLAY=:7`.
 
 It creates an unpresented window and temporary PDFs, exercises the real navigation,
 presentation, search replacement, and reload paths, and never saves the user session.
@@ -85,6 +132,12 @@ atomic/private persistence, stale-writer merging, deletion, and all page rotatio
 | Key | Action |
 |-----|--------|
 | Ctrl+O | Open |
+| Ctrl+Shift+T | Add text: click, type, Enter |
+| Ctrl+Shift+D | Draw: drag to write or sign |
+| Ctrl+Z | Undo last stroke or text change |
+| Ctrl+Shift+F | Fill interactive form fields |
+| Esc | Finish drawing or adding text |
+| Ctrl+S | Save a filled copy |
 | Ctrl+F | Find |
 | Ctrl+H | Reading History |
 | Ctrl+Shift+H | Highlight current selection |
@@ -108,7 +161,7 @@ Presentation, Reload, Reading History, Properties, Keyboard shortcuts, and About
 
 Annotations are stored by Lector in `$XDG_CONFIG_HOME/lector/annotations.toml`
 (falling back to `~/.config/lector/annotations.toml`), never beside the PDF.
-Print includes the current rotation and marks; Save a Copy writes the original PDF
-without them. Both annotation and reading-state files are atomically replaced and
+Print includes the current rotation and marks; Save a Copy includes form values,
+embedded Add Text answers, and ink drawings, but not Lector sidecar highlights/notes or view rotation. Both annotation and reading-state files are atomically replaced and
 private to the user (`0600` on Unix). Clearing Reading History does not remove
 annotations.

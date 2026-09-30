@@ -1,5 +1,7 @@
 mod annotations;
 mod doc;
+#[cfg(test)]
+mod form_tests;
 mod persist;
 mod session;
 mod theme;

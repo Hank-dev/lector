@@ -604,6 +604,26 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
             heading: "ANNOTATIONS",
             rows: &[
                 ShortcutRow {
+                    action: "Add text to PDF",
+                    keys: "Ctrl+Shift+T",
+                },
+                ShortcutRow {
+                    action: "Draw on PDF",
+                    keys: "Ctrl+Shift+D",
+                },
+                ShortcutRow {
+                    action: "Fill PDF form fields",
+                    keys: "Ctrl+Shift+F",
+                },
+                ShortcutRow {
+                    action: "Undo last stroke or text change",
+                    keys: "Ctrl+Z",
+                },
+                ShortcutRow {
+                    action: "Finish drawing or adding text",
+                    keys: "Esc",
+                },
+                ShortcutRow {
                     action: "Highlight selection",
                     keys: "Ctrl+Shift+H",
                 },

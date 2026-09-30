@@ -136,7 +136,586 @@ impl SearchOptions {
     }
 }
 
+pub const INK_STROKE_WIDTH: f64 = 1.6;
+pub const INK_MAX_WIDTH: f64 = 3.0;
+pub const INK_BLACK: (f64, f64, f64) = (0.10, 0.10, 0.10);
+pub const FREE_TEXT_SIZE: f64 = 12.0;
+const INK_MIN_LENGTH: f64 = 2.0;
+const INK_MIN_SPACING: f64 = 0.6;
+const INK_SAMPLE_STEP: f64 = 0.8;
+const INK_MAX_POINTS: usize = 2000;
+
+/// Pen colour and width of a handwritten drawing, in PDF points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InkStyle {
+    pub rgb: (f64, f64, f64),
+    pub width: f64,
+}
+
+impl Default for InkStyle {
+    fn default() -> Self {
+        Self {
+            rgb: INK_BLACK,
+            width: INK_STROKE_WIDTH,
+        }
+    }
+}
+
+/// An embedded free-text answer in top-origin document coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FreeTextSpec {
+    pub rect: crate::annotations::DocumentRect,
+    pub text: String,
+    pub size: f64,
+    pub rgb: (f64, f64, f64),
+}
+
+/// Drops non-finite and near-duplicate input points and rejects dots.
+pub fn simplify_ink_stroke(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+    let mut simplified = Vec::new();
+    for &(x, y) in points {
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        if let Some(&(last_x, last_y)) = simplified.last() {
+            let dx = x - last_x;
+            let dy = y - last_y;
+            if dx * dx + dy * dy < INK_MIN_SPACING * INK_MIN_SPACING {
+                if simplified.len() > 1 {
+                    if let Some(last) = simplified.last_mut() {
+                        *last = (x, y);
+                    }
+                }
+                continue;
+            }
+        }
+        simplified.push((x, y));
+    }
+    if simplified.len() < 2 || polyline_length(&simplified) < INK_MIN_LENGTH {
+        None
+    } else {
+        Some(simplified)
+    }
+}
+
+/// Interpolates a curve through every point (chord-length Catmull-Rom as
+/// cubic Béziers), sampled finely enough that any viewer draws it smoothly.
+pub fn smooth_polyline(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let n = points.len();
+    if n < 3 {
+        return points.to_vec();
+    }
+    let at = |i: isize| points[i.clamp(0, n as isize - 1) as usize];
+    let dist = |a: (f64, f64), b: (f64, f64)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    let mut out = Vec::with_capacity(n * 3);
+    out.push(points[0]);
+    for i in 0..n as isize - 1 {
+        let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        let (d01, d12, d23) = (dist(p0, p1), dist(p1, p2), dist(p2, p3));
+        let handle = |a: (f64, f64), b: (f64, f64), span: f64| {
+            if span <= f64::EPSILON {
+                (0.0, 0.0)
+            } else {
+                let k = d12 / (3.0 * span);
+                ((b.0 - a.0) * k, (b.1 - a.1) * k)
+            }
+        };
+        let h1 = handle(p0, p2, d01 + d12);
+        let h2 = handle(p1, p3, d12 + d23);
+        let c1 = (p1.0 + h1.0, p1.1 + h1.1);
+        let c2 = (p2.0 - h2.0, p2.1 - h2.1);
+        let steps = (d12 / INK_SAMPLE_STEP).ceil().clamp(1.0, 24.0) as usize;
+        for s in 1..=steps {
+            let t = s as f64 / steps as f64;
+            let u = 1.0 - t;
+            let bez = |a: f64, b: f64, c: f64, d: f64| {
+                u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+            };
+            out.push((bez(p1.0, c1.0, c2.0, p2.0), bez(p1.1, c1.1, c2.1, p2.1)));
+        }
+    }
+    out
+}
+
+/// The stored form of one pen stroke: cleaned, smoothed, bounded in size.
+pub fn smooth_ink_stroke(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+    let mut smooth = smooth_polyline(&simplify_ink_stroke(points)?);
+    if smooth.len() > INK_MAX_POINTS {
+        let stride = smooth.len().div_ceil(INK_MAX_POINTS);
+        let last = *smooth.last()?;
+        smooth = smooth.iter().step_by(stride).copied().collect();
+        if smooth.last() != Some(&last) {
+            smooth.push(last);
+        }
+    }
+    Some(smooth)
+}
+
+fn polyline_length(points: &[(f64, f64)]) -> f64 {
+    points
+        .windows(2)
+        .map(|pair| {
+            let dx = pair[1].0 - pair[0].0;
+            let dy = pair[1].1 - pair[0].1;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .sum()
+}
+
+fn bounds<'a>(points: impl IntoIterator<Item = &'a (f64, f64)>) -> (f64, f64, f64, f64) {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &(x, y) in points {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    (min_x, max_x, min_y, max_y)
+}
+
+fn ink_path(points: &[(f64, f64)]) -> poppler::Path {
+    use glib::translate::FromGlibPtrFull;
+    // poppler_path_new_from_array stores this pointer and poppler_path_free
+    // releases it with g_free. It does not copy the array.
+    let bytes = std::mem::size_of::<poppler::ffi::PopplerPoint>() * points.len();
+    let ptr = unsafe { glib::ffi::g_malloc(bytes) as *mut poppler::ffi::PopplerPoint };
+    assert!(!ptr.is_null(), "g_malloc failed");
+    for (index, &(x, y)) in points.iter().enumerate() {
+        unsafe {
+            std::ptr::write(ptr.add(index), poppler::ffi::PopplerPoint { x, y });
+        }
+    }
+    unsafe {
+        FromGlibPtrFull::from_glib_full(poppler::ffi::poppler_path_new_from_array(
+            ptr,
+            points.len(),
+        ))
+    }
+}
+
+/// poppler-rs 0.26 leaves `AnnotInk::set_ink_list` unimplemented.
+/// The call copies point data; the paths must stay alive until it returns.
+fn set_ink_list(annot: &poppler::AnnotInk, paths: &[poppler::Path]) {
+    use glib::translate::ToGlibPtr;
+    let stashes = paths
+        .iter()
+        .map(|path| path.to_glib_none())
+        .collect::<Vec<_>>();
+    let mut ptrs = stashes.iter().map(|stash| stash.0).collect::<Vec<_>>();
+    unsafe {
+        poppler::ffi::poppler_annot_ink_set_ink_list(
+            annot.to_glib_none().0,
+            ptrs.as_mut_ptr(),
+            ptrs.len(),
+        );
+    }
+}
+
+fn poppler_color(rgb: (f64, f64, f64)) -> poppler::Color {
+    let channel = |value: f64| (value.clamp(0.0, 1.0) * 65535.0).round() as u16;
+    let mut color = poppler::Color::new();
+    color.set_red(channel(rgb.0));
+    color.set_green(channel(rgb.1));
+    color.set_blue(channel(rgb.2));
+    color
+}
+
+fn rgb_of(color: &poppler::Color) -> (f64, f64, f64) {
+    (
+        color.red() as f64 / 65535.0,
+        color.green() as f64 / 65535.0,
+        color.blue() as f64 / 65535.0,
+    )
+}
+
+fn pdf_rect(x1: f64, y1: f64, x2: f64, y2: f64) -> poppler::Rectangle {
+    let mut area = poppler::Rectangle::new();
+    area.set_x1(x1);
+    area.set_y1(y1);
+    area.set_x2(x2);
+    area.set_y2(y2);
+    area
+}
+
 impl OpenDoc {
+    fn page_annots(&self, index: i32, kind: poppler::AnnotType) -> Vec<poppler::Annot> {
+        use glib::translate::{from_glib_none, ToGlibPtr};
+        use poppler::prelude::*;
+        let Some(page) = self.page(index) else {
+            return Vec::new();
+        };
+        page.annot_mapping()
+            .into_iter()
+            .filter_map(|mapping| {
+                // The mapping owns an annot reference; retain our own before dropping it.
+                let annot: poppler::Annot = unsafe {
+                    let ptr: *mut poppler::ffi::PopplerAnnotMapping = mapping.to_glib_none().0;
+                    from_glib_none((*ptr).annot)
+                };
+                (annot.annot_type() == kind).then_some(annot)
+            })
+            .collect()
+    }
+
+    fn all_annots(&self, kind: poppler::AnnotType) -> Vec<(i32, poppler::Annot)> {
+        (0..self.n_pages)
+            .flat_map(|index| {
+                self.page_annots(index, kind)
+                    .into_iter()
+                    .map(move |annot| (index, annot))
+            })
+            .collect()
+    }
+
+    pub fn free_text_annotations(&self) -> Vec<(i32, poppler::Annot)> {
+        self.all_annots(poppler::AnnotType::FreeText)
+    }
+
+    pub fn remove_fill_text(&self, index: i32, annot: &poppler::Annot) -> Result<(), String> {
+        use poppler::prelude::*;
+        if annot.annot_type() != poppler::AnnotType::FreeText || annot.page_index() != index {
+            return Err("Text annotation not found on this page".into());
+        }
+        let page = self.page(index).ok_or("Page not found")?;
+        page.remove_annot(annot);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn add_fill_text(
+        &self,
+        index: i32,
+        rect: crate::annotations::DocumentRect,
+        text: &str,
+    ) -> Result<(), String> {
+        self.add_free_text(
+            index,
+            &FreeTextSpec {
+                rect,
+                text: text.to_string(),
+                size: FREE_TEXT_SIZE,
+                rgb: INK_BLACK,
+            },
+        )
+        .map(|_| ())
+    }
+
+    pub fn add_free_text(&self, index: i32, spec: &FreeTextSpec) -> Result<poppler::Annot, String> {
+        use glib::object::Cast;
+        use poppler::prelude::*;
+        let page = self.page(index).ok_or("Page not found")?;
+        let (_, height) = page.size();
+        let rect = spec.rect;
+        let mut area = pdf_rect(
+            rect.x,
+            height - rect.y - rect.height,
+            rect.x + rect.width,
+            height - rect.y,
+        );
+        let annotation = poppler::AnnotFreeText::new(&self.document, &mut area);
+        annotation.set_contents(&spec.text);
+        annotation.set_border_width(0.0);
+        annotation.set_color(None);
+        annotation.set_flags(poppler::AnnotFlag::PRINT);
+        let mut font = poppler::FontDescription::new("Helvetica");
+        unsafe {
+            let ptr = glib::translate::ToGlibPtr::<*const poppler::ffi::PopplerFontDescription>::to_glib_none(&font).0
+                as *mut poppler::ffi::PopplerFontDescription;
+            (*ptr).size_pt = spec.size;
+        }
+        annotation.set_font_desc(&mut font);
+        annotation.set_font_color(&mut poppler_color(spec.rgb));
+        page.add_annot(&annotation);
+        Ok(annotation.upcast())
+    }
+
+    /// Reads back what Lector needs to edit or restore an embedded answer.
+    pub fn free_text_spec(&self, index: i32, annot: &poppler::Annot) -> FreeTextSpec {
+        use glib::object::Cast;
+        use poppler::prelude::*;
+        let (_, height) = self.size(index, 0);
+        let area = annot.rectangle();
+        let (x1, x2) = (area.x1().min(area.x2()), area.x1().max(area.x2()));
+        let (y1, y2) = (area.y1().min(area.y2()), area.y1().max(area.y2()));
+        let free_text = annot.downcast_ref::<poppler::AnnotFreeText>();
+        let size = free_text
+            .and_then(|annot| annot.font_desc())
+            .map(|font| unsafe {
+                let ptr = glib::translate::ToGlibPtr::<
+                    *const poppler::ffi::PopplerFontDescription,
+                >::to_glib_none(&font)
+                .0;
+                (*ptr).size_pt
+            })
+            .filter(|size| size.is_finite() && *size > 0.0)
+            .unwrap_or(FREE_TEXT_SIZE);
+        let rgb = free_text
+            .and_then(|annot| annot.font_color())
+            .map(|color| rgb_of(&color))
+            .unwrap_or((0.0, 0.0, 0.0));
+        FreeTextSpec {
+            rect: crate::annotations::DocumentRect {
+                x: x1,
+                y: height - y2,
+                width: x2 - x1,
+                height: y2 - y1,
+            },
+            text: annot.contents().map(|s| s.to_string()).unwrap_or_default(),
+            size,
+            rgb,
+        }
+    }
+
+    /// The topmost embedded answer under a top-origin document point.
+    pub fn free_text_at(
+        &self,
+        index: i32,
+        x: f64,
+        y: f64,
+    ) -> Option<(poppler::Annot, FreeTextSpec)> {
+        self.page_annots(index, poppler::AnnotType::FreeText)
+            .into_iter()
+            .rev()
+            .map(|annot| {
+                let spec = self.free_text_spec(index, &annot);
+                (annot, spec)
+            })
+            .find(|(_, spec)| {
+                let r = spec.rect;
+                x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height
+            })
+    }
+
+    /// The answer that `spec` describes, for undo after other edits moved
+    /// Poppler's objects around.
+    pub fn find_free_text(&self, index: i32, spec: &FreeTextSpec) -> Option<poppler::Annot> {
+        self.page_annots(index, poppler::AnnotType::FreeText)
+            .into_iter()
+            .rev()
+            .find(|annot| {
+                let found = self.free_text_spec(index, annot);
+                found.text == spec.text
+                    && (found.size - spec.size).abs() < 0.01
+                    && (found.rect.x - spec.rect.x).abs() < 0.05
+                    && (found.rect.y - spec.rect.y).abs() < 0.05
+            })
+    }
+
+    pub fn free_text_rects(&self, index: i32) -> Vec<crate::annotations::DocumentRect> {
+        self.page_annots(index, poppler::AnnotType::FreeText)
+            .iter()
+            .map(|annot| self.free_text_spec(index, annot).rect)
+            .collect()
+    }
+
+    pub fn ink_annotations(&self) -> Vec<(i32, poppler::Annot)> {
+        self.all_annots(poppler::AnnotType::Ink)
+    }
+
+    /// Strokes of one ink annotation in PDF (bottom-origin) coordinates.
+    fn ink_pdf_paths(annot: &poppler::AnnotInk) -> Vec<Vec<(f64, f64)>> {
+        annot
+            .ink_list()
+            .into_iter()
+            .map(|path| {
+                path.points()
+                    .into_iter()
+                    .map(|point| (point.x(), point.y()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|points| !points.is_empty())
+            .collect()
+    }
+
+    pub fn ink_stroke_count(annot: &poppler::Annot) -> usize {
+        use glib::object::Cast;
+        annot
+            .downcast_ref::<poppler::AnnotInk>()
+            .map(|ink| Self::ink_pdf_paths(ink).len())
+            .unwrap_or(0)
+    }
+
+    /// Ink colour of each stroke returned by [`Self::ink_document_points`].
+    pub fn ink_document_strokes(&self, index: i32) -> Vec<(InkStyle, Vec<(f64, f64)>)> {
+        use glib::object::Cast;
+        use poppler::prelude::*;
+        let (_, height) = self.size(index, 0);
+        let mut strokes = Vec::new();
+        for annot in self.page_annots(index, poppler::AnnotType::Ink) {
+            let mut width = INK_STROKE_WIDTH;
+            let has_width = unsafe {
+                poppler::ffi::poppler_annot_get_border_width(
+                    glib::translate::ToGlibPtr::to_glib_none(&annot).0,
+                    &mut width,
+                )
+            };
+            let style = InkStyle {
+                rgb: annot.color().map(|c| rgb_of(&c)).unwrap_or(INK_BLACK),
+                width: if has_width != 0 && width > 0.0 {
+                    width
+                } else {
+                    INK_STROKE_WIDTH
+                },
+            };
+            let Ok(ink) = annot.downcast::<poppler::AnnotInk>() else {
+                continue;
+            };
+            for path in Self::ink_pdf_paths(&ink) {
+                strokes.push((
+                    style,
+                    path.into_iter().map(|(x, y)| (x, height - y)).collect(),
+                ));
+            }
+        }
+        strokes
+    }
+
+    #[cfg(test)]
+    pub fn ink_document_points(&self, index: i32) -> Vec<Vec<(f64, f64)>> {
+        self.ink_document_strokes(index)
+            .into_iter()
+            .map(|(_, points)| points)
+            .collect()
+    }
+
+    pub fn ink_display_strokes(
+        &self,
+        index: i32,
+        rotation: i32,
+    ) -> Vec<(InkStyle, Vec<(f64, f64)>)> {
+        let (page_width, page_height) = self.size(index, 0);
+        self.ink_document_strokes(index)
+            .into_iter()
+            .map(|(style, stroke)| {
+                let points = stroke
+                    .into_iter()
+                    .map(|(x, y)| {
+                        crate::annotations::document_point_to_display(
+                            x,
+                            y,
+                            page_width,
+                            page_height,
+                            rotation,
+                        )
+                    })
+                    .collect();
+                (style, points)
+            })
+            .collect()
+    }
+
+    pub fn remove_ink(&self, index: i32, annot: &poppler::Annot) -> Result<(), String> {
+        use poppler::prelude::*;
+        if annot.annot_type() != poppler::AnnotType::Ink || annot.page_index() != index {
+            return Err("Drawing not found on this page".into());
+        }
+        let page = self.page(index).ok_or("Page not found")?;
+        page.remove_annot(annot);
+        Ok(())
+    }
+
+    /// Smooths a top-origin stroke and converts it to clamped PDF coordinates.
+    fn ink_pdf_stroke(&self, index: i32, points: &[(f64, f64)]) -> Result<Vec<(f64, f64)>, String> {
+        let points = smooth_ink_stroke(points).ok_or("Stroke is too short")?;
+        let (width, height) = self.size(index, 0);
+        let pdf_points = points
+            .iter()
+            .map(|(x, y)| (x.clamp(0.0, width), height - y.clamp(0.0, height)))
+            .collect::<Vec<_>>();
+        if polyline_length(&pdf_points) < INK_MIN_LENGTH {
+            return Err("Stroke is too short".into());
+        }
+        Ok(pdf_points)
+    }
+
+    /// Writes all strokes and a Rect that covers them. The Rect must be
+    /// updated first: other viewers scale the appearance into it.
+    fn set_ink_paths(&self, index: i32, annot: &poppler::AnnotInk, paths: &[Vec<(f64, f64)>]) {
+        use poppler::prelude::*;
+        let (width, height) = self.size(index, 0);
+        let pad = INK_MAX_WIDTH + 1.0;
+        let (min_x, max_x, min_y, max_y) = bounds(paths.iter().flatten());
+        let mut x1 = (min_x - pad).max(0.0);
+        let mut y1 = (min_y - pad).max(0.0);
+        let mut x2 = (max_x + pad).min(width);
+        let mut y2 = (max_y + pad).min(height);
+        if x2 - x1 < 1.0 {
+            x2 = (x1 + 1.0).min(width);
+            x1 = (x2 - 1.0).max(0.0);
+        }
+        if y2 - y1 < 1.0 {
+            y2 = (y1 + 1.0).min(height);
+            y1 = (y2 - 1.0).max(0.0);
+        }
+        annot.set_rectangle(&mut pdf_rect(x1, y1, x2, y2));
+        let paths = paths.iter().map(|path| ink_path(path)).collect::<Vec<_>>();
+        set_ink_list(annot, &paths);
+    }
+
+    #[cfg(test)]
+    pub fn add_ink_stroke(&self, index: i32, points: &[(f64, f64)]) -> Result<(), String> {
+        self.add_ink_drawing(index, points, InkStyle::default())
+            .map(|_| ())
+    }
+
+    /// Starts a new drawing (one ink annotation) with its first stroke.
+    pub fn add_ink_drawing(
+        &self,
+        index: i32,
+        points: &[(f64, f64)],
+        style: InkStyle,
+    ) -> Result<poppler::AnnotInk, String> {
+        use poppler::prelude::*;
+        let stroke = self.ink_pdf_stroke(index, points)?;
+        let page = self.page(index).ok_or("Page not found")?;
+        let (min_x, max_x, min_y, max_y) = bounds(&stroke);
+        let annotation =
+            poppler::AnnotInk::new(&self.document, &pdf_rect(min_x, min_y, max_x, max_y));
+        annotation.set_color(Some(&poppler_color(style.rgb)));
+        annotation.set_border_width(style.width.clamp(0.25, INK_MAX_WIDTH));
+        annotation.set_opacity(1.0);
+        annotation.set_flags(poppler::AnnotFlag::PRINT);
+        page.add_annot(&annotation);
+        self.set_ink_paths(index, &annotation, &[stroke]);
+        Ok(annotation)
+    }
+
+    /// Adds a stroke to an existing drawing so a signature stays one object.
+    pub fn append_ink_stroke(
+        &self,
+        index: i32,
+        annot: &poppler::AnnotInk,
+        points: &[(f64, f64)],
+    ) -> Result<(), String> {
+        let stroke = self.ink_pdf_stroke(index, points)?;
+        let mut paths = Self::ink_pdf_paths(annot);
+        paths.push(stroke);
+        self.set_ink_paths(index, annot, &paths);
+        Ok(())
+    }
+
+    /// Removes the newest stroke; returns true when the drawing is now gone.
+    pub fn pop_ink_stroke(&self, index: i32, annot: &poppler::AnnotInk) -> Result<bool, String> {
+        use glib::object::Cast;
+        let mut paths = Self::ink_pdf_paths(annot);
+        paths.pop();
+        if paths.is_empty() {
+            self.remove_ink(index, annot.upcast_ref())?;
+            return Ok(true);
+        }
+        self.set_ink_paths(index, annot, &paths);
+        Ok(false)
+    }
+
+    pub fn save_filled_copy(&self, path: &Path) -> Result<(), String> {
+        self.document
+            .save(&path_uri(path))
+            .map_err(|e| e.to_string())
+    }
+
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self, OpenError> {
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let uri = path_uri(&path);

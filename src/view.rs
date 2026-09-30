@@ -677,6 +677,194 @@ fn scale_for(zoom: Zoom, pw: f64, ph: f64, vw: f64, vh: f64) -> f64 {
     }
 }
 
+/// Maps an annotation colour the way the page raster is recoloured, so live
+/// previews match what Poppler draws after the edit is committed.
+pub fn preview_rgb(rgb: (f64, f64, f64), mode: PdfMode, palette: PdfPalette) -> (f64, f64, f64) {
+    let byte = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let [r, g, b] = rendered_rgb([byte(rgb.0), byte(rgb.1), byte(rgb.2)], mode, palette);
+    (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
+}
+
+pub fn paint_ink_polyline(
+    cr: &Context,
+    points: &[(f64, f64)],
+    scale: f64,
+    rgb: (f64, f64, f64),
+    width: f64,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    cr.save().ok();
+    cr.set_source_rgb(rgb.0, rgb.1, rgb.2);
+    cr.set_line_width((width * scale).max(1.0));
+    cr.set_line_cap(cairo::LineCap::Round);
+    cr.set_line_join(cairo::LineJoin::Round);
+    cr.move_to(points[0].0 * scale, points[0].1 * scale);
+    for point in points.iter().skip(1) {
+        cr.line_to(point.0 * scale, point.1 * scale);
+    }
+    cr.stroke().ok();
+    cr.restore().ok();
+}
+
+/// Poppler writes FreeText in Helvetica with the first baseline one font size
+/// below the box top and one font size per line. The preview uses the same
+/// metrics so text does not move when it is committed.
+const FREE_TEXT_FONT: &str = "Helvetica";
+const FREE_TEXT_DESCENT: f64 = 0.3;
+/// Where the caret's middle sits below the box top, in font sizes.
+pub const FREE_TEXT_CARET_CENTER: f64 = 0.7;
+
+fn free_text_font(cr: &Context, size: f64) {
+    cr.select_font_face(
+        FREE_TEXT_FONT,
+        cairo::FontSlant::Normal,
+        cairo::FontWeight::Normal,
+    );
+    cr.set_font_size(size);
+}
+
+pub fn free_text_extent(text: &str, size: f64) -> (f64, f64) {
+    let surface = ImageSurface::create(Format::ARgb32, 8, 8).unwrap();
+    let cr = Context::new(&surface).unwrap();
+    free_text_font(&cr, size);
+    let mut width = size * 0.5;
+    for line in text.split('\n') {
+        if let Ok(ext) = cr.text_extents(line) {
+            width = width.max(ext.x_advance().max(ext.x_bearing() + ext.width()));
+        }
+    }
+    let lines = text.split('\n').count().max(1) as f64;
+    // Slack keeps Poppler from wrapping on rounding differences.
+    (width + 4.0, (lines + FREE_TEXT_DESCENT) * size)
+}
+
+/// The box a draft commits to: its extent, kept on the page by shifting the
+/// origin rather than shrinking (a narrower box would make Poppler wrap).
+pub fn free_text_rect(
+    x: f64,
+    y: f64,
+    text: &str,
+    size: f64,
+    page_width: f64,
+    page_height: f64,
+) -> DocumentRect {
+    let (width, height) = free_text_extent(text, size);
+    let width = width.min(page_width.max(1.0));
+    let height = height.min(page_height.max(1.0));
+    DocumentRect {
+        x: x.min(page_width - width).max(0.0),
+        y: y.min(page_height - height).max(0.0),
+        width,
+        height,
+    }
+}
+
+pub struct TextPreview<'a> {
+    pub rect: DocumentRect,
+    pub text: &'a str,
+    /// Byte offset of the caret in `text`.
+    pub cursor: usize,
+    pub size: f64,
+    pub rgb: (f64, f64, f64),
+    pub accent: (f64, f64, f64),
+    pub page_width: f64,
+    pub page_height: f64,
+    pub rotation: i32,
+    pub scale: f64,
+}
+
+fn rotate_to_display(cr: &Context, rotation: i32) {
+    match rotation.rem_euclid(360) {
+        90 => cr.rotate(std::f64::consts::FRAC_PI_2),
+        180 => cr.rotate(std::f64::consts::PI),
+        270 => cr.rotate(-std::f64::consts::FRAC_PI_2),
+        _ => {}
+    }
+}
+
+/// Paints a text draft in document orientation with its caret and frame.
+pub fn paint_free_text_draft(cr: &Context, p: TextPreview<'_>) {
+    let (ox, oy) = crate::annotations::document_point_to_display(
+        p.rect.x,
+        p.rect.y,
+        p.page_width,
+        p.page_height,
+        p.rotation,
+    );
+    cr.save().ok();
+    cr.translate(ox * p.scale, oy * p.scale);
+    rotate_to_display(cr, p.rotation);
+    cr.scale(p.scale, p.scale);
+    let pad = 3.0;
+    cr.rectangle(
+        -pad,
+        -pad,
+        p.rect.width + 2.0 * pad,
+        p.rect.height + 2.0 * pad,
+    );
+    cr.set_source_rgba(p.accent.0, p.accent.1, p.accent.2, 0.9);
+    cr.set_line_width(1.0 / p.scale.max(0.1));
+    cr.set_dash(&[3.0 / p.scale.max(0.1), 2.0 / p.scale.max(0.1)], 0.0);
+    cr.stroke().ok();
+    cr.set_dash(&[], 0.0);
+    free_text_font(cr, p.size);
+    cr.set_source_rgb(p.rgb.0, p.rgb.1, p.rgb.2);
+    for (i, line) in p.text.split('\n').enumerate() {
+        if !line.is_empty() {
+            cr.move_to(0.0, p.size * (i as f64 + 1.0));
+            cr.show_text(line).ok();
+        }
+    }
+    let cursor = p.cursor.min(p.text.len());
+    let before = &p.text[..cursor];
+    let line = before.matches('\n').count() as f64;
+    let column = before.rsplit('\n').next().unwrap_or("");
+    let caret_x = cr
+        .text_extents(column)
+        .map(|ext| ext.x_advance())
+        .unwrap_or(0.0);
+    let baseline = p.size * (line + 1.0);
+    cr.set_source_rgb(p.accent.0, p.accent.1, p.accent.2);
+    cr.set_line_width((1.5 / p.scale.max(0.1)).max(p.size / 14.0));
+    cr.move_to(caret_x, baseline - p.size * 0.8);
+    cr.line_to(caret_x, baseline + p.size * 0.2);
+    cr.stroke().ok();
+    cr.restore().ok();
+}
+
+/// Faint frames around existing added text so it reads as clickable.
+pub fn paint_free_text_frames(
+    cr: &Context,
+    rects: &[DocumentRect],
+    page_width: f64,
+    page_height: f64,
+    rotation: i32,
+    scale: f64,
+    accent: (f64, f64, f64),
+) {
+    if rects.is_empty() {
+        return;
+    }
+    cr.save().ok();
+    cr.set_source_rgba(accent.0, accent.1, accent.2, 0.45);
+    cr.set_line_width(1.0);
+    cr.set_dash(&[2.0, 2.0], 0.0);
+    for rect in rects {
+        let r =
+            crate::annotations::document_rect_to_display(*rect, page_width, page_height, rotation);
+        cr.rectangle(
+            (r.x - 2.0) * scale,
+            (r.y - 2.0) * scale,
+            (r.width + 4.0) * scale,
+            (r.height + 4.0) * scale,
+        );
+    }
+    cr.stroke().ok();
+    cr.restore().ok();
+}
+
 pub fn draw_one_page(cr: &Context, drawing: PageDrawing<'_>) {
     let local = PageGeom {
         x: 0.0,

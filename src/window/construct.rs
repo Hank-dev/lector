@@ -282,8 +282,14 @@ impl Lector {
         body.append(&sidebar_revealer);
         body.append(&scrolled);
 
+        let edit_bar = EditBar::new();
+        let keys = gtk::EventControllerKey::new();
+        let im = gtk::IMMulticontext::new();
+        im.set_client_widget(Some(&pages_box));
+
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.append(&toolbar);
+        root.append(&edit_bar.revealer);
         root.append(&find_bar);
         root.append(&file_banner);
         root.append(&body);
@@ -291,6 +297,18 @@ impl Lector {
 
         let ui = Rc::new(Self {
             window: window.clone(),
+            pdf_dirty: Cell::new(false),
+            text_placement: Cell::new(false),
+            draw_mode: Cell::new(false),
+            ink_stroke: RefCell::new(None),
+            text_draft: RefCell::new(None),
+            text_press: RefCell::new(None),
+            pen: Cell::new(Pen::default()),
+            ink_groups: RefCell::new(HashMap::new()),
+            edit_undo: RefCell::new(Vec::new()),
+            edit_bar,
+            im: im.clone(),
+            keys: keys.clone(),
             pages_box: pages_box.clone(),
             scrolled: scrolled.clone(),
             toolbar: toolbar.clone(),
@@ -388,6 +406,34 @@ impl Lector {
                     menu_save,
                 ),
                 ("document-print-symbolic", "Print…", "Ctrl+P", menu_print),
+                (
+                    "insert-text-symbolic",
+                    "Add Text…",
+                    "Ctrl+Shift+T",
+                    Lector::add_text_dialog,
+                ),
+                (
+                    "input-tablet-symbolic",
+                    "Draw…",
+                    "Ctrl+Shift+D",
+                    Lector::toggle_draw,
+                ),
+                (
+                    "view-list-symbolic",
+                    "Added Text & Drawings…",
+                    "",
+                    Lector::present_edits_manager,
+                ),
+                (
+                    "document-edit-symbolic",
+                    "Fill Form…",
+                    "Ctrl+Shift+F",
+                    |ui| {
+                        if let Some(dialog) = ui.forms_dialog() {
+                            dialog.present();
+                        }
+                    },
+                ),
             ],
             &menu_pop,
             &h,
@@ -478,6 +524,10 @@ impl Lector {
         menu_btn.set_popover(Some(&menu_pop));
         {
             let document_labels = [
+                "Fill Form…",
+                "Add Text…",
+                "Draw…",
+                "Added Text & Drawings…",
                 "Save a Copy…",
                 "Print…",
                 "Rotate left",
@@ -621,6 +671,7 @@ impl Lector {
         });
 
         let drag = GestureDrag::new();
+        drag.set_button(1);
         drag.connect_drag_begin({
             let h = h.clone();
             move |_, x, y| {
@@ -633,7 +684,31 @@ impl Lector {
             let h = h.clone();
             move |g, dx, dy| {
                 if let (Some(ui), Some((ox, oy))) = (h.get(), g.start_point()) {
-                    ui.drag_update(ox + dx, oy + dy);
+                    if ui.draw_mode.get() {
+                        ui.extend_ink_stroke_from_event(g.current_event(), ox + dx, oy + dy);
+                    } else {
+                        ui.drag_update(ox + dx, oy + dy);
+                    }
+                }
+            }
+        });
+        drag.connect_drag_end({
+            let h = h.clone();
+            move |g, dx, dy| {
+                if let Some(ui) = h.get() {
+                    if ui.draw_mode.get() {
+                        if let Some((x, y)) = g.start_point() {
+                            ui.extend_ink_stroke(x + dx, y + dy);
+                        }
+                        ui.finish_ink_stroke();
+                    } else if ui.text_placement.get() {
+                        if let Some((x, y)) = g.start_point() {
+                            ui.drag_text(x + dx, y + dy);
+                        }
+                        ui.release_text();
+                    } else if let Some((x, y)) = g.start_point() {
+                        ui.drag_update(x + dx, y + dy);
+                    }
                 }
             }
         });
@@ -647,7 +722,18 @@ impl Lector {
             let first_was_link = first_was_link.clone();
             move |_, n, x, y| {
                 if let Some(ui) = h.get() {
+                    if ui.draw_mode.get() {
+                        first_was_link.set(false);
+                        return;
+                    }
                     if n == 1 {
+                        let selecting = ui.inner.borrow().view.selection.is_some_and(|s| {
+                            (s.x2 - s.x1).abs() > 3.0 || (s.y2 - s.y1).abs() > 3.0
+                        });
+                        if ui.draw_mode.get() || ui.text_placement.get() || selecting {
+                            first_was_link.set(false);
+                            return;
+                        }
                         if ui.activate_note_at(x, y) {
                             first_was_link.set(false);
                         } else {
@@ -786,7 +872,15 @@ impl Lector {
         });
         window.add_controller(drop);
 
-        let keys = gtk::EventControllerKey::new();
+        ui.connect_edit_bar();
+        im.connect_commit({
+            let h = h.clone();
+            move |_, text| {
+                if let Some(ui) = h.get() {
+                    ui.insert_inline_text(text);
+                }
+            }
+        });
         keys.connect_key_pressed({
             let h = h.clone();
             move |_, key, _, mods| {
@@ -1065,6 +1159,11 @@ impl Lector {
             let h = h.clone();
             move |_| {
                 if let Some(ui) = h.get() {
+                    ui.commit_text_draft();
+                    if ui.pdf_dirty.get() {
+                        ui.confirm_discard(|ui| ui.window.close());
+                        return glib::Propagation::Stop;
+                    }
                     ui.persist();
                     ui.hold.borrow_mut().take();
                 }

@@ -501,6 +501,10 @@ fn shortcut_overlay_is_grouped_like_the_app_menu() {
         .rows
         .iter()
         .any(|row| row.action == "Highlight selection" && row.keys == "Ctrl+Shift+H")));
+    assert!(shortcut_sections().iter().any(|section| section
+        .rows
+        .iter()
+        .any(|row| row.action == "Draw on PDF" && row.keys == "Ctrl+Shift+D")));
 }
 
 #[test]

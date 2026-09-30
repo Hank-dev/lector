@@ -30,11 +30,12 @@ use crate::theme::{self, Theme};
 use crate::view::{
     apply_print_page_transform, display_point_to_document, draw_annotations, draw_page_overlays,
     layout_content_size, page_alloc_size, page_in_view, page_paint_size, page_scroll_y,
-    pages_intersecting_view, paint_raster, print_content_size, raster_cache_needs_clear,
+    pages_intersecting_view, paint_free_text_draft, paint_free_text_frames, paint_ink_polyline,
+    paint_raster, preview_rgb, print_content_size, raster_cache_needs_clear,
     raster_cache_needs_reset, raster_idle_is_stale, raster_page, search_hit_scroll_y,
     selected_text, selection_highlight_rects, thumbnail, thumbnail_css_size, AnnotationDrawing,
-    Layout, LayoutMode, PageDrawing, PdfMode, RasterCache, RasterKey, Selection, Zoom, MAX_ZOOM,
-    SEARCH_HIT_MARGIN, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
+    Layout, LayoutMode, PageDrawing, PdfMode, RasterCache, RasterKey, Selection, TextPreview, Zoom,
+    MAX_ZOOM, SEARCH_HIT_MARGIN, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
 };
 
 mod annotations_ui;
@@ -42,18 +43,34 @@ mod canvas;
 mod chrome;
 mod construct;
 mod document;
+pub(crate) mod edit_bar;
+mod forms;
 mod helpers;
+mod ink;
 mod nav;
 mod search;
 mod state;
 mod widgets;
 
+pub(crate) use edit_bar::{EditBar, EditUndo, Pen};
 pub(crate) use helpers::*;
 pub(crate) use state::*;
 pub(crate) use widgets::*;
 
 pub struct Lector {
     window: ApplicationWindow,
+    pdf_dirty: Cell<bool>,
+    text_placement: Cell<bool>,
+    draw_mode: Cell<bool>,
+    ink_stroke: RefCell<Option<ink::ActiveInk>>,
+    text_draft: RefCell<Option<forms::TextDraft>>,
+    text_press: RefCell<Option<forms::TextPress>>,
+    pen: Cell<Pen>,
+    ink_groups: RefCell<HashMap<i32, (crate::doc::InkStyle, poppler::AnnotInk)>>,
+    edit_undo: RefCell<Vec<EditUndo>>,
+    edit_bar: EditBar,
+    im: gtk::IMMulticontext,
+    keys: gtk::EventControllerKey,
     pages_box: Fixed,
     scrolled: ScrolledWindow,
     toolbar: GtkBox,

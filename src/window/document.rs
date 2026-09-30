@@ -46,10 +46,19 @@ impl Lector {
     }
 
     pub(crate) fn adopt_doc(&self, doc: OpenDoc) {
+        // Typed but uncommitted text counts as an unsaved change.
+        self.commit_text_draft();
+        if self.pdf_dirty.get() {
+            self.confirm_discard(move |ui| ui.adopt_doc(doc));
+            return;
+        }
         if doc.n_pages <= 0 {
             self.alert("Could not open document", "The file has no pages.");
             return;
         }
+        self.cancel_text_placement();
+        self.cancel_draw();
+        self.reset_edit_history();
         let opened_path = doc.path.clone();
         let restore = {
             let mut st = self.inner.borrow_mut();
@@ -381,6 +390,7 @@ impl Lector {
     }
 
     pub(crate) fn save_copy(&self) {
+        self.commit_text_draft();
         let st = self.inner.borrow();
         let Some(doc) = st.view.doc.as_ref() else {
             return;
@@ -402,10 +412,19 @@ impl Lector {
             move |res| match res {
                 Ok(file) => {
                     if let Some(path) = file.path() {
-                        let uri = crate::theme::path_uri(&path);
-                        if let Err(e) = document.save_a_copy(&uri) {
-                            if let Some(ui) = h.get() {
-                                ui.alert("Could not save a copy", &e.to_string());
+                        if let Some(ui) = h.get() {
+                            let same_document = ui
+                                .inner
+                                .borrow()
+                                .view
+                                .doc
+                                .as_ref()
+                                .is_some_and(|doc| doc.document == document);
+                            if !same_document {
+                                return;
+                            }
+                            if let Err(error) = ui.save_copy_to(&path) {
+                                ui.alert("Could not save a copy", &error);
                             }
                         }
                     }

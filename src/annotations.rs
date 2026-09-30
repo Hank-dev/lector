@@ -16,6 +16,21 @@ pub struct DocumentRect {
     pub height: f64,
 }
 
+pub fn document_point_to_display(
+    x: f64,
+    y: f64,
+    page_width: f64,
+    page_height: f64,
+    rotation: i32,
+) -> (f64, f64) {
+    match rotation.rem_euclid(360) {
+        90 => (page_height - y, x),
+        180 => (page_width - x, page_height - y),
+        270 => (y, page_width - x),
+        _ => (x, y),
+    }
+}
+
 pub fn document_rect_to_display(
     rect: DocumentRect,
     page_width: f64,

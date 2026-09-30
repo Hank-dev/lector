@@ -2,6 +2,14 @@ use super::*;
 
 impl Lector {
     pub(crate) fn drag_begin(&self, x: f64, y: f64) {
+        if self.draw_mode.get() {
+            self.begin_ink_stroke(x, y);
+            return;
+        }
+        if self.text_placement.get() {
+            self.place_text_caret(x, y);
+            return;
+        }
         let hit = self.hit_at(x, y);
         {
             let st = &mut *self.inner.borrow_mut();
@@ -16,6 +24,14 @@ impl Lector {
     }
 
     pub(crate) fn drag_update(&self, x: f64, y: f64) {
+        if self.draw_mode.get() {
+            self.extend_ink_stroke(x, y);
+            return;
+        }
+        if self.text_placement.get() {
+            self.drag_text(x, y);
+            return;
+        }
         {
             let hit = self.hit_at(x, y);
             let st = &mut *self.inner.borrow_mut();
