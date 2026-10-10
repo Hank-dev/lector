@@ -46,14 +46,15 @@ impl Lector {
     }
 
     pub(crate) fn adopt_doc(&self, doc: OpenDoc) {
+        // Checked before discarding edits: a refused document keeps them.
+        if doc.n_pages <= 0 {
+            self.alert("Could not open document", "The file has no pages.");
+            return;
+        }
         // Typed but uncommitted text counts as an unsaved change.
         self.commit_text_draft();
         if self.pdf_dirty.get() {
             self.confirm_discard(move |ui| ui.adopt_doc(doc));
-            return;
-        }
-        if doc.n_pages <= 0 {
-            self.alert("Could not open document", "The file has no pages.");
             return;
         }
         self.cancel_text_placement();
@@ -337,20 +338,24 @@ impl Lector {
         }
     }
 
-    pub(crate) fn print_doc(&self) {
+    /// What a print job draws. A text draft is committed first: while an
+    /// answer is being edited it is out of the PDF.
+    pub(crate) fn print_source(&self) -> Option<(poppler::Document, i32, i32, Vec<Annotation>)> {
+        self.commit_text_draft();
         let st = self.inner.borrow();
-        let Some(doc) = st.view.doc.as_ref() else {
-            return;
-        };
-        let n = doc.n_pages;
-        let document = doc.document.clone();
-        let rotation = st.view.rotation;
+        let doc = st.view.doc.as_ref()?;
         let marks = st
             .annotations
             .as_ref()
             .map(|store| store.for_document(&doc.path).to_vec())
             .unwrap_or_default();
-        drop(st);
+        Some((doc.document.clone(), doc.n_pages, st.view.rotation, marks))
+    }
+
+    pub(crate) fn print_doc(&self) {
+        let Some((document, n, rotation, marks)) = self.print_source() else {
+            return;
+        };
         let op = gtk::PrintOperation::new();
         op.set_n_pages(n);
         op.connect_draw_page(move |_, ctx, nr| {
@@ -396,10 +401,7 @@ impl Lector {
             return;
         };
         let document = doc.document.clone();
-        let suggest = doc
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
+        let suggest = copy_file_name(&doc.path);
         drop(st);
         let dialog = gtk::FileDialog::builder().title("Save a Copy").build();
         if let Some(name) = suggest {

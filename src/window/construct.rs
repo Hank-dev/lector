@@ -722,34 +722,7 @@ impl Lector {
             let first_was_link = first_was_link.clone();
             move |_, n, x, y| {
                 if let Some(ui) = h.get() {
-                    if ui.draw_mode.get() {
-                        first_was_link.set(false);
-                        return;
-                    }
-                    if n == 1 {
-                        let selecting = ui.inner.borrow().view.selection.is_some_and(|s| {
-                            (s.x2 - s.x1).abs() > 3.0 || (s.y2 - s.y1).abs() > 3.0
-                        });
-                        if ui.draw_mode.get() || ui.text_placement.get() || selecting {
-                            first_was_link.set(false);
-                            return;
-                        }
-                        if ui.activate_note_at(x, y) {
-                            first_was_link.set(false);
-                        } else {
-                            let link = ui.activate_link_at(x, y);
-                            if !link {
-                                ui.target_annotation_at(x, y);
-                            }
-                            first_was_link.set(link);
-                        }
-                    } else {
-                        let has_link = ui.link_at_view(x, y).is_some();
-                        if should_toggle_fit(n, has_link, first_was_link.get()) {
-                            ui.toggle_fit();
-                        }
-                        first_was_link.set(false);
-                    }
+                    ui.click_released(n, x, y, &first_was_link);
                 }
             }
         });

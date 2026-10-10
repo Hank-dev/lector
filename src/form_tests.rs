@@ -250,18 +250,36 @@ fn filled_copy_refuses_original_and_roundtrips_acroforms() {
         doc.save_filled_copy(&path).is_err(),
         "must refuse overwriting the original"
     );
+    #[cfg(unix)]
+    {
+        let link = path.with_extension("link.pdf");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            doc.save_filled_copy(&link).is_err(),
+            "a link to the original is the original"
+        );
+        std::fs::remove_file(link).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "a refused save must leave the original intact"
+    );
+    // Poppler still reads the original, so the edits can be saved elsewhere.
+    std::fs::remove_file(&copy).unwrap();
+    doc.save_filled_copy(&copy).unwrap();
+    assert_eq!(
+        field(&OpenDoc::open(&copy, None).unwrap(), "Name")
+            .text_get_text()
+            .as_deref(),
+        Some("Backend answer")
+    );
     std::fs::remove_file(copy).unwrap();
     std::fs::remove_file(path).unwrap();
 }
 
 pub(crate) fn fixture() -> std::path::PathBuf {
-    use std::io::Write;
-    let path = std::env::temp_dir().join(format!(
-        "lector-forms-{}-{}.pdf",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("test")
-    ));
-    let objects = [
+    write_raw_pdf("forms", &[
         "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R 13 0 R 14 0 R] /DA (/Helv 12 Tf 0 g) /DR << /Font << /Helv 4 0 R >> >> >> >>",
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 11 0 R 12 0 R 13 0 R 14 0 R] >>",
@@ -278,7 +296,17 @@ pub(crate) fn fixture() -> std::path::PathBuf {
         "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature) /Rect [50 150 250 200] /P 3 0 R >>",
         "<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 0 >>\nstream\n\nendstream",
         "<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 20 >>\nstream\n0 0 20 20 re 0 g f\nendstream",
-    ];
+    ])
+}
+
+/// Writes numbered objects (the first is the catalog) as a PDF in the temp dir.
+fn write_raw_pdf(name: &str, objects: &[&str]) -> std::path::PathBuf {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!(
+        "lector-{name}-{}-{}.pdf",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0];
     for (i, object) in objects.iter().enumerate() {
@@ -549,4 +577,100 @@ fn smoothing_passes_through_input_and_rounds_corners() {
         .map(|i| (i as f64 * 0.7, (i as f64 * 0.05).sin() * 20.0))
         .collect::<Vec<_>>();
     assert!(crate::doc::smooth_ink_stroke(&long).unwrap().len() <= 2001);
+}
+
+#[test]
+fn slow_fine_strokes_keep_their_shape() {
+    // A semicircle drawn slowly at a high zoom: one sample every 0.4 pt.
+    let radius = 48.0 * 0.4 / std::f64::consts::PI;
+    let arc = (0..=48)
+        .map(|i| {
+            let angle = std::f64::consts::PI * i as f64 / 48.0;
+            (100.0 + radius * angle.cos(), 100.0 - radius * angle.sin())
+        })
+        .collect::<Vec<_>>();
+    let kept = crate::doc::simplify_ink_stroke(&arc).unwrap();
+    assert!(kept.len() >= 20, "curve collapsed to {} points", kept.len());
+    assert_eq!(kept.first(), arc.first());
+    assert_eq!(
+        kept.last(),
+        arc.last(),
+        "the stroke ends where the pen lifted"
+    );
+    for (x, y) in crate::doc::smooth_ink_stroke(&arc).unwrap() {
+        let off = ((x - 100.0).hypot(y - 100.0) - radius).abs();
+        assert!(off < 0.2, "({x}, {y}) is {off} pt off the arc");
+    }
+}
+
+#[test]
+fn free_text_on_rotated_pages_is_found_where_it_was_written() {
+    use crate::annotations::DocumentRect;
+    for rotate in [0, 90, 180, 270] {
+        let path =
+            crate::doc::write_test_pdf_pages("text-rotated", &[""], &format!(" /Rotate {rotate}"));
+        let doc = OpenDoc::open(&path, None).unwrap();
+        let rect = DocumentRect {
+            x: 40.0,
+            y: 60.0,
+            width: 120.0,
+            height: 30.0,
+        };
+        doc.add_fill_text(0, rect, "Rotated answer").unwrap();
+        let (_, found) = doc
+            .free_text_at(0, 100.0, 75.0)
+            .unwrap_or_else(|| panic!("/Rotate {rotate}: no hit inside the written box"));
+        for (got, want) in [
+            (found.rect.x, rect.x),
+            (found.rect.y, rect.y),
+            (found.rect.width, rect.width),
+            (found.rect.height, rect.height),
+        ] {
+            assert!(
+                (got - want).abs() < 0.01,
+                "/Rotate {rotate}: {:?} vs {rect:?}",
+                found.rect
+            );
+        }
+        assert_eq!(doc.free_text_rects(0), vec![found.rect]);
+        assert!(doc.find_free_text(0, &found).is_some());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn text_boxes_from_other_tools_are_not_editable() {
+    let path = write_raw_pdf(
+        "foreign-text",
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R 5 0 R 6 0 R] >>",
+            "<< /Type /Annot /Subtype /FreeText /Rect [100 600 300 650] /Contents (Signed note) /DA (/Helv 12 Tf 0 g) /T (Reviewer) /Border [0 0 0] >>",
+            "<< /Type /Annot /Subtype /FreeText /Rect [100 500 300 550] /Contents (Filled note) /DA (/Helv 12 Tf 0 g) /C [1 1 0] /Border [0 0 0] >>",
+            "<< /Type /Annot /Subtype /FreeText /Rect [100 400 300 450] /Contents (Framed note) /DA (/Helv 12 Tf 0 g) /Border [0 0 2] >>",
+        ],
+    );
+    let doc = OpenDoc::open(&path, None).unwrap();
+    assert_eq!(doc.free_text_annotations().len(), 3);
+    for y in [167.0, 267.0, 367.0] {
+        assert!(
+            doc.free_text_at(0, 200.0, y).is_none(),
+            "a click at y={y} would rebuild another tool's note"
+        );
+    }
+    assert!(doc.free_text_rects(0).is_empty());
+    let rect = crate::annotations::DocumentRect {
+        x: 100.0,
+        y: 500.0,
+        width: 150.0,
+        height: 20.0,
+    };
+    doc.add_fill_text(0, rect, "Own answer").unwrap();
+    let (annot, _) = doc
+        .free_text_at(0, 120.0, 510.0)
+        .expect("own text stays editable");
+    assert!(crate::doc::is_plain_free_text(&annot));
+    assert_eq!(doc.free_text_rects(0).len(), 1);
+    std::fs::remove_file(path).unwrap();
 }

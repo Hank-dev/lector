@@ -37,12 +37,15 @@ cargo clippy --offline --release --all-targets -- -D warnings
 cargo build --offline --release
 ```
 
-The GTK integration test requires a display and must run separately on one test thread:
+GTK integration tests are `#[ignore]`d. They present windows, so `init_test_gtk`
+lets them run only on Broadway (`gtk4-broadwayd :7`, then
+`GDK_BACKEND=broadway BROADWAY_DISPLAY=:7`); `LECTOR_TEST_ON_DESKTOP=1` overrides
+that. Run each one in its own process (loop in README), for example:
 
 ```bash
-cargo test --offline --release actual_window_navigation_presentation_search_and_reload -- --ignored --test-threads=1
+cargo test --offline --release actual_window_navigation_presentation_search_and_reload -- --ignored --exact --test-threads=1
 ```
 
 Add a regression test for every bug fix. Prefer headless tests for layout, session,
-Cairo, and Poppler behavior. Keep GTK window tests unpresented and ensure they do
-not write the user's real session file.
+Cairo, and Poppler behavior. Start GTK tests with `init_test_gtk()` and ensure they
+do not write the user's real session file.

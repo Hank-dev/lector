@@ -139,10 +139,9 @@ impl Lector {
         if let Some(stroke) = self.ink_stroke.borrow().as_ref() {
             if stroke.page == index {
                 let pen = self.pen.get();
-                let smooth = crate::doc::smooth_polyline(&stroke.points);
                 paint_ink_polyline(
                     cr,
-                    &smooth,
+                    &stroke.preview(),
                     geom.scale,
                     ink(pen.color.rgb()),
                     pen.width.points(),

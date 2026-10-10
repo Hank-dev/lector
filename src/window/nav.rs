@@ -687,6 +687,22 @@ impl Lector {
         self.ensure_visible_rasters();
     }
 
+    /// Drops the thumbnail of an edited page; the visible ones are filled
+    /// again now, others when the thumbnails are shown.
+    pub(crate) fn refresh_thumb(&self, page: i32) {
+        let Some(col) = self.thumbs.row_at_index(page).and_then(|row| row.child()) else {
+            return;
+        };
+        if let Some(picture) = col.first_child().filter(|child| child.is::<gtk::Picture>()) {
+            if let Some(column) = col.downcast_ref::<GtkBox>() {
+                column.remove(&picture);
+            }
+        }
+        if self.inner.borrow().pane.sidebar == Sidebar::Thumbs {
+            self.schedule_thumbs();
+        }
+    }
+
     pub(crate) fn schedule_thumbs(&self) {
         let gen = self.inner.borrow().thumb_gen;
         let h = Handle(self.me.borrow().clone());

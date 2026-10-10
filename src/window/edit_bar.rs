@@ -393,6 +393,9 @@ impl Lector {
         let Some(step) = self.edit_undo.borrow_mut().pop() else {
             return;
         };
+        let page = match &step {
+            EditUndo::Stroke { page, .. } | EditUndo::Text { page, .. } => *page,
+        };
         let result = {
             let st = self.inner.borrow();
             let Some(doc) = st.view.doc.as_ref() else {
@@ -427,7 +430,7 @@ impl Lector {
             }
         };
         match result {
-            Ok(()) => self.pdf_changed(),
+            Ok(()) => self.pdf_changed(page),
             Err(error) => self.alert("Could not undo", &error),
         }
     }
@@ -532,7 +535,7 @@ impl Lector {
                 match result {
                     Ok(()) => {
                         ui.reset_edit_history();
-                        ui.pdf_changed();
+                        ui.pdf_changed(page);
                         row.set_visible(false);
                     }
                     Err(error) => ui.alert("Could not remove", &error),

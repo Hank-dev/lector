@@ -151,7 +151,8 @@ impl Lector {
                     self.show_search();
                     return glib::Propagation::Stop;
                 }
-                Key::g => {
+                // With Shift held, GTK reports the upper-case keyval.
+                Key::g | Key::G => {
                     self.search_step(if shift { -1 } else { 1 });
                     return glib::Propagation::Stop;
                 }
@@ -163,7 +164,7 @@ impl Lector {
                     self.window.close();
                     return glib::Propagation::Stop;
                 }
-                Key::r => {
+                Key::r | Key::R => {
                     if shift {
                         self.reload();
                     } else {

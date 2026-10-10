@@ -1,4 +1,5 @@
-//! Display-backed checks run explicitly; no windows are presented or sessions saved.
+//! Display-backed checks run explicitly on Broadway (see `init_test_gtk`);
+//! no sessions are saved.
 use super::*;
 
 fn form_widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
@@ -14,7 +15,7 @@ fn form_widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_added_text_manager_deletes_selected_entry() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorRemoveTextTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -73,7 +74,7 @@ fn actual_added_text_manager_deletes_selected_entry() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_form_keyboard_shortcuts() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorFormShortcutTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -114,7 +115,7 @@ fn actual_form_keyboard_shortcuts() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_blank_page_drag_opens_text_editor() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorTextPlacementTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -174,7 +175,7 @@ fn actual_blank_page_drag_opens_text_editor() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_free_text_selection_editor() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorFreeTextTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -207,7 +208,17 @@ fn actual_free_text_selection_editor() {
             .filter_map(|w| w.downcast::<Button>().ok())
             .find(|b| widget_tree_has_label(b.upcast_ref(), "Add Text…"))
             .expect("Add Text menu action missing");
-        let raster_gen = ui.inner.borrow().raster_gen;
+        let key = {
+            let st = ui.inner.borrow();
+            RasterKey::from_geom(
+                &st.view.layout.page_geom(0).unwrap(),
+                st.view.rotation,
+                st.view.pdf_mode,
+                st.theme.pdf_palette(),
+                ui.page_dpr(),
+            )
+        };
+        assert!(ui.inner.borrow().raster.contains(&key));
         button.emit_clicked();
         ui.drag_begin(
             bounds.x() as f64 + dx * scale,
@@ -266,7 +277,10 @@ fn actual_free_text_selection_editor() {
             assert!(area.y2 > area.y1 + 4.0);
         }
         assert!(ui.window.title().unwrap().contains("Unsaved"));
-        assert_ne!(ui.inner.borrow().raster_gen, raster_gen);
+        assert!(
+            !ui.inner.borrow().raster.contains(&key),
+            "rotation {rotation}: the edited page must re-render"
+        );
     }
     let other = crate::doc::write_test_pdf("other-fill", &[""]);
     ui.open_path(&other, None);
@@ -301,7 +315,7 @@ fn actual_free_text_selection_editor() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_form_text_editor() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorFormTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -424,7 +438,7 @@ fn actual_form_text_editor() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_adoption_invalidates_raster_lifetime() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorRasterLifetime")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -470,7 +484,7 @@ fn actual_adoption_invalidates_raster_lifetime() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_sidebar_population_is_lazy_and_reused() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorLazySidebar")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -517,7 +531,7 @@ fn actual_sidebar_population_is_lazy_and_reused() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_marks_selection_follows_target_after_sidebar_reuse() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorMarksReuse")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -574,7 +588,7 @@ fn actual_marks_selection_follows_target_after_sidebar_reuse() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_raster_queue_prunes_obsolete_and_cached_work() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorRasterQueue")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -637,7 +651,7 @@ fn actual_raster_queue_prunes_obsolete_and_cached_work() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_rotation_feedback_reuses_correctly_oriented_pixels() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorRotationFeedback")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -711,7 +725,7 @@ fn actual_rotation_feedback_reuses_correctly_oriented_pixels() {
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_layout_transition_keeps_reusable_page_widget() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorWidgetReuse")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -783,7 +797,7 @@ fn wait_for_view_restore(ui: &Lector, context: &glib::MainContext) {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_window_navigation_presentation_search_and_reload() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorRegression")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -958,7 +972,7 @@ fn actual_window_navigation_presentation_search_and_reload() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_window_info_dialogs_use_lector_chrome() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorDialogRegression")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1049,7 +1063,7 @@ fn actual_window_info_dialogs_use_lector_chrome() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_pinch_zoom_keeps_anchor_and_page_during_reflow() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorPinchRegression")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1103,7 +1117,7 @@ fn actual_pinch_zoom_keeps_anchor_and_page_during_reflow() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_zoom_button_keeps_the_current_page() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorZoomButtonRegression")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1133,7 +1147,7 @@ fn actual_zoom_button_keeps_the_current_page() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_back_navigation_restores_single_page_viewport() {
-    gtk::init().expect("GTK display");
+    init_test_gtk();
     let app = gtk::Application::builder()
         .application_id("org.omarchy.Lector.NavigationViewportTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1194,7 +1208,7 @@ fn actual_back_navigation_restores_single_page_viewport() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_outline_disclosure_hides_and_restores_descendants() {
-    gtk::init().expect("GTK display");
+    init_test_gtk();
     let app = gtk::Application::builder()
         .application_id("org.omarchy.Lector.OutlineTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1267,7 +1281,7 @@ fn actual_outline_disclosure_hides_and_restores_descendants() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_document_menu_actions_follow_open_state() {
-    gtk::init().expect("GTK display");
+    init_test_gtk();
     let app = gtk::Application::builder()
         .application_id("org.omarchy.Lector.MenuSensitivityTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1297,7 +1311,7 @@ fn actual_document_menu_actions_follow_open_state() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_continuous_arrow_key_scroll_releases_state_before_adjustment_signal() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorArrowScrollRegression")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1333,7 +1347,7 @@ fn actual_continuous_arrow_key_scroll_releases_state_before_adjustment_signal() 
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_draw_stroke_commits_and_can_be_removed() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorDrawTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1486,13 +1500,14 @@ fn actual_draw_stroke_commits_and_can_be_removed() {
     assert!(ui.pages_box.cursor().is_none());
     ui.hold.borrow_mut().take();
     ui.window.set_visible(false);
+    std::fs::remove_file(copy).unwrap();
     std::fs::remove_file(path).unwrap();
 }
 
 #[test]
 #[ignore = "requires a GTK display; run separately"]
 fn actual_add_text_types_on_the_page_and_enter_commits() {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.LectorInlineTextTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1623,7 +1638,7 @@ fn actual_add_text_types_on_the_page_and_enter_commits() {
 }
 
 fn markup_window(id: &str, name: &str) -> (Rc<Lector>, std::path::PathBuf) {
-    gtk::init().unwrap();
+    init_test_gtk();
     let app = Application::builder()
         .application_id(id)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1866,7 +1881,7 @@ fn search_result_count(ui: &Lector) -> usize {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_page_labels_are_shown_and_accepted() {
-    gtk::init().expect("GTK display");
+    init_test_gtk();
     let app = gtk::Application::builder()
         .application_id("org.omarchy.Lector.PageLabelTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1896,7 +1911,7 @@ fn actual_page_labels_are_shown_and_accepted() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_live_search_debounces_and_lists_results() {
-    gtk::init().expect("GTK display");
+    init_test_gtk();
     let app = gtk::Application::builder()
         .application_id("org.omarchy.Lector.LiveSearchTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1936,7 +1951,7 @@ fn actual_live_search_debounces_and_lists_results() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_external_file_change_offers_reload() {
-    gtk::init().expect("GTK display");
+    init_test_gtk();
     let app = gtk::Application::builder()
         .application_id("org.omarchy.Lector.FileChangeTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1966,7 +1981,7 @@ fn actual_external_file_change_offers_reload() {
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn actual_zoom_dropdown_shows_the_applied_percent() {
-    gtk::init().expect("GTK display");
+    init_test_gtk();
     let app = gtk::Application::builder()
         .application_id("org.omarchy.Lector.ZoomChromeTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -1993,4 +2008,186 @@ fn selected_zoom_label(drop: &DropDown) -> String {
         .and_then(|list| list.string(idx))
         .map(|value| value.to_string())
         .unwrap_or_default()
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_text_draft_survives_redo_double_click_and_print() {
+    let (ui, path) = markup_window("org.omarchy.LectorDraftKeysTest", "draft-keys");
+    let ctrl = gdk::ModifierType::CONTROL_MASK;
+    ui.add_text_dialog();
+    press(&ui, 100., 200.);
+    type_keys(&ui, &[Key::H, Key::i]);
+    assert_eq!(
+        ui.key(Key::Z, ctrl | gdk::ModifierType::SHIFT_MASK),
+        glib::Propagation::Stop
+    );
+    assert_eq!(
+        draft_text(&ui).as_deref(),
+        Some("Hi"),
+        "Ctrl+Shift+Z (redo elsewhere) must not drop the typing"
+    );
+    let zoom = ui.inner.borrow().view.zoom;
+    let (x, y) = page_point(&ui, 100., 200.);
+    let first_was_link = Cell::new(false);
+    ui.click_released(1, x, y, &first_was_link);
+    ui.click_released(2, x, y, &first_was_link);
+    assert_eq!(
+        ui.inner.borrow().view.zoom,
+        zoom,
+        "a double-click while placing text must not switch the zoom"
+    );
+    assert!(ui.print_source().is_some());
+    assert!(ui.text_draft.borrow().is_none());
+    assert_eq!(texts(&ui), vec!["Hi"], "printing includes a new draft");
+    // Re-opening an answer takes it out of the PDF until it is committed.
+    press(&ui, 102., 202.);
+    assert_eq!(draft_text(&ui).as_deref(), Some("Hi"));
+    assert!(texts(&ui).is_empty());
+    assert!(ui.print_source().is_some());
+    assert_eq!(
+        texts(&ui),
+        vec!["Hi"],
+        "printing includes an answer being edited"
+    );
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_refused_document_keeps_unsaved_edits() {
+    let (ui, path) = markup_window("org.omarchy.LectorRefusedDocTest", "refused-doc");
+    ui.add_text_dialog();
+    press(&ui, 100., 200.);
+    type_keys(&ui, &[Key::H, Key::i]);
+    ui.cancel_text_placement();
+    assert!(ui.pdf_dirty.get());
+    let empty = crate::doc::write_test_pdf("no-pages", &[]);
+    let refused = OpenDoc::open(&empty, None).expect("Poppler opens a page-less PDF");
+    assert_eq!(refused.n_pages, 0);
+    ui.adopt_doc(refused);
+    let toplevels = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Window>().ok())
+        .collect::<Vec<_>>();
+    assert!(
+        !toplevels
+            .iter()
+            .any(|w| w.title().as_deref() == Some("Unsaved PDF changes")),
+        "a document that cannot be shown must not offer to discard edits"
+    );
+    assert!(ui.pdf_dirty.get(), "the edits stay marked unsaved");
+    assert_eq!(
+        ui.inner.borrow().view.doc.as_ref().map(|d| d.path.clone()),
+        Some(path.canonicalize().unwrap())
+    );
+    for window in toplevels {
+        if window != ui.window.clone().upcast::<gtk::Window>() {
+            window.destroy();
+        }
+    }
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(empty).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_shifted_shortcuts_reload_and_search_back() {
+    let (ui, path) = markup_window("org.omarchy.LectorShiftedKeysTest", "shifted-keys");
+    let mods = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+    {
+        let mut st = ui.inner.borrow_mut();
+        st.search.hits = vec![(0, poppler::Rectangle::new()); 3];
+        st.search.idx = Some(0);
+    }
+    assert_eq!(ui.key(Key::G, mods), glib::Propagation::Stop);
+    assert_eq!(
+        ui.inner.borrow().search.idx,
+        Some(2),
+        "Ctrl+Shift+G steps back"
+    );
+    let before = ui
+        .inner
+        .borrow()
+        .view
+        .doc
+        .as_ref()
+        .unwrap()
+        .document
+        .clone();
+    assert_eq!(ui.key(Key::R, mods), glib::Propagation::Stop);
+    let st = ui.inner.borrow();
+    assert_ne!(
+        st.view.doc.as_ref().unwrap().document,
+        before,
+        "Ctrl+Shift+R reloads"
+    );
+    assert_eq!(st.view.rotation, 0, "Ctrl+Shift+R does not rotate");
+    drop(st);
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_edit_rerenders_only_its_page_and_thumbnail() {
+    let (ui, path) = markup_window("org.omarchy.LectorEditRasterTest", "edit-raster");
+    let context = glib::MainContext::default();
+    ui.set_sidebar_visible(true);
+    ui.stack.set_visible_child_name("thumbs");
+    drain_for(&context, 300);
+    let picture = |ui: &Lector| {
+        ui.thumbs
+            .row_at_index(0)
+            .and_then(|row| row.child())
+            .and_then(|col| col.first_child())
+            .filter(|child| child.is::<gtk::Picture>())
+    };
+    let row = ui.thumbs.row_at_index(0).expect("thumbnail row");
+    let old_picture = picture(&ui).expect("thumbnail rendered");
+    let key = {
+        let st = ui.inner.borrow();
+        RasterKey::from_geom(
+            &st.view.layout.page_geom(0).unwrap(),
+            st.view.rotation,
+            st.view.pdf_mode,
+            st.theme.pdf_palette(),
+            ui.page_dpr(),
+        )
+    };
+    assert!(ui.inner.borrow().raster.contains(&key));
+    ui.inner
+        .borrow()
+        .view
+        .doc
+        .as_ref()
+        .unwrap()
+        .add_ink_stroke(0, &[(100., 100.), (200., 150.)])
+        .unwrap();
+    ui.pdf_changed(0);
+    {
+        let mut st = ui.inner.borrow_mut();
+        assert!(!st.raster.contains(&key), "the edited page re-renders");
+        assert!(
+            st.raster.get_page(&key).is_some(),
+            "its old pixels stay on screen meanwhile"
+        );
+    }
+    drain_for(&context, 300);
+    assert!(ui.inner.borrow().raster.contains(&key));
+    assert_eq!(
+        ui.thumbs.row_at_index(0).unwrap(),
+        row,
+        "an edit must not rebuild the thumbnail list"
+    );
+    let new_picture = picture(&ui).expect("thumbnail re-rendered");
+    assert_ne!(new_picture, old_picture);
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
 }

@@ -3,7 +3,7 @@ use super::*;
 #[test]
 #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
 fn menu_popover_opens_and_maps_on_activation() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("test.lector.menu")
         .flags(gio::ApplicationFlags::NON_UNIQUE)

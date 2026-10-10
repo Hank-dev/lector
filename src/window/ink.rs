@@ -3,6 +3,41 @@ use super::*;
 pub(crate) struct ActiveInk {
     pub(crate) page: i32,
     pub(crate) points: Vec<(f64, f64)>,
+    /// The smoothed curve up to the last segment that new points no longer
+    /// change, so long strokes are not re-smoothed on every motion event.
+    settled: Vec<(f64, f64)>,
+}
+
+impl ActiveInk {
+    pub(crate) fn new(page: i32, point: (f64, f64)) -> Self {
+        Self {
+            page,
+            points: vec![point],
+            settled: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, point: (f64, f64)) {
+        self.points.push(point);
+        let n = self.points.len();
+        if n >= 3 {
+            if self.settled.is_empty() {
+                self.settled.push(self.points[0]);
+            }
+            crate::doc::smooth_segments(&self.points, n - 3..n - 2, &mut self.settled);
+        }
+    }
+
+    /// The same curve as `smooth_polyline(&self.points)`.
+    pub(crate) fn preview(&self) -> Vec<(f64, f64)> {
+        let n = self.points.len();
+        if n < 3 {
+            return self.points.clone();
+        }
+        let mut curve = self.settled.clone();
+        crate::doc::smooth_segments(&self.points, n - 2..n - 1, &mut curve);
+        curve
+    }
 }
 
 impl Lector {
@@ -45,10 +80,9 @@ impl Lector {
     }
 
     pub(crate) fn begin_ink_stroke(&self, x: f64, y: f64) {
-        *self.ink_stroke.borrow_mut() = self.hit_at(x, y).map(|(page, px, py)| ActiveInk {
-            page,
-            points: vec![(px, py)],
-        });
+        *self.ink_stroke.borrow_mut() = self
+            .hit_at(x, y)
+            .map(|(page, px, py)| ActiveInk::new(page, (px, py)));
         self.queue_pages_draw();
     }
 
@@ -105,7 +139,7 @@ impl Lector {
                 return false;
             }
         }
-        active.points.push((px, py));
+        active.push((px, py));
         true
     }
 
@@ -146,7 +180,7 @@ impl Lector {
                     page: stroke.page,
                     annot,
                 });
-                self.pdf_changed();
+                self.pdf_changed(stroke.page);
             }
             Err(error) if error == "Stroke is too short" => self.queue_pages_draw(),
             Err(error) => {

@@ -106,19 +106,22 @@ cargo clippy --offline --release --all-targets -- -D warnings
 cargo build --offline --release
 ```
 
-The GTK integration test is ignored by default because it requires a display.
-Run it separately from the headless tests so GTK stays on a single test thread:
+The GTK integration tests are ignored by default because they need a display.
+They present windows and dialogs, so they run on GTK's headless Broadway backend
+and refuse a desktop display unless `LECTOR_TEST_ON_DESKTOP=1` is set. GTK binds
+to its first thread, so run each test in its own process:
 
 ```bash
-cargo test --offline --release actual_window_navigation_presentation_search_and_reload -- --ignored --test-threads=1
-cargo test --offline --release actual_form_text_editor -- --ignored --test-threads=1
-cargo test --offline --release actual_free_text_selection_editor -- --ignored --test-threads=1
-cargo test --offline --release actual_text_tool_edits_commits_moves_and_undoes -- --ignored --test-threads=1
-cargo test --offline --release actual_draw_tool_groups_by_pen_and_undoes_strokes -- --ignored --test-threads=1
+gtk4-broadwayd :7 &   # once
+export GDK_BACKEND=broadway BROADWAY_DISPLAY=:7
+for t in $(cargo test --offline --release -- --ignored --list 2>/dev/null | sed -n 's/: test$//p' | grep -v visual_pdf); do
+  cargo test --offline --release "$t" -- --ignored --exact --test-threads=1 -q
+done
 ```
 
-To run them without a desktop session, start `gtk4-broadwayd :7` and prefix each
-command with `GDK_BACKEND=broadway BROADWAY_DISPLAY=:7`.
+On Broadway, `actual_back_navigation_restores_single_page_viewport` and four
+viewport tests in `zoom_tests` also fail on unchanged code: they depend on the
+window size a desktop compositor gives.
 
 It creates an unpresented window and temporary PDFs, exercises the real navigation,
 presentation, search replacement, and reload paths, and never saves the user session.

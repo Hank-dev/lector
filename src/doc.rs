@@ -67,6 +67,17 @@ pub enum DocumentLink {
     Uri(String),
 }
 
+/// Pen strokes of a page with their style, in top-origin document points.
+pub type InkStrokes = Vec<(InkStyle, Vec<(f64, f64)>)>;
+
+/// Ink and text-box geometry per page. Drawing reads it every frame, so it
+/// is read from Poppler once and dropped by the methods that edit a page.
+#[derive(Default)]
+struct MarkupCache {
+    ink: std::collections::HashMap<i32, InkStrokes>,
+    text_rects: std::collections::HashMap<i32, Vec<crate::annotations::DocumentRect>>,
+}
+
 pub struct OpenDoc {
     pub path: PathBuf,
     #[allow(dead_code)]
@@ -83,6 +94,7 @@ pub struct OpenDoc {
     pub creator: Option<String>,
     pub pdf_version: Option<String>,
     pub password: Option<String>,
+    markup: std::cell::RefCell<MarkupCache>,
 }
 
 #[derive(Debug)]
@@ -171,8 +183,11 @@ pub struct FreeTextSpec {
 }
 
 /// Drops non-finite and near-duplicate input points and rejects dots.
+/// Spacing is measured from the last kept point, so slow, finely sampled
+/// curves keep their shape; the stroke still ends where the pen lifted.
 pub fn simplify_ink_stroke(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
-    let mut simplified = Vec::new();
+    let mut simplified: Vec<(f64, f64)> = Vec::new();
+    let mut skipped_end = None;
     for &(x, y) in points {
         if !x.is_finite() || !y.is_finite() {
             continue;
@@ -181,15 +196,16 @@ pub fn simplify_ink_stroke(points: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
             let dx = x - last_x;
             let dy = y - last_y;
             if dx * dx + dy * dy < INK_MIN_SPACING * INK_MIN_SPACING {
-                if simplified.len() > 1 {
-                    if let Some(last) = simplified.last_mut() {
-                        *last = (x, y);
-                    }
-                }
+                skipped_end = Some((x, y));
                 continue;
             }
         }
         simplified.push((x, y));
+        skipped_end = None;
+    }
+    if let Some(end) = skipped_end.filter(|_| simplified.len() > 1) {
+        // Moves the last point by less than the spacing.
+        *simplified.last_mut()? = end;
     }
     if simplified.len() < 2 || polyline_length(&simplified) < INK_MIN_LENGTH {
         None
@@ -205,11 +221,27 @@ pub fn smooth_polyline(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
     if n < 3 {
         return points.to_vec();
     }
-    let at = |i: isize| points[i.clamp(0, n as isize - 1) as usize];
-    let dist = |a: (f64, f64), b: (f64, f64)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
     let mut out = Vec::with_capacity(n * 3);
     out.push(points[0]);
-    for i in 0..n as isize - 1 {
+    smooth_segments(points, 0..n - 1, &mut out);
+    out
+}
+
+/// Appends the samples of curve segments `segments` of [`smooth_polyline`];
+/// segment `i` runs from point `i` to `i + 1`. A segment also depends on the
+/// points on either side, so it is final once point `i + 2` exists.
+pub fn smooth_segments(
+    points: &[(f64, f64)],
+    segments: std::ops::Range<usize>,
+    out: &mut Vec<(f64, f64)>,
+) {
+    let n = points.len();
+    if n == 0 {
+        return;
+    }
+    let at = |i: isize| points[i.clamp(0, n as isize - 1) as usize];
+    let dist = |a: (f64, f64), b: (f64, f64)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    for i in segments.start as isize..segments.end.min(n.saturating_sub(1)) as isize {
         let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
         let (d01, d12, d23) = (dist(p0, p1), dist(p1, p2), dist(p2, p3));
         let handle = |a: (f64, f64), b: (f64, f64), span: f64| {
@@ -234,7 +266,6 @@ pub fn smooth_polyline(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
             out.push((bez(p1.0, c1.0, c2.0, p2.0), bez(p1.1, c1.1, c2.1, p2.1)));
         }
     }
-    out
 }
 
 /// The stored form of one pen stroke: cleaned, smoothed, bounded in size.
@@ -340,8 +371,89 @@ fn pdf_rect(x1: f64, y1: f64, x2: f64, y2: f64) -> poppler::Rectangle {
     area
 }
 
+/// Reads back what Lector needs to edit or restore an embedded answer.
+/// `area` is the annotation mapping area; `height` the page height.
+fn free_text_spec(
+    annot: &poppler::Annot,
+    (x1, y1, x2, y2): (f64, f64, f64, f64),
+    height: f64,
+) -> FreeTextSpec {
+    use glib::object::Cast;
+    use poppler::prelude::*;
+    let free_text = annot.downcast_ref::<poppler::AnnotFreeText>();
+    let size = free_text
+        .and_then(|annot| annot.font_desc())
+        .map(|font| unsafe {
+            let ptr = glib::translate::ToGlibPtr::<
+                *const poppler::ffi::PopplerFontDescription,
+            >::to_glib_none(&font)
+            .0;
+            (*ptr).size_pt
+        })
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(FREE_TEXT_SIZE);
+    let rgb = free_text
+        .and_then(|annot| annot.font_color())
+        .map(|color| rgb_of(&color))
+        .unwrap_or((0.0, 0.0, 0.0));
+    FreeTextSpec {
+        rect: crate::annotations::DocumentRect {
+            x: x1,
+            y: height - y2,
+            width: x2 - x1,
+            height: y2 - y1,
+        },
+        text: annot.contents().map(|s| s.to_string()).unwrap_or_default(),
+        size,
+        rgb,
+    }
+}
+
+/// True for a borderless, unfilled text box without author, popup or
+/// callout, as `add_free_text` makes. Editing re-creates the box from a
+/// [`FreeTextSpec`], which would strip anything richer, such as another
+/// tool's comment.
+pub fn is_plain_free_text(annot: &poppler::Annot) -> bool {
+    use glib::object::Cast;
+    use glib::translate::ToGlibPtr;
+    use poppler::prelude::*;
+    let Some(free_text) = annot.downcast_ref::<poppler::AnnotFreeText>() else {
+        return false;
+    };
+    let mut border = 0.0;
+    let has_border = unsafe {
+        poppler::ffi::poppler_annot_get_border_width(annot.to_glib_none().0, &mut border)
+    } != 0;
+    annot.color().is_none()
+        && (!has_border || border <= 0.0)
+        && free_text.callout_line().is_none()
+        && !free_text.has_popup()
+        && free_text.label().is_none_or(|label| label.is_empty())
+}
+
 impl OpenDoc {
+    /// Forgets cached geometry after an edit of page `index`.
+    fn markup_changed(&self, index: i32) {
+        let mut markup = self.markup.borrow_mut();
+        markup.ink.remove(&index);
+        markup.text_rects.remove(&index);
+    }
+
     fn page_annots(&self, index: i32, kind: poppler::AnnotType) -> Vec<poppler::Annot> {
+        self.page_annot_areas(index, kind)
+            .into_iter()
+            .map(|(annot, _)| annot)
+            .collect()
+    }
+
+    /// Annotations with their area as `(x1, y1, x2, y2)` in bottom-origin
+    /// page coordinates. Unlike `Annot::rectangle`, the mapping area honours
+    /// the page's own /Rotate, like the coordinates `add_free_text` writes.
+    fn page_annot_areas(
+        &self,
+        index: i32,
+        kind: poppler::AnnotType,
+    ) -> Vec<(poppler::Annot, (f64, f64, f64, f64))> {
         use glib::translate::{from_glib_none, ToGlibPtr};
         use poppler::prelude::*;
         let Some(page) = self.page(index) else {
@@ -351,11 +463,20 @@ impl OpenDoc {
             .into_iter()
             .filter_map(|mapping| {
                 // The mapping owns an annot reference; retain our own before dropping it.
-                let annot: poppler::Annot = unsafe {
+                let (annot, area): (poppler::Annot, _) = unsafe {
                     let ptr: *mut poppler::ffi::PopplerAnnotMapping = mapping.to_glib_none().0;
-                    from_glib_none((*ptr).annot)
+                    let a = (*ptr).area;
+                    (
+                        from_glib_none((*ptr).annot),
+                        (
+                            a.x1.min(a.x2),
+                            a.y1.min(a.y2),
+                            a.x1.max(a.x2),
+                            a.y1.max(a.y2),
+                        ),
+                    )
                 };
-                (annot.annot_type() == kind).then_some(annot)
+                (annot.annot_type() == kind).then_some((annot, area))
             })
             .collect()
     }
@@ -366,6 +487,18 @@ impl OpenDoc {
                 self.page_annots(index, kind)
                     .into_iter()
                     .map(move |annot| (index, annot))
+            })
+            .collect()
+    }
+
+    /// Embedded text boxes with their specs, in page order.
+    fn free_text_specs(&self, index: i32) -> Vec<(poppler::Annot, FreeTextSpec)> {
+        let (_, height) = self.size(index, 0);
+        self.page_annot_areas(index, poppler::AnnotType::FreeText)
+            .into_iter()
+            .map(|(annot, area)| {
+                let spec = free_text_spec(&annot, area, height);
+                (annot, spec)
             })
             .collect()
     }
@@ -381,6 +514,7 @@ impl OpenDoc {
         }
         let page = self.page(index).ok_or("Page not found")?;
         page.remove_annot(annot);
+        self.markup_changed(index);
         Ok(())
     }
 
@@ -429,60 +563,21 @@ impl OpenDoc {
         annotation.set_font_desc(&mut font);
         annotation.set_font_color(&mut poppler_color(spec.rgb));
         page.add_annot(&annotation);
+        self.markup_changed(index);
         Ok(annotation.upcast())
     }
 
-    /// Reads back what Lector needs to edit or restore an embedded answer.
-    pub fn free_text_spec(&self, index: i32, annot: &poppler::Annot) -> FreeTextSpec {
-        use glib::object::Cast;
-        use poppler::prelude::*;
-        let (_, height) = self.size(index, 0);
-        let area = annot.rectangle();
-        let (x1, x2) = (area.x1().min(area.x2()), area.x1().max(area.x2()));
-        let (y1, y2) = (area.y1().min(area.y2()), area.y1().max(area.y2()));
-        let free_text = annot.downcast_ref::<poppler::AnnotFreeText>();
-        let size = free_text
-            .and_then(|annot| annot.font_desc())
-            .map(|font| unsafe {
-                let ptr = glib::translate::ToGlibPtr::<
-                    *const poppler::ffi::PopplerFontDescription,
-                >::to_glib_none(&font)
-                .0;
-                (*ptr).size_pt
-            })
-            .filter(|size| size.is_finite() && *size > 0.0)
-            .unwrap_or(FREE_TEXT_SIZE);
-        let rgb = free_text
-            .and_then(|annot| annot.font_color())
-            .map(|color| rgb_of(&color))
-            .unwrap_or((0.0, 0.0, 0.0));
-        FreeTextSpec {
-            rect: crate::annotations::DocumentRect {
-                x: x1,
-                y: height - y2,
-                width: x2 - x1,
-                height: y2 - y1,
-            },
-            text: annot.contents().map(|s| s.to_string()).unwrap_or_default(),
-            size,
-            rgb,
-        }
-    }
-
-    /// The topmost embedded answer under a top-origin document point.
+    /// The topmost answer Lector can edit under a top-origin document point.
     pub fn free_text_at(
         &self,
         index: i32,
         x: f64,
         y: f64,
     ) -> Option<(poppler::Annot, FreeTextSpec)> {
-        self.page_annots(index, poppler::AnnotType::FreeText)
+        self.free_text_specs(index)
             .into_iter()
             .rev()
-            .map(|annot| {
-                let spec = self.free_text_spec(index, &annot);
-                (annot, spec)
-            })
+            .filter(|(annot, _)| is_plain_free_text(annot))
             .find(|(_, spec)| {
                 let r = spec.rect;
                 x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height
@@ -492,23 +587,34 @@ impl OpenDoc {
     /// The answer that `spec` describes, for undo after other edits moved
     /// Poppler's objects around.
     pub fn find_free_text(&self, index: i32, spec: &FreeTextSpec) -> Option<poppler::Annot> {
-        self.page_annots(index, poppler::AnnotType::FreeText)
+        self.free_text_specs(index)
             .into_iter()
             .rev()
-            .find(|annot| {
-                let found = self.free_text_spec(index, annot);
+            .find(|(_, found)| {
                 found.text == spec.text
                     && (found.size - spec.size).abs() < 0.01
                     && (found.rect.x - spec.rect.x).abs() < 0.05
                     && (found.rect.y - spec.rect.y).abs() < 0.05
             })
+            .map(|(annot, _)| annot)
     }
 
+    /// Boxes of the answers Lector can edit.
     pub fn free_text_rects(&self, index: i32) -> Vec<crate::annotations::DocumentRect> {
-        self.page_annots(index, poppler::AnnotType::FreeText)
-            .iter()
-            .map(|annot| self.free_text_spec(index, annot).rect)
-            .collect()
+        if let Some(rects) = self.markup.borrow().text_rects.get(&index) {
+            return rects.clone();
+        }
+        let rects = self
+            .free_text_specs(index)
+            .into_iter()
+            .filter(|(annot, _)| is_plain_free_text(annot))
+            .map(|(_, spec)| spec.rect)
+            .collect::<Vec<_>>();
+        self.markup
+            .borrow_mut()
+            .text_rects
+            .insert(index, rects.clone());
+        rects
     }
 
     pub fn ink_annotations(&self) -> Vec<(i32, poppler::Annot)> {
@@ -539,7 +645,16 @@ impl OpenDoc {
     }
 
     /// Ink colour of each stroke returned by [`Self::ink_document_points`].
-    pub fn ink_document_strokes(&self, index: i32) -> Vec<(InkStyle, Vec<(f64, f64)>)> {
+    pub fn ink_document_strokes(&self, index: i32) -> InkStrokes {
+        if let Some(strokes) = self.markup.borrow().ink.get(&index) {
+            return strokes.clone();
+        }
+        let strokes = self.read_ink_strokes(index);
+        self.markup.borrow_mut().ink.insert(index, strokes.clone());
+        strokes
+    }
+
+    fn read_ink_strokes(&self, index: i32) -> InkStrokes {
         use glib::object::Cast;
         use poppler::prelude::*;
         let (_, height) = self.size(index, 0);
@@ -614,6 +729,7 @@ impl OpenDoc {
         }
         let page = self.page(index).ok_or("Page not found")?;
         page.remove_annot(annot);
+        self.markup_changed(index);
         Ok(())
     }
 
@@ -631,26 +747,9 @@ impl OpenDoc {
         Ok(pdf_points)
     }
 
-    /// Writes all strokes and a Rect that covers them. The Rect must be
-    /// updated first: other viewers scale the appearance into it.
-    fn set_ink_paths(&self, index: i32, annot: &poppler::AnnotInk, paths: &[Vec<(f64, f64)>]) {
-        use poppler::prelude::*;
-        let (width, height) = self.size(index, 0);
-        let pad = INK_MAX_WIDTH + 1.0;
-        let (min_x, max_x, min_y, max_y) = bounds(paths.iter().flatten());
-        let mut x1 = (min_x - pad).max(0.0);
-        let mut y1 = (min_y - pad).max(0.0);
-        let mut x2 = (max_x + pad).min(width);
-        let mut y2 = (max_y + pad).min(height);
-        if x2 - x1 < 1.0 {
-            x2 = (x1 + 1.0).min(width);
-            x1 = (x2 - 1.0).max(0.0);
-        }
-        if y2 - y1 < 1.0 {
-            y2 = (y1 + 1.0).min(height);
-            y1 = (y2 - 1.0).max(0.0);
-        }
-        annot.set_rectangle(&mut pdf_rect(x1, y1, x2, y2));
+    /// Writes all strokes. Poppler then sets the Rect to the ink bounds
+    /// widened by the border width, in memory and in saved copies.
+    fn set_ink_paths(annot: &poppler::AnnotInk, paths: &[Vec<(f64, f64)>]) {
         let paths = paths.iter().map(|path| ink_path(path)).collect::<Vec<_>>();
         set_ink_list(annot, &paths);
     }
@@ -679,7 +778,8 @@ impl OpenDoc {
         annotation.set_opacity(1.0);
         annotation.set_flags(poppler::AnnotFlag::PRINT);
         page.add_annot(&annotation);
-        self.set_ink_paths(index, &annotation, &[stroke]);
+        Self::set_ink_paths(&annotation, &[stroke]);
+        self.markup_changed(index);
         Ok(annotation)
     }
 
@@ -693,7 +793,8 @@ impl OpenDoc {
         let stroke = self.ink_pdf_stroke(index, points)?;
         let mut paths = Self::ink_pdf_paths(annot);
         paths.push(stroke);
-        self.set_ink_paths(index, annot, &paths);
+        Self::set_ink_paths(annot, &paths);
+        self.markup_changed(index);
         Ok(())
     }
 
@@ -706,14 +807,25 @@ impl OpenDoc {
             self.remove_ink(index, annot.upcast_ref())?;
             return Ok(true);
         }
-        self.set_ink_paths(index, annot, &paths);
+        Self::set_ink_paths(annot, &paths);
+        self.markup_changed(index);
         Ok(false)
     }
 
+    /// Writes the edited document to `path`. Poppler keeps reading the open
+    /// file while it saves, so writing over it would destroy both; any other
+    /// file is replaced only once the copy is complete.
     pub fn save_filled_copy(&self, path: &Path) -> Result<(), String> {
-        self.document
-            .save(&path_uri(path))
-            .map_err(|e| e.to_string())
+        if crate::persist::same_file(path, &self.path) {
+            return Err("That is the open PDF. Save the copy under a different name.".into());
+        }
+        // Saving through a symlink updates the file it points at.
+        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        crate::persist::replace_file(&target, |temp| {
+            self.document
+                .save(&path_uri(temp))
+                .map_err(|e| e.to_string())
+        })
     }
 
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self, OpenError> {
@@ -788,6 +900,7 @@ impl OpenDoc {
             pdf_version: document.pdf_version_string().map(|s| s.to_string()),
             password: password.map(str::to_string),
             document,
+            markup: Default::default(),
         })
     }
 
@@ -947,7 +1060,17 @@ fn dest_page(doc: &Document, dest: *mut PopplerDest) -> Option<i32> {
 
 #[cfg(test)]
 pub(crate) fn write_test_pdf(name: &str, page_contents: &[&str]) -> PathBuf {
-    write_test_pdf_catalog(name, page_contents, "")
+    write_test_pdf_catalog(name, page_contents, "", "")
+}
+
+/// Like [`write_test_pdf`], with `page_extra` added to every page dictionary.
+#[cfg(test)]
+pub(crate) fn write_test_pdf_pages(
+    name: &str,
+    page_contents: &[&str],
+    page_extra: &str,
+) -> PathBuf {
+    write_test_pdf_catalog(name, page_contents, "", page_extra)
 }
 
 #[cfg(test)]
@@ -960,11 +1083,17 @@ pub(crate) fn write_labeled_test_pdf() -> PathBuf {
             "BT /F1 20 Tf 72 700 Td (arabic one) Tj ET",
         ],
         " /PageLabels << /Nums [ 0 << /S /r >> 2 << /S /D >> ] >>",
+        "",
     )
 }
 
 #[cfg(test)]
-fn write_test_pdf_catalog(name: &str, page_contents: &[&str], catalog_extra: &str) -> PathBuf {
+fn write_test_pdf_catalog(
+    name: &str,
+    page_contents: &[&str],
+    catalog_extra: &str,
+    page_extra: &str,
+) -> PathBuf {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -986,7 +1115,7 @@ fn write_test_pdf_catalog(name: &str, page_contents: &[&str], catalog_extra: &st
     ];
     for i in 0..page_count {
         objects.push(format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font} 0 R >> >> /Contents {} 0 R >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font} 0 R >> >> /Contents {} 0 R{page_extra} >>",
             first_contents + i
         ));
     }
