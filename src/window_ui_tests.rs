@@ -2317,8 +2317,18 @@ fn actual_viewport_resize_reflows_without_frame_polling() {
     // window directly; the viewport then reports its new page size.
     ui.window
         .allocate(before as i32 - 200, ui.window.height(), -1, None);
-    drain_for(&context, 300);
-    let after = ui.inner.borrow().view.view_w;
+    // The next layout pass restores the real surface size, so record the
+    // narrowest width the layout saw. Wait long enough for a resize that a
+    // running view restore deferred.
+    let mut after = before;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+    while after >= before - 100.0 && std::time::Instant::now() < deadline {
+        while context.pending() {
+            context.iteration(false);
+        }
+        after = after.min(ui.inner.borrow().view.view_w);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert!(
         after < before - 100.0,
         "a narrower viewport must reflow: {before} -> {after}"
