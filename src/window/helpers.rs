@@ -794,3 +794,13 @@ pub(crate) enum ViewRestore {
     CurrentPage,
     Location(ViewLocation),
 }
+
+/// Name suggested by Save a Copy. Never the open file's own name, which the
+/// save refuses.
+pub(crate) fn copy_file_name(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy();
+    Some(match path.extension() {
+        Some(ext) => format!("{stem} (copy).{}", ext.to_string_lossy()),
+        None => format!("{stem} (copy)"),
+    })
+}

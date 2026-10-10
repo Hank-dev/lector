@@ -3,7 +3,7 @@ use super::*;
 #[test]
 #[ignore = "requires a GTK display; run separately on one test thread"]
 fn actual_pinch_reuses_raster_until_end() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.Lector.PinchRasterTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -130,7 +130,7 @@ fn dual_zoom_anchor_miss_stays_on_the_nearest_page() {
 #[test]
 #[ignore = "requires a GTK display; run separately on one test thread"]
 fn actual_pinch_commits_small_final_scale() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.Lector.PinchFinalTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -181,7 +181,7 @@ fn actual_pinch_commits_small_final_scale() {
 #[test]
 #[ignore = "requires a GTK display; run separately on one test thread"]
 fn single_to_continuous_restores_late_page_after_allocation() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.Lector.LayoutRestoreTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -222,7 +222,7 @@ fn single_to_continuous_restores_late_page_after_allocation() {
 #[test]
 #[ignore = "requires a GTK display; run separately on one test thread"]
 fn continuous_goto_reaches_page_beyond_stale_adjustment() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.Lector.GotoStaleUpperTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -264,7 +264,7 @@ fn continuous_goto_reaches_page_beyond_stale_adjustment() {
 #[test]
 #[ignore = "requires a GTK display; run separately on one test thread"]
 fn mapped_pinch_ticks_before_end_and_discards_finished_targets() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.Lector.PinchTickTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -350,7 +350,7 @@ fn settle() {
 #[test]
 #[ignore = "requires a GTK display; run separately on one test thread"]
 fn zoom_keeps_visible_page_widgets_after_restore() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.Lector.ZoomVisibilityTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -419,7 +419,7 @@ fn zoom_keeps_visible_page_widgets_after_restore() {
 #[test]
 #[ignore = "requires a GTK display; run separately on one test thread"]
 fn zoom_from_centered_page_preserves_document_focus() {
-    gtk::init().expect("GTK display required");
+    init_test_gtk();
     let app = Application::builder()
         .application_id("org.omarchy.Lector.ZoomCenterTest")
         .flags(gio::ApplicationFlags::NON_UNIQUE)

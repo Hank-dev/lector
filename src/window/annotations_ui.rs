@@ -297,6 +297,43 @@ impl Lector {
             .cloned()
     }
 
+    /// Primary-button release on the pages. `first_was_link` remembers whether
+    /// the first click of a double-click followed a link.
+    pub(crate) fn click_released(&self, n: i32, x: f64, y: f64, first_was_link: &Cell<bool>) {
+        // Edit tools own every click, double-clicks included.
+        if self.draw_mode.get() || self.text_placement.get() {
+            first_was_link.set(false);
+            return;
+        }
+        if n == 1 {
+            let selecting = self
+                .inner
+                .borrow()
+                .view
+                .selection
+                .is_some_and(|s| (s.x2 - s.x1).abs() > 3.0 || (s.y2 - s.y1).abs() > 3.0);
+            if selecting {
+                first_was_link.set(false);
+                return;
+            }
+            if self.activate_note_at(x, y) {
+                first_was_link.set(false);
+            } else {
+                let link = self.activate_link_at(x, y);
+                if !link {
+                    self.target_annotation_at(x, y);
+                }
+                first_was_link.set(link);
+            }
+        } else {
+            let has_link = self.link_at_view(x, y).is_some();
+            if should_toggle_fit(n, has_link, first_was_link.get()) {
+                self.toggle_fit();
+            }
+            first_was_link.set(false);
+        }
+    }
+
     pub(crate) fn activate_note_at(&self, x: f64, y: f64) -> bool {
         let Some(annotation) = self.annotation_at_view(x, y, true) else {
             return false;

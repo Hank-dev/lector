@@ -601,3 +601,35 @@ fn about_copy_names_lector_not_a_generic_toolkit_dialog() {
 fn marks_empty_copy_says_sidecar_storage() {
     assert!(marks_empty_copy().contains("not in the PDF"));
 }
+
+#[test]
+fn save_a_copy_suggests_a_new_name() {
+    assert_eq!(
+        copy_file_name(Path::new("/tmp/Exam form.pdf")).as_deref(),
+        Some("Exam form (copy).pdf")
+    );
+    assert_eq!(
+        copy_file_name(Path::new("/tmp/scan")).as_deref(),
+        Some("scan (copy)")
+    );
+}
+
+#[test]
+fn live_stroke_preview_matches_the_full_smoothing() {
+    let points = (0..200)
+        .map(|i| {
+            let t = i as f64 * 0.1;
+            (t * 7.0, (t * 1.3).sin() * 20.0 + (t * 0.4).cos() * 5.0)
+        })
+        .collect::<Vec<_>>();
+    let mut stroke = super::ink::ActiveInk::new(3, points[0]);
+    for (n, &point) in points.iter().enumerate().skip(1) {
+        stroke.push(point);
+        let full = crate::doc::smooth_polyline(&points[..=n]);
+        let preview = stroke.preview();
+        assert_eq!(preview.len(), full.len(), "after {} points", n + 1);
+        for (a, b) in preview.iter().zip(&full) {
+            assert!((a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9);
+        }
+    }
+}

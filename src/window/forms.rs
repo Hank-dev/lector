@@ -263,7 +263,7 @@ impl Lector {
             replaced: Some(spec),
             was_dirty,
         });
-        self.pdf_changed();
+        self.pdf_changed(page);
         true
     }
 
@@ -353,7 +353,7 @@ impl Lector {
                     added: None,
                     replaced: Some(old),
                 });
-                self.pdf_changed();
+                self.pdf_changed(draft.page);
             } else {
                 self.queue_pages_draw();
                 self.update_chrome();
@@ -386,7 +386,7 @@ impl Lector {
                         replaced: draft.replaced,
                     });
                 }
-                self.pdf_changed();
+                self.pdf_changed(draft.page);
                 if unchanged {
                     self.pdf_dirty.set(draft.was_dirty);
                     self.update_chrome();
@@ -420,7 +420,7 @@ impl Lector {
             if let Some(Err(error)) = result {
                 self.alert("Could not restore text", &error);
             }
-            self.pdf_changed();
+            self.pdf_changed(draft.page);
             self.pdf_dirty.set(draft.was_dirty);
         }
         self.queue_pages_draw();
@@ -445,7 +445,9 @@ impl Lector {
         if ctrl {
             match key {
                 Key::v | Key::V if !shift => self.paste_into_draft(),
-                Key::z | Key::Z => self.discard_text_draft(),
+                Key::z | Key::Z if !shift => self.discard_text_draft(),
+                // There is no redo; swallow it rather than run undo.
+                Key::z | Key::Z => {}
                 Key::BackSpace => {
                     self.edit_draft(|d| d.delete_range(d.prev_word(d.cursor), d.cursor))
                 }
@@ -523,16 +525,16 @@ impl Lector {
             });
     }
 
-    pub(crate) fn pdf_changed(&self) {
+    /// The PDF changed on `page`: marks it unsaved and re-renders that page
+    /// and its thumbnail. Its old pixels stay on screen meanwhile.
+    pub(crate) fn pdf_changed(&self, page: i32) {
         self.pdf_dirty.set(true);
         {
             let mut st = self.inner.borrow_mut();
-            st.raster.clear();
-            st.raster_gen = st.raster_gen.wrapping_add(1);
+            st.raster.invalidate_page(page);
             st.view.selection = None;
         }
-        self.raster_pending.borrow_mut().clear();
-        self.rebuild_sidebar();
+        self.refresh_thumb(page);
         self.queue_pages_draw();
         self.ensure_visible_rasters();
         self.update_chrome();
@@ -645,7 +647,7 @@ impl Lector {
                         let value = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
                         field.text_set_text(&value);
                         if let Some(ui) = h.get() {
-                            ui.pdf_changed();
+                            ui.pdf_changed(page);
                         }
                     });
                     body.append(&text);
@@ -663,7 +665,7 @@ impl Lector {
                         }
                         field.text_set_text(&entry.text());
                         if let Some(ui) = h.get() {
-                            ui.pdf_changed();
+                            ui.pdf_changed(page);
                         }
                     });
                     body.append(&entry);
@@ -690,7 +692,7 @@ impl Lector {
                         }
                         field.button_set_state(button.is_active());
                         if let Some(ui) = h.get() {
-                            ui.pdf_changed();
+                            ui.pdf_changed(page);
                         }
                     });
                     body.append(&button);
@@ -715,7 +717,7 @@ impl Lector {
                                     field.choice_toggle_item(i as i32);
                                 }
                                 if let Some(ui) = h.get() {
-                                    ui.pdf_changed();
+                                    ui.pdf_changed(page);
                                 }
                             });
                             body.append(&button);
@@ -742,7 +744,7 @@ impl Lector {
                                 selected_field.choice_select_item(drop.selected() as i32);
                             }
                             if let Some(ui) = selected_h.get() {
-                                ui.pdf_changed();
+                                ui.pdf_changed(page);
                             }
                         });
                         body.append(&drop);
@@ -757,7 +759,7 @@ impl Lector {
                                 }
                                 field.choice_set_text(&entry.text());
                                 if let Some(ui) = h.get() {
-                                    ui.pdf_changed();
+                                    ui.pdf_changed(page);
                                 }
                             });
                             body.append(&entry);

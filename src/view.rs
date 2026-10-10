@@ -277,6 +277,8 @@ pub struct RasterCache {
     map: HashMap<RasterKey, ImageSurface>,
     lru: VecDeque<RasterKey>,
     cap: usize,
+    /// Outdated pixels of edited pages, shown until a new render lands.
+    stale: HashMap<i32, (RasterKey, ImageSurface)>,
 }
 
 impl RasterCache {
@@ -285,6 +287,7 @@ impl RasterCache {
             map: HashMap::new(),
             lru: VecDeque::new(),
             cap: cap.max(1),
+            stale: HashMap::new(),
         }
     }
 
@@ -295,18 +298,36 @@ impl RasterCache {
     }
 
     pub fn get_page(&mut self, wanted: &RasterKey) -> Option<(ImageSurface, i32)> {
-        let key = self
+        let compatible = |key: &RasterKey| {
+            key.index == wanted.index
+                && key.pdf_mode == wanted.pdf_mode
+                && key.palette == wanted.palette
+        };
+        let delta = |key: &RasterKey| (wanted.rotation - key.rotation).rem_euclid(360);
+        if let Some(key) = self.lru.iter().rev().find(|key| compatible(key)).copied() {
+            return self.get(&key).map(|surface| (surface, delta(&key)));
+        }
+        let (key, surface) = self.stale.get(&wanted.index)?;
+        compatible(key).then(|| (surface.clone(), delta(key)))
+    }
+
+    /// Drops a page's rasters after its content changed. The newest stays
+    /// available to `get_page` until a new raster of the page is inserted, so
+    /// the page does not blank while it re-renders.
+    pub fn invalidate_page(&mut self, index: i32) {
+        if let Some(key) = self
             .lru
             .iter()
             .rev()
-            .find(|key| {
-                key.index == wanted.index
-                    && key.pdf_mode == wanted.pdf_mode
-                    && key.palette == wanted.palette
-            })
-            .copied()?;
-        self.get(&key)
-            .map(|surface| (surface, (wanted.rotation - key.rotation).rem_euclid(360)))
+            .find(|key| key.index == index)
+            .copied()
+        {
+            if let Some(surface) = self.map.get(&key) {
+                self.stale.insert(index, (key, surface.clone()));
+            }
+        }
+        self.map.retain(|key, _| key.index != index);
+        self.lru.retain(|key| key.index != index);
     }
 
     pub fn contains(&self, key: &RasterKey) -> bool {
@@ -315,6 +336,7 @@ impl RasterCache {
 
     pub fn insert(&mut self, key: RasterKey, surf: ImageSurface) {
         use std::collections::hash_map::Entry;
+        self.stale.remove(&key.index);
         match self.map.entry(key) {
             Entry::Occupied(mut occupied) => {
                 occupied.insert(surf);
@@ -336,6 +358,7 @@ impl RasterCache {
     pub fn clear(&mut self) {
         self.map.clear();
         self.lru.clear();
+        self.stale.clear();
     }
 
     fn touch(&mut self, key: &RasterKey) {
@@ -1914,6 +1937,42 @@ mod tests {
                 ..key
             })
             .is_none());
+    }
+
+    #[test]
+    fn edited_page_keeps_old_pixels_until_it_re_renders() {
+        let mut cache = RasterCache::new(4);
+        let key = RasterKey {
+            index: 3,
+            width: 10,
+            height: 10,
+            rotation: 0,
+            pdf_mode: PdfMode::Normal,
+            palette: PdfPalette::default(),
+        };
+        let other = RasterKey { index: 4, ..key };
+        let surf = |w| ImageSurface::create(Format::ARgb32, w, 10).expect("surface");
+        cache.insert(key, surf(10));
+        cache.insert(other, surf(10));
+        cache.invalidate_page(3);
+        assert!(!cache.contains(&key), "the edited page must re-render");
+        assert!(cache.contains(&other), "other pages keep their rasters");
+        assert_eq!(
+            cache.get_page(&key).map(|(s, _)| s.width()),
+            Some(10),
+            "old pixels stay on screen meanwhile"
+        );
+        assert!(cache
+            .get_page(&RasterKey {
+                pdf_mode: PdfMode::Inverted,
+                ..key
+            })
+            .is_none());
+        cache.insert(RasterKey { width: 20, ..key }, surf(20));
+        assert_eq!(cache.get_page(&key).map(|(s, _)| s.width()), Some(20));
+        cache.invalidate_page(3);
+        cache.clear();
+        assert!(cache.get_page(&key).is_none());
     }
 
     #[test]

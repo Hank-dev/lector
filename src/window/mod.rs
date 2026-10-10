@@ -145,6 +145,24 @@ impl Handle {
     }
 }
 
+/// GTK for window tests. They present windows and dialogs, so they run on
+/// GTK's headless Broadway backend unless LECTOR_TEST_ON_DESKTOP=1 opts in
+/// to windows on the desktop.
+#[cfg(test)]
+pub(crate) fn init_test_gtk() {
+    gtk::init().expect("GTK display required");
+    if std::env::var_os("LECTOR_TEST_ON_DESKTOP").is_some_and(|v| v == "1") {
+        return;
+    }
+    let backend = gdk::Display::default().map(|display| display.type_().name().to_string());
+    assert_eq!(
+        backend.as_deref(),
+        Some("GdkBroadwayDisplay"),
+        "window tests open windows: start `gtk4-broadwayd :7` and run them with \
+         GDK_BACKEND=broadway BROADWAY_DISPLAY=:7 (or set LECTOR_TEST_ON_DESKTOP=1)"
+    );
+}
+
 #[cfg(test)]
 #[path = "../window_ui_tests.rs"]
 mod ui_tests;
