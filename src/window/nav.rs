@@ -106,7 +106,17 @@ impl Lector {
     }
 
     pub(crate) fn goto_page_rel(&self, delta: i32) {
-        let page = self.inner.borrow().view.page + delta;
+        let page = {
+            let st = self.inner.borrow();
+            let n_pages = st.view.doc.as_ref().map_or(0, |doc| doc.n_pages);
+            crate::view::page_step(
+                st.view.layout_mode,
+                st.view.page,
+                delta,
+                n_pages,
+                st.view.dual_cover,
+            )
+        };
         self.goto_page(page);
     }
 
@@ -265,6 +275,7 @@ impl Lector {
         self.raster_pending.borrow_mut().clear();
         drop(st);
         self.reflow();
+        self.refresh_all_thumbs();
     }
 
     pub(crate) fn toggle_fullscreen(&self) {
@@ -687,15 +698,24 @@ impl Lector {
         self.ensure_visible_rasters();
     }
 
-    /// Drops the thumbnail of an edited page; the visible ones are filled
+    /// Drops the thumbnail of a changed page; the visible ones are filled
     /// again now, others when the thumbnails are shown.
     pub(crate) fn refresh_thumb(&self, page: i32) {
-        let Some(col) = self.thumbs.row_at_index(page).and_then(|row| row.child()) else {
-            return;
-        };
-        if let Some(picture) = col.first_child().filter(|child| child.is::<gtk::Picture>()) {
-            if let Some(column) = col.downcast_ref::<GtkBox>() {
-                column.remove(&picture);
+        if let Some(row) = self.thumbs.row_at_index(page) {
+            drop_thumb_picture(&row);
+        }
+        if self.inner.borrow().pane.sidebar == Sidebar::Thumbs {
+            self.schedule_thumbs();
+        }
+    }
+
+    /// Like [`Self::refresh_thumb`] for every page, e.g. after a rotation.
+    pub(crate) fn refresh_all_thumbs(&self) {
+        let mut child = self.thumbs.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
+                drop_thumb_picture(&row);
             }
         }
         if self.inner.borrow().pane.sidebar == Sidebar::Thumbs {
@@ -761,6 +781,7 @@ impl Lector {
                     page,
                     THUMB_CSS_WIDTH,
                     dpr,
+                    st.view.rotation,
                     pdf_mode,
                     st.theme.pdf_palette(),
                 )
@@ -791,6 +812,18 @@ impl Lector {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Removes a thumbnail row's picture so the fill pass renders it again.
+fn drop_thumb_picture(row: &gtk::ListBoxRow) {
+    let Some(col) = row.child() else {
+        return;
+    };
+    if let Some(picture) = col.first_child().filter(|child| child.is::<gtk::Picture>()) {
+        if let Some(column) = col.downcast_ref::<GtkBox>() {
+            column.remove(&picture);
         }
     }
 }

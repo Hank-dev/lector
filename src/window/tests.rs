@@ -633,3 +633,16 @@ fn live_stroke_preview_matches_the_full_smoothing() {
         }
     }
 }
+
+#[test]
+fn search_snippet_survives_case_folding_that_changes_byte_length() {
+    // U+212B ANGSTROM SIGN and U+212A KELVIN SIGN shrink when lower-cased;
+    // U+0130 grows. Byte offsets in the folded text must not cut the original.
+    assert!(search_snippet("1.5 \u{212B}, résumé", "sum", false).contains("résumé"));
+    assert!(search_snippet("300 \u{212A} in résumé", "RÉSUMÉ", false).contains("in résumé"));
+    assert!(
+        search_snippet("\u{130}stanbul ẞtraße needle", "needle", false)
+            .starts_with("ẞtraße needle")
+    );
+    assert!(search_snippet("\u{212B}ngstrom unit", "\u{e5}ngstrom", false).starts_with('\u{212B}'));
+}

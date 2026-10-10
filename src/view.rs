@@ -102,6 +102,8 @@ pub const VIEW_PAGE_PAD: f64 = 400.0;
 pub const THUMB_CSS_WIDTH: f64 = 180.0;
 pub const MAX_RASTER_EDGE: i32 = 4096;
 pub const SEARCH_HIT_MARGIN: f64 = 24.0;
+/// Page rasters kept at least, besides the pages near the view.
+pub const RASTER_CACHE_PAGES: usize = 12;
 
 pub fn dual_spread(current: i32, n_pages: i32, cover: bool) -> (i32, i32) {
     if n_pages <= 0 {
@@ -117,6 +119,25 @@ pub fn dual_spread(current: i32, n_pages: i32, cover: bool) -> (i32, i32) {
     }
     let a = current - (current % 2);
     (a, (a + 1).min(n_pages - 1))
+}
+
+/// The page `delta` steps from `current`. In Dual layout a step is a whole
+/// spread, and the result is the spread's first page.
+pub fn page_step(mode: LayoutMode, current: i32, delta: i32, n_pages: i32, cover: bool) -> i32 {
+    if mode != LayoutMode::Dual || n_pages <= 0 {
+        return current + delta;
+    }
+    let mut page = dual_spread(current, n_pages, cover).0;
+    for _ in 0..delta.unsigned_abs() {
+        let (first, last) = dual_spread(page, n_pages, cover);
+        let next = if delta > 0 {
+            (last + 1).min(n_pages - 1)
+        } else {
+            (first - 1).max(0)
+        };
+        page = dual_spread(next, n_pages, cover).0;
+    }
+    page
 }
 
 pub fn pages_intersecting_view(
@@ -328,6 +349,17 @@ impl RasterCache {
         }
         self.map.retain(|key, _| key.index != index);
         self.lru.retain(|key| key.index != index);
+    }
+
+    /// Sets how many rasters are kept, dropping the least recently used.
+    pub fn set_capacity(&mut self, cap: usize) {
+        self.cap = cap.max(1);
+        while self.map.len() > self.cap {
+            let Some(old) = self.lru.pop_front() else {
+                break;
+            };
+            self.map.remove(&old);
+        }
     }
 
     pub fn contains(&self, key: &RasterKey) -> bool {
@@ -603,13 +635,15 @@ impl Layout {
                 } else {
                     (0.0, 0.0)
                 };
-                let pair_w = aw + if b != a { bw + PAGE_GAP } else { 0.0 };
-                let pair_h = ah.max(bh);
+                // The gap between the pages stays PAGE_GAP on screen at any
+                // scale, so fit the pages into the width that is left. One
+                // more pixel absorbs rounding each page size up.
+                let gap = if b != a { PAGE_GAP + 1.0 } else { 0.0 };
                 let scale = scale_for(
                     zoom,
-                    pair_w,
-                    pair_h,
-                    view_w - PAGE_PAD * 2.0,
+                    aw + bw,
+                    ah.max(bh),
+                    view_w - PAGE_PAD * 2.0 - gap,
                     view_h - PAGE_PAD * 2.0,
                 );
                 let aw_s = snap_size(aw * scale);
@@ -1169,38 +1203,45 @@ pub fn pdf_rect_to_view(
     )
 }
 
-pub fn search_hit_scroll_y(
+/// Scroll offset along one axis that shows `start..end` in a view of length
+/// `len` at offset `pos`: unchanged when it is already inside the margins,
+/// otherwise centred, or aligned to the start when it does not fit. Centring
+/// keeps a hit visible when the find bar's results list grows afterwards.
+pub fn scroll_into_view(start: f64, end: f64, pos: f64, len: f64, margin: f64) -> f64 {
+    let len = len.max(1.0);
+    let margin = margin.max(0.0);
+    if start >= pos + margin && end <= pos + len - margin {
+        return pos.max(0.0);
+    }
+    if end - start + margin * 2.0 >= len {
+        return (start - margin).max(0.0);
+    }
+    ((start + end - len) * 0.5).max(0.0)
+}
+
+/// Content scroll position `(x, y)` that shows search hit `rect` on `page`,
+/// for a view `(x, y, width, height)`. None while the layout lacks the page.
+pub fn search_hit_scroll(
     pages: &[PageGeom],
     doc: &OpenDoc,
     rotation: i32,
     page: i32,
     rect: &Rectangle,
-    view: (f64, f64),
+    view: (f64, f64, f64, f64),
     margin: f64,
-) -> f64 {
-    let (view_top, view_h) = view;
-    let Some(geom) = pages.iter().copied().find(|geom| geom.index == page) else {
-        return page_scroll_y(pages, page);
-    };
+) -> Option<(f64, f64)> {
+    let geom = pages.iter().copied().find(|geom| geom.index == page)?;
     let local = PageGeom {
         x: 0.0,
         y: 0.0,
         ..geom
     };
-    let (_, y, _, height) = pdf_rect_to_view(&local, doc, rotation, rect);
-    let hit_top = geom.y + y;
-    let hit_bottom = hit_top + height;
-    let view_h = view_h.max(1.0);
-    let margin = margin.max(0.0);
-    let visible_top = view_top + margin;
-    let visible_bottom = view_top + view_h - margin;
-    if hit_top >= visible_top && hit_bottom <= visible_bottom {
-        return view_top.max(0.0);
-    }
-    if hit_top < visible_top || height + margin * 2.0 >= view_h {
-        return hit_top.max(0.0) - margin.min(hit_top.max(0.0));
-    }
-    (hit_bottom + margin - view_h).max(0.0)
+    let (x, y, width, height) = pdf_rect_to_view(&local, doc, rotation, rect);
+    let (view_x, view_y, view_w, view_h) = view;
+    Some((
+        scroll_into_view(geom.x + x, geom.x + x + width, view_x, view_w, margin),
+        scroll_into_view(geom.y + y, geom.y + y + height, view_y, view_h, margin),
+    ))
 }
 
 pub fn thumbnail_pixel_size(page_w: f64, page_h: f64, css_width: f64, dpr: f64) -> (i32, i32) {
@@ -1218,25 +1259,29 @@ pub fn thumbnail_css_size(page_w: f64, page_h: f64, css_width: f64) -> (i32, i32
     thumbnail_pixel_size(page_w, page_h, css_width, 1.0)
 }
 
+/// A page thumbnail as the main view shows it, including the view rotation.
 pub fn thumbnail(
     doc: &OpenDoc,
     index: i32,
     css_width: f64,
     dpr: f64,
+    rotation: i32,
     pdf_mode: PdfMode,
     palette: PdfPalette,
 ) -> Option<ImageSurface> {
     let page = doc.page(index)?;
     let (pw, ph) = page.size();
-    let (w, h) = thumbnail_pixel_size(pw, ph, css_width, dpr);
+    let (dw, dh) = print_content_size(pw, ph, rotation);
+    let (w, h) = thumbnail_pixel_size(dw, dh, css_width, dpr);
     let mut surf = ImageSurface::create(Format::ARgb32, w, h).ok()?;
     {
         let cr = Context::new(&surf).ok()?;
         cr.set_source_rgb(1.0, 1.0, 1.0);
         cr.paint().ok()?;
-        let scale = w as f64 / pw.max(1.0);
-        cr.scale(scale, scale);
+        cr.save().ok()?;
+        apply_print_page_transform(&cr, pw, ph, rotation, w as f64, h as f64);
         page.render(&cr);
+        cr.restore().ok()?;
         if pdf_mode == PdfMode::Inverted {
             cr.set_operator(Operator::Difference);
             cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -1805,12 +1850,134 @@ mod tests {
         bottom.set_y1(20.0);
         bottom.set_x2(172.0);
         bottom.set_y2(40.0);
-        let y = search_hit_scroll_y(&stacked, &doc, 0, 0, &bottom, (0.0, 400.0), 24.0);
+        let (_, y) = search_hit_scroll(
+            &stacked,
+            &doc,
+            0,
+            0,
+            &bottom,
+            (0.0, 0.0, 200.0, 400.0),
+            24.0,
+        )
+        .unwrap();
         assert!(
             y > stacked[0].y + 100.0,
             "a hit near the page bottom must scroll past page top, got {y}"
         );
+        assert!(
+            search_hit_scroll(
+                &stacked,
+                &doc,
+                0,
+                1,
+                &bottom,
+                (0.0, 0.0, 200.0, 400.0),
+                24.0
+            )
+            .is_none(),
+            "a page outside the layout has no position yet"
+        );
         std::fs::remove_file(path).expect("remove test PDF");
+    }
+
+    #[test]
+    fn fitted_dual_spreads_fit_the_viewport_at_any_scale() {
+        let path = crate::doc::write_test_pdf("dual-fit", &["", "", ""]);
+        let doc = OpenDoc::open(&path, None).expect("open test PDF");
+        for zoom in [Zoom::FitWidth, Zoom::FitPage] {
+            for view_w in [500.0, 800.0, 1000.0, 1234.0, 2400.0] {
+                let layout =
+                    Layout::compute(&doc, LayoutMode::Dual, zoom, 0, 0, view_w, 5000.0, false);
+                let (content_w, _) = layout_content_size(&layout.pages);
+                assert!(
+                    content_w <= view_w && content_w >= view_w - 3.0,
+                    "{zoom:?} at {view_w}: spread is {content_w} wide"
+                );
+                assert_eq!(
+                    layout.pages[1].x - layout.pages[0].x - layout.pages[0].w,
+                    PAGE_GAP
+                );
+            }
+        }
+        std::fs::remove_file(path).expect("remove test PDF");
+    }
+
+    #[test]
+    fn thumbnails_follow_the_view_rotation() {
+        // A dark square in the page's top-left corner.
+        let path = crate::doc::write_test_pdf("thumb-rotation", &["0 g 0 692 100 100 re f"]);
+        let doc = OpenDoc::open(&path, None).expect("open test PDF");
+        let dark = |surface: &mut ImageSurface, x: i32, y: i32| {
+            let stride = surface.stride() as usize;
+            let data = surface.data().expect("thumbnail pixels");
+            data[y as usize * stride + x as usize * 4] < 128
+        };
+        for (rotation, corner) in [(0, (0, 0)), (90, (1, 0)), (180, (1, 1)), (270, (0, 1))] {
+            let mut thumb = thumbnail(
+                &doc,
+                0,
+                120.0,
+                1.0,
+                rotation,
+                PdfMode::Normal,
+                PdfPalette::default(),
+            )
+            .expect("thumbnail");
+            let (w, h) = (thumb.width(), thumb.height());
+            assert_eq!(w > h, rotation % 180 != 0, "rotation {rotation}: {w}x{h}");
+            let at = |(cx, cy): (i32, i32)| {
+                (
+                    if cx == 0 { 3 } else { w - 4 },
+                    if cy == 0 { 3 } else { h - 4 },
+                )
+            };
+            let (x, y) = at(corner);
+            assert!(
+                dark(&mut thumb, x, y),
+                "rotation {rotation}: square not at {corner:?}"
+            );
+            let (x, y) = at((1 - corner.0, 1 - corner.1));
+            assert!(
+                !dark(&mut thumb, x, y),
+                "rotation {rotation}: opposite corner dark"
+            );
+        }
+        std::fs::remove_file(path).expect("remove test PDF");
+    }
+
+    #[test]
+    fn dual_layout_steps_by_whole_spreads() {
+        let next = |page, cover| page_step(LayoutMode::Dual, page, 1, 7, cover);
+        let prev = |page, cover| page_step(LayoutMode::Dual, page, -1, 7, cover);
+        assert_eq!(next(0, false), 2);
+        assert_eq!(next(1, false), 2, "from the right-hand page too");
+        assert_eq!(next(6, false), 6, "the last spread stays");
+        assert_eq!(prev(3, false), 0);
+        assert_eq!(prev(0, false), 0);
+        assert_eq!(next(0, true), 1, "the cover is a spread of its own");
+        assert_eq!(next(1, true), 3);
+        assert_eq!(next(2, true), 3);
+        assert_eq!(prev(3, true), 1);
+        assert_eq!(prev(1, true), 0);
+        assert_eq!(page_step(LayoutMode::Dual, 0, 2, 7, false), 4);
+        assert_eq!(page_step(LayoutMode::Single, 4, 1, 7, false), 5);
+        assert_eq!(page_step(LayoutMode::Continuous, 4, -1, 7, false), 3);
+    }
+
+    #[test]
+    fn hits_outside_the_view_are_centred_on_both_axes() {
+        // Inside the margins: no scrolling.
+        assert_eq!(scroll_into_view(150.0, 170.0, 100.0, 400.0, 24.0), 100.0);
+        // Below the view: centred, so a list growing under the find bar
+        // (up to 148 px) cannot hide it.
+        let y = scroll_into_view(900.0, 920.0, 100.0, 400.0, 24.0);
+        assert_eq!(y, 710.0);
+        assert!(910.0 - y < 400.0 - 148.0);
+        // Right of a zoomed-in page: scrolled horizontally too.
+        assert_eq!(scroll_into_view(1500.0, 1600.0, 0.0, 800.0, 24.0), 1150.0);
+        // Larger than the view: aligned to its start.
+        assert_eq!(scroll_into_view(500.0, 1000.0, 0.0, 300.0, 24.0), 476.0);
+        assert_eq!(scroll_into_view(10.0, 20.0, 500.0, 300.0, 24.0), 0.0);
     }
 
     fn stacked_pages(count: i32, height: f64) -> Vec<PageGeom> {
@@ -2001,6 +2168,11 @@ mod tests {
         assert!(cache.get(&c).is_some());
         cache.clear();
         assert!(cache.get(&b).is_none());
+        cache.insert(a, surf());
+        cache.insert(b, surf());
+        cache.set_capacity(1);
+        assert!(!cache.contains(&a), "shrinking drops the oldest");
+        assert!(cache.contains(&b));
     }
 
     #[test]

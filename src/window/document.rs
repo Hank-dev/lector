@@ -9,6 +9,15 @@ impl Lector {
                 &format!("{error}\n\nThe annotation file will not be modified."),
             );
         }
+        if let Some(error) = self.inner.borrow().session_error.clone() {
+            self.alert(
+                "Could not load reading history",
+                &format!(
+                    "{error}\n\nThe session file will not be modified. Fix or remove it to save \
+                     reading positions again."
+                ),
+            );
+        }
         self.pages_box.grab_focus();
         let h = Handle(self.me.borrow().clone());
         glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
@@ -730,35 +739,46 @@ impl Lector {
     }
 
     pub(crate) fn persist(&self) {
-        let result = {
-            let mut st = self.inner.borrow_mut();
-            let remember = st
-                .view
-                .doc
-                .as_ref()
-                .map(|d| (d.path.clone(), st.view.page, st.view.zoom, st.view.rotation));
-            if let Some((path, page, zoom, rotation)) = remember {
-                remember_document_state(&mut st.session, &path, page, zoom, rotation);
-            }
-            st.session.invert = st.view.pdf_mode == PdfMode::Inverted;
-            st.session.pdf_mode = st.view.pdf_mode.key().into();
-            st.session.layout = match st.view.layout_mode {
-                LayoutMode::Single => "single".into(),
-                LayoutMode::Dual => "dual".into(),
-                LayoutMode::Continuous => "continuous".into(),
-            };
-            st.session.dual_cover = st.view.dual_cover;
-            st.session.sidebar = match st.pane.sidebar {
-                Sidebar::Hidden => "hidden".into(),
-                Sidebar::Thumbs => "thumbs".into(),
-                Sidebar::Outline => "outline".into(),
-                Sidebar::Marks => "marks".into(),
-            };
-            st.session.save()
-        };
+        self.record_view_in_session();
+        let result = self.inner.borrow_mut().session.save();
         if let Err(error) = result {
             self.alert("Could not save session", &error);
         }
+    }
+
+    /// Copies the view into the session. During a presentation that is the
+    /// view it returns to, not its temporary single-page, fit-page layout.
+    pub(crate) fn record_view_in_session(&self) {
+        let mut st = self.inner.borrow_mut();
+        let st = &mut *st;
+        let (layout, zoom, sidebar) = st.pres_restore.filter(|_| st.presentation).unwrap_or((
+            st.view.layout_mode,
+            st.view.zoom,
+            st.pane.sidebar,
+        ));
+        if let Some(doc) = st.view.doc.as_ref() {
+            remember_document_state(
+                &mut st.session,
+                &doc.path,
+                st.view.page,
+                zoom,
+                st.view.rotation,
+            );
+        }
+        st.session.invert = st.view.pdf_mode == PdfMode::Inverted;
+        st.session.pdf_mode = st.view.pdf_mode.key().into();
+        st.session.layout = match layout {
+            LayoutMode::Single => "single".into(),
+            LayoutMode::Dual => "dual".into(),
+            LayoutMode::Continuous => "continuous".into(),
+        };
+        st.session.dual_cover = st.view.dual_cover;
+        st.session.sidebar = match sidebar {
+            Sidebar::Hidden => "hidden".into(),
+            Sidebar::Thumbs => "thumbs".into(),
+            Sidebar::Outline => "outline".into(),
+            Sidebar::Marks => "marks".into(),
+        };
     }
 
     pub(crate) fn reload_theme(&self) {

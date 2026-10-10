@@ -32,10 +32,10 @@ use crate::view::{
     layout_content_size, page_alloc_size, page_in_view, page_paint_size, page_scroll_y,
     pages_intersecting_view, paint_free_text_draft, paint_free_text_frames, paint_ink_polyline,
     paint_raster, preview_rgb, print_content_size, raster_cache_needs_clear,
-    raster_cache_needs_reset, raster_idle_is_stale, raster_page, search_hit_scroll_y,
-    selected_text, selection_highlight_rects, thumbnail, thumbnail_css_size, AnnotationDrawing,
-    Layout, LayoutMode, PageDrawing, PdfMode, RasterCache, RasterKey, Selection, TextPreview, Zoom,
-    MAX_ZOOM, SEARCH_HIT_MARGIN, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
+    raster_cache_needs_reset, raster_idle_is_stale, raster_page, search_hit_scroll, selected_text,
+    selection_highlight_rects, thumbnail, thumbnail_css_size, AnnotationDrawing, Layout,
+    LayoutMode, PageDrawing, PdfMode, RasterCache, RasterKey, Selection, TextPreview, Zoom,
+    MAX_ZOOM, RASTER_CACHE_PAGES, SEARCH_HIT_MARGIN, THUMB_CSS_WIDTH, VIEW_PAGE_PAD,
 };
 
 mod annotations_ui;

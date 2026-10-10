@@ -20,6 +20,10 @@ impl Lector {
             Ok(store) => (Some(store), None),
             Err(error) => (None, Some(error)),
         };
+        let (session, session_error) = match Session::load() {
+            Ok(session) => (session, None),
+            Err(error) => (Session::default(), Some(error)),
+        };
 
         let inner = Rc::new(RefCell::new(Inner {
             view: ViewState::new(),
@@ -28,7 +32,8 @@ impl Lector {
             presentation: false,
             toolbar_hidden: false,
             theme,
-            session: Session::load(),
+            session,
+            session_error,
             annotations,
             annotation_error,
             ignore_zoom_dropdown: false,
@@ -37,7 +42,7 @@ impl Lector {
             layout_gen: 0,
             thumb_gen: 0,
             pres_restore: None,
-            raster: RasterCache::new(12),
+            raster: RasterCache::new(RASTER_CACHE_PAGES),
             raster_gen: 0,
             navigation: NavigationHistory::default(),
         }));
@@ -636,30 +641,35 @@ impl Lector {
                     let last = last.clone();
                     let pending = pending.clone();
                     let sw = sw.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
-                        pending.set(false);
+                    let mut tries = 0_u8;
+                    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
                         let sz = (sw.width(), sw.height());
-                        if allocation_changed(last.get(), sz) {
-                            last.set(sz);
-                            if let Some(ui) = h.get() {
-                                ui.on_resize(sz.0 as f64, sz.1 as f64);
-                            }
+                        let applied = !allocation_changed(last.get(), sz)
+                            || h.get()
+                                .is_none_or(|ui| ui.on_resize(sz.0 as f64, sz.1 as f64));
+                        tries = tries.saturating_add(1);
+                        // A view restore defers resizes; retry until it ends
+                        // instead of losing this size (about one second).
+                        if !applied && tries < 60 {
+                            return glib::ControlFlow::Continue;
                         }
+                        if applied {
+                            last.set(sz);
+                        }
+                        pending.set(false);
+                        glib::ControlFlow::Break
                     });
                 }
             };
-            // GtkScrolledWindow has no width/height GObject properties.  A
-            // tick sees its allocated size, including changes caused by the
-            // sidebar and find bar, and the timeout above coalesces reflows.
-            scrolled.add_tick_callback({
-                let last = last.clone();
-                move |sw, _| {
-                    if allocation_changed(last.get(), (sw.width(), sw.height())) {
-                        schedule();
-                    }
-                    glib::ControlFlow::Continue
-                }
-            });
+            // GtkScrolledWindow has no width/height GObject properties, but
+            // its viewport sets each adjustment's page size to its allocated
+            // size, including changes caused by the sidebar and find bar. The
+            // timeout above coalesces reflows; no per-frame polling is needed.
+            let schedule = std::rc::Rc::new(schedule);
+            for adjustment in [scrolled.hadjustment(), scrolled.vadjustment()] {
+                let schedule = schedule.clone();
+                adjustment.connect_page_size_notify(move |_| (*schedule)());
+            }
         }
         scrolled.vadjustment().connect_value_changed({
             let h = h.clone();

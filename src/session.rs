@@ -72,17 +72,10 @@ impl Default for FileState {
 }
 
 impl Session {
-    pub fn load() -> Self {
-        Self::load_or_default(&session_path(), &legacy_session_path())
-    }
-
-    /// Startup cannot fail. An unreadable session starts empty in memory, and
-    /// the file stays untouched because every save refuses to replace it.
-    fn load_or_default(path: &Path, legacy_path: &Path) -> Self {
-        Self::load_from_paths(path, legacy_path).unwrap_or_else(|error| {
-            eprintln!("lector: {error}; starting with an empty session");
-            Self::default()
-        })
+    /// An unreadable session is an error; the caller starts empty in memory,
+    /// and the file stays untouched because every save refuses to replace it.
+    pub fn load() -> Result<Self, String> {
+        Self::load_from_paths(&session_path(), &legacy_session_path())
     }
 
     /// The effective session is the Lector file, or the legacy omadoc file
@@ -626,7 +619,7 @@ custom = 1.0
             };
             assert!(error.contains(&path.display().to_string()), "{error}");
 
-            let mut fresh = Session::load_or_default(&path, &missing_legacy);
+            let mut fresh = Session::load_from_paths(&path, &missing_legacy).unwrap_or_default();
             assert!(fresh.files.is_empty(), "{name}");
             fresh.remember(Path::new("/documents/c.pdf"), 0, Zoom::Actual);
             fresh.sidebar = "outline".into();
@@ -646,7 +639,7 @@ custom = 1.0
         let new_path = test_path("corrupt-lector");
         let corrupt = "files = \"not a table\"\n";
         fs::write(&legacy_path, corrupt).unwrap();
-        let mut session = Session::load_or_default(&new_path, &legacy_path);
+        let mut session = Session::load_from_paths(&new_path, &legacy_path).unwrap_or_default();
         assert!(session.files.is_empty());
         session.remember(Path::new("/documents/c.pdf"), 0, Zoom::Actual);
         assert!(session.save_migrating(&new_path, &legacy_path).is_err());

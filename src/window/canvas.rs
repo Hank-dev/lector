@@ -180,9 +180,11 @@ impl Lector {
         }
     }
 
-    pub(crate) fn on_resize(&self, w: f64, h: f64) {
+    /// Reflows for a new viewport size. Returns false when the size was not
+    /// taken because a view restore is running; the caller retries later.
+    pub(crate) fn on_resize(&self, w: f64, h: f64) -> bool {
         if !viewport_resize_should_reflow(self.inner.borrow().ignore_scroll) {
-            return;
+            return false;
         }
         let changed = {
             let mut st = self.inner.borrow_mut();
@@ -196,6 +198,7 @@ impl Lector {
         if changed {
             self.reflow();
         }
+        true
     }
 
     pub(crate) fn on_scroll(&self) {
@@ -205,7 +208,7 @@ impl Lector {
         }
         if st.view.layout_mode == LayoutMode::Continuous && st.view.doc.is_some() {
             drop(st);
-            self.sync_visible_page_widgets();
+            self.sync_page_widgets(false);
             let page = page_in_view(
                 &self.inner.borrow().view.layout.pages,
                 self.scrolled.vadjustment().value(),
@@ -270,7 +273,11 @@ impl Lector {
         };
         {
             let dpr = self.page_dpr();
-            let st = self.inner.borrow();
+            let mut st = self.inner.borrow_mut();
+            // At small zooms more pages are near the view than the base
+            // capacity holds; evicting them would re-render on every scroll.
+            st.raster
+                .set_capacity(RASTER_CACHE_PAGES.max(needed.len() * 2));
             let mut pending = self.raster_pending.borrow_mut();
             pending.retain(|index| needed.contains(index));
             for index in needed {
@@ -494,12 +501,49 @@ impl Lector {
                     vertical.page_size(),
                 ));
             }
+            ViewRestore::SearchHit(hit) => self.show_search_hit(hit),
         }
         // Adjustment callbacks are suppressed during reflow. Reconcile the
         // virtualized pages explicitly against the restored viewport, not the
         // old scroll position at which the new layout was initially installed.
         self.sync_visible_page_widgets();
         self.ensure_visible_rasters();
+    }
+
+    /// Scrolls both axes so search hit `hit` is visible in the current layout.
+    pub(crate) fn show_search_hit(&self, hit: usize) {
+        let target = {
+            let st = self.inner.borrow();
+            let (Some(doc), Some((page, rect))) = (st.view.doc.as_ref(), st.search.hits.get(hit))
+            else {
+                return;
+            };
+            let (offset_x, offset_y) = self.canvas_center_offset(&st.view.layout.pages);
+            let h = self.scrolled.hadjustment();
+            let v = self.scrolled.vadjustment();
+            search_hit_scroll(
+                &st.view.layout.pages,
+                doc,
+                st.view.rotation,
+                *page,
+                rect,
+                (
+                    h.value() - offset_x,
+                    v.value() - offset_y,
+                    self.scrolled.width() as f64,
+                    self.scrolled.height() as f64,
+                ),
+                SEARCH_HIT_MARGIN,
+            )
+            .map(|(x, y)| (x + offset_x, y + offset_y))
+        };
+        let Some((x, y)) = target else {
+            return;
+        };
+        let h = self.scrolled.hadjustment();
+        let v = self.scrolled.vadjustment();
+        h.set_value(clamp_adjustment(x, h.lower(), h.upper(), h.page_size()));
+        v.set_value(clamp_adjustment(y, v.lower(), v.upper(), v.page_size()));
     }
 
     pub(crate) fn schedule_view_restore(&self, restore: ViewRestore) {
@@ -619,7 +663,15 @@ impl Lector {
         pages_intersecting_view(&st.view.layout.pages, view_top, view_h, VIEW_PAGE_PAD)
     }
 
+    /// Puts page widgets for the pages near the view and repaints them all,
+    /// e.g. after a layout change.
     pub(crate) fn sync_visible_page_widgets(&self) {
+        self.sync_page_widgets(true);
+    }
+
+    /// Like [`Self::sync_visible_page_widgets`] but repaints only widgets that
+    /// moved or changed size; scrolling alone does not change a page's pixels.
+    pub(crate) fn sync_page_widgets(&self, repaint_all: bool) {
         let pages = self.inner.borrow().view.layout.pages.clone();
         let (content_w, content_h) = layout_content_size(&pages);
         self.pages_box.set_size_request(
@@ -675,11 +727,18 @@ impl Lector {
         for geom in &pages {
             if let Some((_, da)) = widgets.iter().find(|(i, _)| *i == geom.index) {
                 let (pw, ph) = page_alloc_size(geom);
-                da.set_content_width(pw);
-                da.set_content_height(ph);
-                da.set_size_request(pw, ph);
-                self.pages_box.move_(da, geom.x, geom.y);
-                da.queue_draw();
+                let resized = da.content_width() != pw || da.content_height() != ph;
+                if resized {
+                    da.set_content_width(pw);
+                    da.set_content_height(ph);
+                    da.set_size_request(pw, ph);
+                }
+                if self.pages_box.child_position(da) != (geom.x, geom.y) {
+                    self.pages_box.move_(da, geom.x, geom.y);
+                }
+                if repaint_all || resized {
+                    da.queue_draw();
+                }
             }
         }
     }
