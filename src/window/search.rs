@@ -6,14 +6,15 @@ impl Lector {
         let gen = {
             let mut st = self.inner.borrow_mut();
             st.search.hits.clear();
+            st.search.snippets.clear();
             st.search.idx = None;
             st.search.query = q.clone();
             st.search.gen = st.search.gen.wrapping_add(1);
             st.search.gen
         };
+        self.clear_search_results();
         if q.is_empty() {
             self.search_info.set_text("");
-            self.clear_search_results();
             self.queue_pages_draw();
             return;
         }
@@ -86,7 +87,7 @@ impl Lector {
                     let n_hits = st.search.hits.len();
                     drop(st);
                     ui.search_info.set_text(&format!("{} of {}", i + 1, n_hits));
-                    ui.rebuild_search_results();
+                    ui.sync_search_results();
                     ui.queue_pages_draw();
                 }
             }
@@ -113,7 +114,7 @@ impl Lector {
             let index = search_idx.unwrap_or(0);
             self.search_info
                 .set_text(&format!("{} of {}", index + 1, n_hits));
-            self.rebuild_search_results();
+            self.sync_search_results();
             self.queue_pages_draw();
         }
     }
@@ -146,33 +147,11 @@ impl Lector {
         };
         self.search_info.set_text(&format!("{} of {}", i + 1, n));
         self.scroll_to_search_hit(page, i);
-        self.rebuild_search_results();
+        self.sync_search_results();
         self.queue_pages_draw();
     }
 
     pub(crate) fn scroll_to_search_hit(&self, page: i32, hit: usize) {
-        let (y, horizontal) = {
-            let st = self.inner.borrow();
-            let Some((_, rect)) = st.search.hits.get(hit) else {
-                return;
-            };
-            let Some(doc) = st.view.doc.as_ref() else {
-                return;
-            };
-            let y = search_hit_scroll_y(
-                &st.view.layout.pages,
-                doc,
-                st.view.rotation,
-                page,
-                rect,
-                (
-                    self.scrolled.vadjustment().value(),
-                    self.scrolled.height() as f64,
-                ),
-                SEARCH_HIT_MARGIN,
-            );
-            (y, self.scrolled.hadjustment().value())
-        };
         {
             let mut st = self.inner.borrow_mut();
             let n = st.view.doc.as_ref().map(|doc| doc.n_pages).unwrap_or(1);
@@ -190,16 +169,13 @@ impl Lector {
             }
         }
         self.update_chrome();
-        self.inner.borrow_mut().ignore_scroll = true;
         if self.inner.borrow().view.layout_mode != LayoutMode::Continuous {
-            self.inner.borrow_mut().ignore_scroll = false;
-            self.reflow_restore(ViewRestore::Location(ViewLocation::new(
-                page, horizontal, y,
-            )));
+            // The hit's page may not be laid out yet; place it after reflow.
+            self.reflow_restore(ViewRestore::SearchHit(hit));
             return;
         }
-        let v = self.scrolled.vadjustment();
-        v.set_value(clamp_adjustment(y, v.lower(), v.upper(), v.page_size()));
+        self.inner.borrow_mut().ignore_scroll = true;
+        self.show_search_hit(hit);
         self.inner.borrow_mut().ignore_scroll = false;
         self.sync_visible_page_widgets();
         self.ensure_visible_rasters();
@@ -211,6 +187,7 @@ impl Lector {
         {
             let mut st = self.inner.borrow_mut();
             st.search.hits.clear();
+            st.search.snippets.clear();
             st.search.idx = None;
             st.search.gen = st.search.gen.wrapping_add(1);
         }
@@ -267,56 +244,59 @@ impl Lector {
         self.ignore_search_results.set(false);
     }
 
-    pub(crate) fn rebuild_search_results(&self) {
-        let (rows, selected) = {
-            let st = self.inner.borrow();
-            if st.search.hits.is_empty() {
-                (Vec::new(), None)
-            } else {
-                let query = st.search.query.clone();
-                let case_sensitive = st.search.options.case_sensitive;
-                let labels = st
-                    .view
-                    .doc
-                    .as_ref()
-                    .map(|doc| doc.labels.clone())
-                    .unwrap_or_default();
-                let mut texts = HashMap::new();
-                if let Some(doc) = st.view.doc.as_ref() {
-                    for (page, _) in &st.search.hits {
-                        texts.entry(*page).or_insert_with(|| {
-                            doc.page(*page)
-                                .and_then(|page| page.text().map(|text| text.to_string()))
-                                .unwrap_or_default()
-                        });
-                    }
-                }
-                let rows = st
-                    .search
-                    .hits
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (page, _))| {
-                        let label = display_page_label(&labels, *page);
-                        let snippet = texts
-                            .get(page)
-                            .map(|text| search_snippet(text, &query, case_sensitive))
-                            .unwrap_or_default();
-                        (index, search_result_row_text(&label, &snippet))
-                    })
-                    .collect::<Vec<_>>();
-                (rows, st.search.idx)
-            }
-        };
-        if rows.is_empty() {
+    /// Adds rows for hits found since the last call and selects the current
+    /// one. Rows are only appended, and each page's text is read once per
+    /// search, so a long search stays linear in its number of hits.
+    pub(crate) fn sync_search_results(&self) {
+        let n_hits = self.inner.borrow().search.hits.len();
+        if n_hits == 0 {
             self.clear_search_results();
             return;
         }
-        self.ignore_search_results.set(true);
-        while let Some(child) = self.search_results.first_child() {
-            self.search_results.remove(&child);
+        let mut shown = self
+            .search_results
+            .last_child()
+            .and_then(|row| {
+                row.widget_name()
+                    .trim_start_matches('s')
+                    .parse::<usize>()
+                    .ok()
+            })
+            .map_or(0, |last| last + 1);
+        if shown > n_hits {
+            // Rows of an older result set.
+            self.clear_search_results();
+            shown = 0;
         }
-        let mut selected_row = None;
+        let (rows, selected) = {
+            let mut st = self.inner.borrow_mut();
+            let st = &mut *st;
+            let doc = st.view.doc.as_ref();
+            let search = &mut st.search;
+            let query = search.query.clone();
+            let case_sensitive = search.options.case_sensitive;
+            let rows = (shown..n_hits)
+                .map(|index| {
+                    let page = search.hits[index].0;
+                    let snippet = search
+                        .snippets
+                        .entry(page)
+                        .or_insert_with(|| {
+                            doc.and_then(|doc| doc.page(page))
+                                .and_then(|page| page.text())
+                                .map(|text| search_snippet(&text, &query, case_sensitive))
+                                .unwrap_or_default()
+                        })
+                        .clone();
+                    let label = doc
+                        .map(|doc| display_page_label(&doc.labels, page))
+                        .unwrap_or_else(|| (page + 1).to_string());
+                    (index, search_result_row_text(&label, &snippet))
+                })
+                .collect::<Vec<_>>();
+            (rows, search.idx)
+        };
+        self.ignore_search_results.set(true);
         for (index, caption) in rows {
             let label = Label::new(Some(&caption));
             label.set_xalign(0.0);
@@ -326,11 +306,9 @@ impl Lector {
             row.set_widget_name(&format!("s{index}"));
             row.set_child(Some(&label));
             self.search_results.append(&row);
-            if selected == Some(index) {
-                selected_row = Some(row);
-            }
         }
-        if let Some(row) = selected_row {
+        if let Some(row) = selected.and_then(|index| self.search_results.row_at_index(index as i32))
+        {
             self.search_results.select_row(Some(&row));
         }
         self.search_results_sw.set_visible(true);

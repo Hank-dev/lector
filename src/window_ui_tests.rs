@@ -2191,3 +2191,331 @@ fn actual_edit_rerenders_only_its_page_and_thumbnail() {
     ui.window.set_visible(false);
     std::fs::remove_file(path).unwrap();
 }
+
+fn search_window(id: &str, name: &str, pages: &[&str]) -> (Rc<Lector>, std::path::PathBuf) {
+    init_test_gtk();
+    let app = Application::builder()
+        .application_id(id)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    ui.inner.borrow_mut().session = Session::default();
+    let path = crate::doc::write_test_pdf(name, pages);
+    ui.open_path(&path, None);
+    (ui, path)
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_search_results_grow_without_rebuilding() {
+    let page = "BT /F1 20 Tf 72 700 Td (needle) Tj 0 -40 Td (needle) Tj ET";
+    let (ui, path) = search_window(
+        "org.omarchy.LectorSearchGrowTest",
+        "search-grow",
+        &[page; 40],
+    );
+    let context = glib::MainContext::default();
+    ui.search("needle");
+    let first = ui
+        .search_results
+        .first_child()
+        .expect("the first page's hits are listed at once");
+    drain_for(&context, 1500);
+    assert_eq!(ui.inner.borrow().search.hits.len(), 80);
+    assert_eq!(search_result_count(&ui), 80);
+    assert_eq!(
+        ui.search_results.first_child().unwrap(),
+        first,
+        "rows are appended as pages are searched, not rebuilt"
+    );
+    assert_eq!(
+        ui.inner.borrow().search.snippets.len(),
+        40,
+        "each page's text is read once"
+    );
+    ui.search_step(1);
+    assert_eq!(
+        ui.search_results.selected_row().map(|row| row.index()),
+        Some(1)
+    );
+    ui.search("zzz");
+    drain_for(&context, 300);
+    assert_eq!(search_result_count(&ui), 0, "a new search drops old rows");
+    ui.hold.borrow_mut().take();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_single_page_search_jump_shows_the_hit() {
+    let (ui, path) = search_window(
+        "org.omarchy.LectorSearchJumpTest",
+        "search-jump",
+        &[
+            "BT /F1 20 Tf 72 700 Td (start) Tj ET",
+            "BT /F1 20 Tf 480 40 Td (needle) Tj ET",
+        ],
+    );
+    let context = glib::MainContext::default();
+    ui.set_layout(LayoutMode::Single);
+    // Zoom before the first allocation: Broadway without a client never
+    // re-allocates, and both pages share one size.
+    ui.set_zoom(Zoom::Custom(3.0));
+    ui.window.present();
+    drain_for(&context, 300);
+    ui.search("needle");
+    drain_for(&context, 500);
+    let st = ui.inner.borrow();
+    assert_eq!(st.view.page, 1);
+    let (_, rect) = st.search.hits[0];
+    let geom = st.view.layout.page_geom(1).expect("hit page laid out");
+    let local = crate::view::PageGeom {
+        x: 0.0,
+        y: 0.0,
+        ..geom
+    };
+    let (x, y, w, h) =
+        crate::view::pdf_rect_to_view(&local, st.view.doc.as_ref().unwrap(), 0, &rect);
+    let (left, top) = (geom.x + x, geom.y + y);
+    let hadj = ui.scrolled.hadjustment();
+    let vadj = ui.scrolled.vadjustment();
+    assert!(
+        vadj.page_size() < geom.h && hadj.page_size() < geom.w,
+        "fixture must scroll both ways"
+    );
+    assert!(
+        top >= vadj.value() && top + h <= vadj.value() + vadj.page_size(),
+        "hit rows {top}..{} outside view {}..{} (upper {})",
+        top + h,
+        vadj.value(),
+        vadj.value() + vadj.page_size(),
+        vadj.upper()
+    );
+    assert!(
+        left >= hadj.value() && left + w <= hadj.value() + hadj.page_size(),
+        "hit columns {left}..{} outside view {}..{}",
+        left + w,
+        hadj.value(),
+        hadj.value() + hadj.page_size()
+    );
+    drop(st);
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_viewport_resize_reflows_without_frame_polling() {
+    let (ui, path) = markup_window("org.omarchy.LectorResizeTest", "resize");
+    let context = glib::MainContext::default();
+    ui.set_zoom(Zoom::FitWidth);
+    drain_for(&context, 300);
+    let before = ui.inner.borrow().view.view_w;
+    // Broadway without a client runs no frames, so allocate a narrower
+    // window directly; the viewport then reports its new page size.
+    ui.window
+        .allocate(before as i32 - 200, ui.window.height(), -1, None);
+    // The next layout pass restores the real surface size, so record the
+    // narrowest width the layout saw. Wait long enough for a resize that a
+    // running view restore deferred.
+    let mut after = before;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+    while after >= before - 100.0 && std::time::Instant::now() < deadline {
+        while context.pending() {
+            context.iteration(false);
+        }
+        after = after.min(ui.inner.borrow().view.view_w);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        after < before - 100.0,
+        "a narrower viewport must reflow: {before} -> {after}"
+    );
+    // A resize that arrives while a view restore runs is taken afterwards.
+    ui.inner.borrow_mut().ignore_scroll = true;
+    assert!(!ui.on_resize(before, 600.0), "deferred during a restore");
+    assert_eq!(ui.inner.borrow().view.view_w, after);
+    ui.inner.borrow_mut().ignore_scroll = false;
+    assert!(ui.on_resize(before, 600.0), "taken once the restore ends");
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_unreadable_session_is_reported_and_kept() {
+    let dir = std::env::temp_dir().join(format!("lector-config-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("lector")).unwrap();
+    let file = dir.join("lector").join("session.toml");
+    std::fs::write(&file, "sidebar = 3\n").unwrap();
+    // One test per process, so pointing the config here affects only this test.
+    std::env::set_var("XDG_CONFIG_HOME", &dir);
+    init_test_gtk();
+    let app = Application::builder()
+        .application_id("org.omarchy.LectorBadSessionTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let ui = Lector::new(&app);
+    assert!(
+        ui.inner
+            .borrow()
+            .session_error
+            .as_deref()
+            .is_some_and(|error| error.contains("session.toml")),
+        "the unreadable file must be reported when the window opens"
+    );
+    ui.persist();
+    assert_eq!(std::fs::read(&file).unwrap(), b"sidebar = 3\n");
+    for window in gtk::Window::list_toplevels() {
+        if let Ok(window) = window.downcast::<gtk::Window>() {
+            window.destroy();
+        }
+    }
+    ui.hold.borrow_mut().take();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_closing_a_presentation_keeps_the_reading_view() {
+    let (ui, path) = search_window(
+        "org.omarchy.LectorPresentationCloseTest",
+        "pres-close",
+        &[""; 3],
+    );
+    ui.set_layout(LayoutMode::Continuous);
+    ui.set_zoom(Zoom::Custom(1.5));
+    ui.toggle_presentation();
+    assert!(ui.inner.borrow().presentation);
+    ui.record_view_in_session();
+    {
+        let st = ui.inner.borrow();
+        assert_eq!(st.session.layout, "continuous");
+        let doc_path = st.view.doc.as_ref().unwrap().path.clone();
+        let saved = st.session.restore(&doc_path).expect("document remembered");
+        assert_eq!(
+            session::parse_zoom(&saved.zoom, saved.custom),
+            Zoom::Custom(1.5)
+        );
+    }
+    ui.toggle_presentation();
+    ui.hold.borrow_mut().take();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_rotation_redraws_thumbnails() {
+    let (ui, path) = markup_window("org.omarchy.LectorThumbRotationTest", "thumb-rotation");
+    let context = glib::MainContext::default();
+    ui.set_sidebar_visible(true);
+    ui.stack.set_visible_child_name("thumbs");
+    drain_for(&context, 300);
+    let picture = |ui: &Lector| {
+        ui.thumbs
+            .row_at_index(0)
+            .and_then(|row| row.child())
+            .and_then(|col| col.first_child())
+            .and_then(|child| child.downcast::<gtk::Picture>().ok())
+    };
+    let size = |picture: &gtk::Picture| {
+        let paintable = picture.paintable().expect("thumbnail texture");
+        (paintable.intrinsic_width(), paintable.intrinsic_height())
+    };
+    let (w, h) = size(&picture(&ui).expect("thumbnail rendered"));
+    assert!(w < h, "portrait page");
+    ui.rotate(90);
+    drain_for(&context, 300);
+    let (w, h) = size(&picture(&ui).expect("thumbnail rendered again"));
+    assert!(w > h, "the thumbnail turns with the page: {w}x{h}");
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_small_zoom_keeps_every_nearby_page_rendered() {
+    let (ui, path) = search_window("org.omarchy.LectorSmallZoomTest", "small-zoom", &[""; 60]);
+    let context = glib::MainContext::default();
+    ui.set_layout(LayoutMode::Continuous);
+    // Zoom before the first allocation: Broadway without a client never
+    // re-allocates.
+    ui.set_zoom(Zoom::Custom(0.1));
+    ui.window.present();
+    drain_for(&context, 500);
+    // Mid-document, pages within the prefetch margin on both sides count.
+    ui.scrolled.vadjustment().set_value(2000.0);
+    drain_for(&context, 1500);
+    let view_top = ui.scrolled.vadjustment().value();
+    let view_h = ui.scrolled.height() as f64;
+    let dpr = ui.page_dpr();
+    let mut st = ui.inner.borrow_mut();
+    let near = pages_intersecting_view(&st.view.layout.pages, view_top, view_h, VIEW_PAGE_PAD);
+    assert!(
+        near.len() > RASTER_CACHE_PAGES,
+        "fixture must need more pages than the base cache: {}",
+        near.len()
+    );
+    let st = &mut *st;
+    let missing = near
+        .iter()
+        .filter(|index| {
+            let geom = st.view.layout.page_geom(**index).unwrap();
+            let key = RasterKey::from_geom(
+                &geom,
+                st.view.rotation,
+                st.view.pdf_mode,
+                st.theme.pdf_palette(),
+                dpr,
+            );
+            !st.raster.contains(&key)
+        })
+        .count();
+    assert_eq!(missing, 0, "pages near the view were evicted");
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+#[ignore = "requires a GTK display; run separately"]
+fn actual_dragged_selection_updates_annotation_items_when_the_menu_opens() {
+    let (ui, path) = search_window(
+        "org.omarchy.LectorDragSelectTest",
+        "drag-select",
+        &["BT /F1 20 Tf 72 700 Td (needle in text) Tj ET"],
+    );
+    let context = glib::MainContext::default();
+    ui.inner.borrow_mut().annotations = Some(AnnotationStore::default());
+    ui.window.present();
+    drain_for(&context, 300);
+    let (x1, y1) = page_point(&ui, 70., 75.);
+    let (x2, y2) = page_point(&ui, 220., 100.);
+    ui.drag_begin(x1, y1);
+    ui.drag_update(x2, y2);
+    assert!(
+        !ui.highlight_item.is_sensitive(),
+        "menu rows are not recomputed on every pointer motion"
+    );
+    let popover = form_widgets(ui.window.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::MenuButton>().ok())
+        .find_map(|button| button.popover())
+        .expect("main menu");
+    popover.popup();
+    drain_for(&context, 100);
+    assert!(
+        ui.highlight_item.is_sensitive(),
+        "refreshed when the menu opens"
+    );
+    assert!(ui.note_item.is_sensitive());
+    popover.popdown();
+    ui.hold.borrow_mut().take();
+    ui.window.set_visible(false);
+    std::fs::remove_file(path).unwrap();
+}

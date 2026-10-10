@@ -9,19 +9,19 @@ use crate::view::{LayoutMode, Zoom};
 
 const MAX_FILES: usize = 200;
 
+// Every stored field has a default, so older or hand-edited files with
+// missing keys still load. A file that still fails to parse is never
+// replaced; see `save_merged`.
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Session {
     pub files: HashMap<String, FileState>,
-    #[serde(default)]
     pub recent: Vec<String>,
-    #[serde(default)]
     history_generation: u64,
     pub sidebar: String,
     pub invert: bool,
-    #[serde(default)]
     pub pdf_mode: String,
     pub layout: String,
-    #[serde(default)]
     pub dual_cover: bool,
     #[serde(skip)]
     dirty_files: HashSet<String>,
@@ -44,11 +44,11 @@ pub struct Session {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FileState {
     pub page: i32,
     pub zoom: String,
     pub custom: f64,
-    #[serde(default)]
     pub rotation: i32,
 }
 
@@ -72,32 +72,57 @@ impl Default for FileState {
 }
 
 impl Session {
-    pub fn load() -> Self {
+    /// An unreadable session is an error; the caller starts empty in memory,
+    /// and the file stays untouched because every save refuses to replace it.
+    pub fn load() -> Result<Self, String> {
         Self::load_from_paths(&session_path(), &legacy_session_path())
     }
 
-    fn load_from_paths(path: &Path, legacy_path: &Path) -> Self {
-        if path.exists() {
-            return Self::load_from_path(path);
+    /// The effective session is the Lector file, or the legacy omadoc file
+    /// until the Lector file exists. Loading and saving resolve it the same way.
+    fn load_from_paths(path: &Path, legacy_path: &Path) -> Result<Self, String> {
+        match Self::read(path)? {
+            Some(session) => Ok(session),
+            None => Self::load_from_path(legacy_path),
         }
-        Self::load_from_path(legacy_path)
     }
 
-    pub fn load_from_path(path: &Path) -> Self {
-        let Ok(text) = fs::read_to_string(path) else {
-            return Self::default();
+    pub fn load_from_path(path: &Path) -> Result<Self, String> {
+        Ok(Self::read(path)?.unwrap_or_default())
+    }
+
+    /// Returns `None` only when `path` does not exist. Every other read or
+    /// parse failure is an error, so a save never replaces a file it could not
+    /// read.
+    fn read(path: &Path) -> Result<Option<Self>, String> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read session {}: {error}", path.display())),
         };
-        let mut session: Self = toml::from_str(&text).unwrap_or_default();
+        let mut session: Self = toml::from_str(&text)
+            .map_err(|error| format!("parse session {}: {error}", path.display()))?;
         session.normalize();
         session.mark_clean();
-        session
+        Ok(Some(session))
     }
 
     pub fn save(&mut self) -> Result<(), String> {
-        self.save_to(&session_path())
+        self.save_migrating(&session_path(), &legacy_session_path())
     }
 
+    #[cfg(test)]
     pub fn save_to(&mut self, path: &Path) -> Result<(), String> {
+        self.save_merged(path, None)
+    }
+
+    /// Saves to `path`, merging into the legacy session while `path` does not
+    /// exist yet, so the first Lector save keeps omadoc history and preferences.
+    fn save_migrating(&mut self, path: &Path, legacy_path: &Path) -> Result<(), String> {
+        self.save_merged(path, Some(legacy_path))
+    }
+
+    fn save_merged(&mut self, path: &Path, legacy_path: Option<&Path>) -> Result<(), String> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)
                 .map_err(|e| format!("create session directory {}: {e}", dir.display()))?;
@@ -107,7 +132,12 @@ impl Session {
         lock.lock()
             .map_err(|e| format!("lock session {}: {e}", lock_path.display()))?;
 
-        let mut merged = Self::load_from_path(path);
+        // Reload only after acquiring the lock. A read or parse error aborts
+        // before replacement, so the user's file remains available for recovery.
+        let mut merged = match legacy_path {
+            Some(legacy_path) => Self::load_from_paths(path, legacy_path)?,
+            None => Self::load_from_path(path)?,
+        };
         merged.merge_dirty(self);
         let text = toml::to_string_pretty(&merged)
             .map_err(|e| format!("serialize session {}: {e}", path.display()))?;
@@ -326,15 +356,15 @@ mod tests {
     #[test]
     fn stale_sessions_merge_different_dirty_files() {
         let path = test_path("merge");
-        let mut first = Session::load_from_path(&path);
-        let mut second = Session::load_from_path(&path);
+        let mut first = Session::load_from_path(&path).unwrap();
+        let mut second = Session::load_from_path(&path).unwrap();
         first.remember(Path::new("/documents/first.pdf"), 3, Zoom::Actual);
         second.remember(Path::new("/documents/second.pdf"), 7, Zoom::FitPage);
 
         first.save_to(&path).expect("save first session");
         second.save_to(&path).expect("merge second session");
 
-        let merged = Session::load_from_path(&path);
+        let merged = Session::load_from_path(&path).unwrap();
         assert_eq!(
             merged
                 .restore(Path::new("/documents/first.pdf"))
@@ -358,14 +388,14 @@ mod tests {
         let mut initial = remembered(2);
         initial.save_to(&path).expect("save initial state");
 
-        let mut stale = Session::load_from_path(&path);
-        let mut newer = Session::load_from_path(&path);
+        let mut stale = Session::load_from_path(&path).unwrap();
+        let mut newer = Session::load_from_path(&path).unwrap();
         newer.remember(Path::new("/documents/a.pdf"), 9, Zoom::Custom(1.5));
         newer.save_to(&path).expect("save newer state");
         stale.remember(Path::new("/documents/b.pdf"), 5, Zoom::FitHeight);
         stale.save_to(&path).expect("merge stale state");
 
-        let merged = Session::load_from_path(&path);
+        let merged = Session::load_from_path(&path).unwrap();
         assert_eq!(
             merged.restore(Path::new("/documents/a.pdf")).unwrap().page,
             9
@@ -386,7 +416,7 @@ mod tests {
                 let path = path.clone();
                 let barrier = barrier.clone();
                 scope.spawn(move || {
-                    let mut session = Session::load_from_path(&path);
+                    let mut session = Session::load_from_path(&path).unwrap();
                     session.remember(Path::new(name), page, Zoom::Actual);
                     barrier.wait();
                     session.save_to(&path).expect("concurrent session save");
@@ -394,7 +424,7 @@ mod tests {
             }
         });
 
-        let merged = Session::load_from_path(&path);
+        let merged = Session::load_from_path(&path).unwrap();
         assert_eq!(merged.restore(Path::new("left.pdf")).unwrap().page, 11);
         assert_eq!(merged.restore(Path::new("right.pdf")).unwrap().page, 12);
         fs::remove_dir_all(path.parent().unwrap()).expect("remove test session directory");
@@ -408,6 +438,7 @@ mod tests {
         legacy.save_to(&legacy_path).unwrap();
         assert_eq!(
             Session::load_from_paths(&new_path, &legacy_path)
+                .unwrap()
                 .restore(Path::new("/documents/a.pdf"))
                 .unwrap()
                 .page,
@@ -417,6 +448,7 @@ mod tests {
         current.save_to(&new_path).unwrap();
         assert_eq!(
             Session::load_from_paths(&new_path, &legacy_path)
+                .unwrap()
                 .restore(Path::new("/documents/a.pdf"))
                 .unwrap()
                 .page,
@@ -424,6 +456,196 @@ mod tests {
         );
         fs::remove_dir_all(new_path.parent().unwrap()).unwrap();
         fs::remove_dir_all(legacy_path.parent().unwrap()).unwrap();
+    }
+
+    const LEGACY_SESSION: &str = r#"sidebar = "thumbs"
+invert = false
+layout = "dual"
+recent = ["/documents/a.pdf", "/documents/b.pdf"]
+
+[files."/documents/a.pdf"]
+page = 4
+zoom = "actual"
+custom = 1.0
+
+[files."/documents/b.pdf"]
+page = 9
+zoom = "fit-page"
+custom = 1.0
+"#;
+
+    fn legacy_and_new_paths(name: &str) -> (PathBuf, PathBuf) {
+        let legacy_path = test_path(&format!("{name}-omadoc"));
+        fs::write(&legacy_path, LEGACY_SESSION).unwrap();
+        (legacy_path, test_path(&format!("{name}-lector")))
+    }
+
+    fn remove_test_dirs(paths: &[&Path]) {
+        for path in paths {
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn first_lector_save_keeps_legacy_history_and_preferences() {
+        let (legacy_path, new_path) = legacy_and_new_paths("migrate");
+        // Open c.pdf and close: the window writes back unchanged preferences.
+        let mut session = Session::load_from_paths(&new_path, &legacy_path).unwrap();
+        session.remember(Path::new("/documents/c.pdf"), 2, Zoom::Actual);
+        session.sidebar = "thumbs".into();
+        session.layout = "dual".into();
+        session.save_migrating(&new_path, &legacy_path).unwrap();
+
+        let migrated = Session::load_from_path(&new_path).unwrap();
+        assert_eq!(
+            migrated.recent,
+            vec!["/documents/a.pdf", "/documents/b.pdf", "/documents/c.pdf"]
+        );
+        let page = |name: &str| migrated.restore(Path::new(name)).unwrap().page;
+        assert_eq!(page("/documents/a.pdf"), 4);
+        assert_eq!(page("/documents/b.pdf"), 9);
+        assert_eq!(page("/documents/c.pdf"), 2);
+        assert_eq!(migrated.sidebar, "thumbs");
+        assert_eq!(migrated.layout, "dual");
+        assert_eq!(fs::read_to_string(&legacy_path).unwrap(), LEGACY_SESSION);
+        remove_test_dirs(&[&legacy_path, &new_path]);
+    }
+
+    #[test]
+    fn concurrent_writers_migrating_from_legacy_keep_history_and_each_change() {
+        let (legacy_path, new_path) = legacy_and_new_paths("migrate-concurrent");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            for (name, page) in [("/documents/left.pdf", 11), ("/documents/right.pdf", 12)] {
+                let (legacy_path, new_path) = (legacy_path.clone(), new_path.clone());
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let mut session = Session::load_from_paths(&new_path, &legacy_path).unwrap();
+                    session.remember(Path::new(name), page, Zoom::Actual);
+                    if page == 11 {
+                        session.invert = true;
+                    } else {
+                        session.layout = "single".into();
+                    }
+                    barrier.wait();
+                    session.save_migrating(&new_path, &legacy_path).unwrap();
+                });
+            }
+        });
+
+        let merged = Session::load_from_path(&new_path).unwrap();
+        for (name, page) in [
+            ("/documents/a.pdf", 4),
+            ("/documents/b.pdf", 9),
+            ("/documents/left.pdf", 11),
+            ("/documents/right.pdf", 12),
+        ] {
+            assert_eq!(
+                merged.restore(Path::new(name)).unwrap().page,
+                page,
+                "{name}"
+            );
+        }
+        assert_eq!(merged.recent[..2], ["/documents/a.pdf", "/documents/b.pdf"]);
+        assert_eq!(merged.sidebar, "thumbs");
+        assert!(merged.invert);
+        assert_eq!(merged.layout, "single");
+        remove_test_dirs(&[&legacy_path, &new_path]);
+    }
+
+    #[test]
+    fn clearing_migrated_history_is_not_undone_by_the_legacy_session() {
+        let (legacy_path, new_path) = legacy_and_new_paths("migrate-clear");
+        let mut session = Session::load_from_paths(&new_path, &legacy_path).unwrap();
+        session.clear_history();
+        session.save_migrating(&new_path, &legacy_path).unwrap();
+        let mut cleared = Session::load_from_paths(&new_path, &legacy_path).unwrap();
+        assert!(cleared.recent.is_empty() && cleared.files.is_empty());
+        assert_eq!(cleared.sidebar, "thumbs");
+
+        cleared.remember(Path::new("/documents/e.pdf"), 1, Zoom::Actual);
+        cleared.save_migrating(&new_path, &legacy_path).unwrap();
+        assert_eq!(
+            Session::load_from_path(&new_path).unwrap().recent,
+            vec!["/documents/e.pdf"]
+        );
+        remove_test_dirs(&[&legacy_path, &new_path]);
+    }
+
+    #[test]
+    fn session_with_missing_fields_loads_and_keeps_its_history() {
+        let path = test_path("partial");
+        fs::write(
+            &path,
+            "recent = [\"/documents/a.pdf\"]\n\n[files.\"/documents/a.pdf\"]\npage = 6\n",
+        )
+        .unwrap();
+        let mut session = Session::load_from_path(&path).unwrap();
+        let restored = session.restore(Path::new("/documents/a.pdf")).unwrap();
+        assert_eq!((restored.page, restored.zoom.as_str()), (6, "fit-width"));
+        session.remember(Path::new("/documents/b.pdf"), 1, Zoom::Actual);
+        session.save_to(&path).unwrap();
+        assert_eq!(
+            Session::load_from_path(&path).unwrap().recent,
+            vec!["/documents/a.pdf", "/documents/b.pdf"]
+        );
+
+        fs::write(&path, "sidebar = \"outline\"\n").unwrap();
+        let preferences_only = Session::load_from_path(&path).unwrap();
+        assert_eq!(preferences_only.sidebar, "outline");
+        assert!(preferences_only.files.is_empty());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unreadable_session_is_reported_and_never_replaced() {
+        let history = "[files.\"/documents/a.pdf\"]\npage = 3\nzoom = \"actual\"\ncustom = 1.0\n";
+        let type_mismatch = format!("invert = \"yes\"\n\n{history}");
+        let cases: [(&str, &[u8]); 4] = [
+            ("type-mismatch", type_mismatch.as_bytes()),
+            (
+                "file-type-mismatch",
+                b"[files.\"/documents/a.pdf\"]\npage = \"three\"\n",
+            ),
+            ("invalid-toml", b"this is not = valid [toml"),
+            ("not-utf8", b"sidebar = \"\xff\xfe\"\n"),
+        ];
+        for (name, contents) in cases {
+            let path = test_path(name);
+            let missing_legacy = path.with_file_name("legacy.toml");
+            fs::write(&path, contents).unwrap();
+            let Err(error) = Session::load_from_path(&path) else {
+                panic!("{name}: an unreadable session must be an error");
+            };
+            assert!(error.contains(&path.display().to_string()), "{error}");
+
+            let mut fresh = Session::load_from_paths(&path, &missing_legacy).unwrap_or_default();
+            assert!(fresh.files.is_empty(), "{name}");
+            fresh.remember(Path::new("/documents/c.pdf"), 0, Zoom::Actual);
+            fresh.sidebar = "outline".into();
+            assert!(fresh.save_to(&path).is_err(), "{name}");
+            assert!(
+                fresh.save_migrating(&path, &missing_legacy).is_err(),
+                "{name}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), contents, "{name}");
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn unreadable_legacy_session_blocks_migration_and_stays_untouched() {
+        let legacy_path = test_path("corrupt-omadoc");
+        let new_path = test_path("corrupt-lector");
+        let corrupt = "files = \"not a table\"\n";
+        fs::write(&legacy_path, corrupt).unwrap();
+        let mut session = Session::load_from_paths(&new_path, &legacy_path).unwrap_or_default();
+        assert!(session.files.is_empty());
+        session.remember(Path::new("/documents/c.pdf"), 0, Zoom::Actual);
+        assert!(session.save_migrating(&new_path, &legacy_path).is_err());
+        assert!(!new_path.exists());
+        assert_eq!(fs::read_to_string(&legacy_path).unwrap(), corrupt);
+        remove_test_dirs(&[&legacy_path, &new_path]);
     }
 
     #[test]
@@ -478,7 +700,7 @@ mod tests {
         )
         .unwrap();
 
-        let session = Session::load_from_path(&path);
+        let session = Session::load_from_path(&path).unwrap();
         assert_eq!(
             session
                 .restore(Path::new("/documents/a.pdf"))
@@ -510,7 +732,7 @@ mod tests {
             ..Session::default()
         };
         session.save_to(&path).unwrap();
-        assert_eq!(Session::load_from_path(&path).pdf_mode, "omarchy");
+        assert_eq!(Session::load_from_path(&path).unwrap().pdf_mode, "omarchy");
 
         let legacy_path = test_path("legacy-invert");
         fs::write(
@@ -518,7 +740,7 @@ mod tests {
             "files = {}\nrecent = []\nsidebar = \"thumbs\"\ninvert = true\nlayout = \"continuous\"\n",
         )
         .unwrap();
-        let legacy = Session::load_from_path(&legacy_path);
+        let legacy = Session::load_from_path(&legacy_path).unwrap();
         assert_eq!(legacy.pdf_mode, "");
         assert!(legacy.invert);
 
@@ -529,31 +751,31 @@ mod tests {
     #[test]
     fn stale_preference_updates_merge_only_changed_fields() {
         let path = test_path("preferences");
-        let mut first = Session::load_from_path(&path);
-        let mut second = Session::load_from_path(&path);
+        let mut first = Session::load_from_path(&path).unwrap();
+        let mut second = Session::load_from_path(&path).unwrap();
         first.invert = true;
         first.save_to(&path).unwrap();
         second.layout = "dual".into();
         second.save_to(&path).unwrap();
-        assert!(Session::load_from_path(&path).invert);
+        assert!(Session::load_from_path(&path).unwrap().invert);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn dual_cover_is_persisted_and_merged_as_a_preference() {
         let path = test_path("dual-cover");
-        let mut first = Session::load_from_path(&path);
+        let mut first = Session::load_from_path(&path).unwrap();
         first.dual_cover = true;
         first.save_to(&path).unwrap();
-        assert!(Session::load_from_path(&path).dual_cover);
+        assert!(Session::load_from_path(&path).unwrap().dual_cover);
 
-        let mut stale = Session::load_from_path(&path);
-        let mut newer = Session::load_from_path(&path);
+        let mut stale = Session::load_from_path(&path).unwrap();
+        let mut newer = Session::load_from_path(&path).unwrap();
         newer.layout = "single".into();
         newer.save_to(&path).unwrap();
         stale.dual_cover = false;
         stale.save_to(&path).unwrap();
-        let merged = Session::load_from_path(&path);
+        let merged = Session::load_from_path(&path).unwrap();
         assert!(!merged.dual_cover);
         assert_eq!(merged.layout, "single");
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -592,14 +814,14 @@ mod tests {
         initial.remember(Path::new("/documents/old-b.pdf"), 2, Zoom::Actual);
         initial.save_to(&path).unwrap();
 
-        let mut clearer = Session::load_from_path(&path);
-        let mut stale = Session::load_from_path(&path);
+        let mut clearer = Session::load_from_path(&path).unwrap();
+        let mut stale = Session::load_from_path(&path).unwrap();
         stale.remember(Path::new("/documents/new.pdf"), 3, Zoom::Actual);
         clearer.clear_history();
         clearer.save_to(&path).unwrap();
         stale.save_to(&path).unwrap();
 
-        let merged = Session::load_from_path(&path);
+        let merged = Session::load_from_path(&path).unwrap();
         assert!(merged.recent.is_empty());
         assert!(merged.restore(Path::new("/documents/old-a.pdf")).is_none());
         assert!(merged.restore(Path::new("/documents/old-b.pdf")).is_none());
@@ -614,15 +836,15 @@ mod tests {
         initial.remember(document, 1, Zoom::Actual);
         initial.save_to(&path).unwrap();
 
-        let mut stale = Session::load_from_path(&path);
-        let mut clearer = Session::load_from_path(&path);
+        let mut stale = Session::load_from_path(&path).unwrap();
+        let mut clearer = Session::load_from_path(&path).unwrap();
         let stale_generation = stale.loaded_history_generation;
         stale.remember(document, 8, Zoom::Custom(1.5));
         clearer.clear_history();
         clearer.save_to(&path).unwrap();
         stale.save_to(&path).unwrap();
 
-        let merged = Session::load_from_path(&path);
+        let merged = Session::load_from_path(&path).unwrap();
         assert!(merged.restore(document).is_none());
         assert!(merged.history_generation > stale_generation);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -636,11 +858,11 @@ mod tests {
         initial.clear_history();
         initial.save_to(&path).unwrap();
 
-        let mut post_clear = Session::load_from_path(&path);
+        let mut post_clear = Session::load_from_path(&path).unwrap();
         post_clear.remember(Path::new("/documents/new.pdf"), 4, Zoom::FitPage);
         post_clear.save_to(&path).unwrap();
 
-        let merged = Session::load_from_path(&path);
+        let merged = Session::load_from_path(&path).unwrap();
         assert_eq!(merged.recent, vec!["/documents/new.pdf"]);
         assert_eq!(merged.history_generation, post_clear.history_generation);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -659,12 +881,15 @@ mod tests {
         session.remember(open, 3, Zoom::FitPage); // reload
         session.remember(open, 4, Zoom::Custom(1.2)); // close persistence
         session.save_to(&path).unwrap();
-        assert!(Session::load_from_path(&path).restore(open).is_none());
+        assert!(Session::load_from_path(&path)
+            .unwrap()
+            .restore(open)
+            .is_none());
 
         session.remember(different, 5, Zoom::Actual);
         session.remember(open, 6, Zoom::Actual);
         session.save_to(&path).unwrap();
-        let reloaded = Session::load_from_path(&path);
+        let reloaded = Session::load_from_path(&path).unwrap();
         assert!(reloaded.restore(different).is_some());
         assert!(reloaded.restore(open).is_some());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();

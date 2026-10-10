@@ -45,8 +45,9 @@ impl Lector {
                 }
             }
         }
+        // The annotation menu rows refresh when the menu opens; reading the
+        // page's text for them on every pointer motion makes selection lag.
         self.queue_pages_draw();
-        self.update_annotation_actions();
     }
 
     pub(crate) fn copy_selection(&self) {
@@ -79,16 +80,23 @@ impl Lector {
     }
 
     pub(crate) fn update_annotation_actions(&self) {
-        let can_create = self.selected_annotation_region().is_some()
-            && self.inner.borrow().annotations.is_some();
+        let selected = self.selected_annotation_region();
+        let can_create = selected.is_some() && self.inner.borrow().annotations.is_some();
         self.highlight_item.set_sensitive(can_create);
         self.note_item.set_sensitive(can_create);
         self.delete_annotation_item
-            .set_sensitive(self.annotation_to_delete().is_some());
+            .set_sensitive(self.annotation_to_delete_in(selected).is_some());
     }
 
     pub(crate) fn annotation_to_delete(&self) -> Option<String> {
-        let selected = self.selected_annotation_region();
+        self.annotation_to_delete_in(self.selected_annotation_region())
+    }
+
+    /// The annotation Delete acts on, given the selected region.
+    fn annotation_to_delete_in(
+        &self,
+        selected: Option<(PathBuf, i32, DocumentRect)>,
+    ) -> Option<String> {
         let st = self.inner.borrow();
         let doc = st.view.doc.as_ref()?;
         let annotations = st.annotations.as_ref()?.for_document(&doc.path);

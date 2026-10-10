@@ -13,9 +13,17 @@ fn menu_popover_opens_and_maps_on_activation() {
     ui.window.set_default_size(1100, 688);
     ui.window.present();
     let context = glib::MainContext::default();
-    for _ in 0..30 {
-        context.iteration(false);
-    }
+    // Wait on real time: an idle window has no pending work to iterate on.
+    let run_until = |done: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !done() && std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    run_until(&|| ui.window.is_mapped());
     let menu_btn = ui
         .toolbar
         .last_child()
@@ -24,9 +32,7 @@ fn menu_popover_opens_and_maps_on_activation() {
     let popover = menu_btn.popover().expect("hamburger must own a popover");
 
     menu_btn.set_active(true);
-    for _ in 0..30 {
-        context.iteration(false);
-    }
+    run_until(&|| popover.is_mapped() && popover.width() > 120);
 
     assert!(
         popover.is_mapped(),

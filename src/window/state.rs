@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::annotations::AnnotationStore;
 use crate::doc::{OpenDoc, SearchOptions};
@@ -54,6 +54,8 @@ pub(crate) struct SearchState {
     pub gen: u64,
     pub query: String,
     pub options: SearchOptions,
+    /// Result-list text per page for the current query.
+    pub snippets: HashMap<i32, String>,
 }
 
 impl SearchState {
@@ -64,6 +66,7 @@ impl SearchState {
             gen: 0,
             query: String::new(),
             options: SearchOptions::default(),
+            snippets: HashMap::new(),
         }
     }
 
@@ -71,6 +74,7 @@ impl SearchState {
         self.gen = self.gen.wrapping_add(1);
         self.query.clear();
         self.hits.clear();
+        self.snippets.clear();
         self.idx = None;
     }
 }
@@ -99,6 +103,8 @@ pub(crate) struct Inner {
     pub toolbar_hidden: bool,
     pub theme: Theme,
     pub session: Session,
+    /// Why the session file could not be read; saves leave it untouched.
+    pub session_error: Option<String>,
     pub annotations: Option<AnnotationStore>,
     pub annotation_error: Option<String>,
     pub ignore_zoom_dropdown: bool,

@@ -172,6 +172,25 @@ pub(crate) fn ellipsize_chars(text: &str, max_chars: usize) -> String {
     format!("{}…", text.chars().take(keep).collect::<String>())
 }
 
+/// Byte offset in `hay` of the first case-insensitive match of `needle`.
+/// Lower-casing can change a character's byte length (K, Å, İ, ẞ), so the
+/// match is mapped back to where its character starts in `hay`.
+fn find_ignoring_case(hay: &str, needle: &str) -> Option<usize> {
+    let needle = needle
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let mut lower = String::with_capacity(hay.len());
+    let mut origin = Vec::with_capacity(hay.len());
+    for (offset, ch) in hay.char_indices() {
+        for lower_ch in ch.to_lowercase() {
+            lower.push(lower_ch);
+            origin.resize(lower.len(), offset);
+        }
+    }
+    lower.find(&needle).map(|index| origin[index])
+}
+
 pub(crate) fn search_snippet(text: &str, query: &str, case_sensitive: bool) -> String {
     let hay = collapsed_whitespace(text);
     if hay.is_empty() {
@@ -184,7 +203,7 @@ pub(crate) fn search_snippet(text: &str, query: &str, case_sensitive: bool) -> S
         let found = if case_sensitive {
             hay.find(query)
         } else {
-            hay.to_lowercase().find(&query.to_lowercase())
+            find_ignoring_case(&hay, query)
         };
         match found {
             Some(index) => hay[..index]
@@ -793,6 +812,8 @@ pub(crate) enum ViewRestore {
     Anchor(ViewportAnchor),
     CurrentPage,
     Location(ViewLocation),
+    /// Bring search hit `n` into view once the layout shows its page.
+    SearchHit(usize),
 }
 
 /// Name suggested by Save a Copy. Never the open file's own name, which the
