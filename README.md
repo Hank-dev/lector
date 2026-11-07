@@ -98,7 +98,7 @@ with older Poppler packages need newer libraries before Lector can build.
 On Omarchy / Arch Linux:
 
 ```bash
-sudo pacman -Syu --needed base-devel git rust gtk4 poppler-glib desktop-file-utils
+sudo pacman -Syu --needed base-devel git rust gtk4 poppler-glib gsfonts desktop-file-utils
 git clone https://github.com/Hank-dev/lector.git
 cd lector
 make install
@@ -107,6 +107,9 @@ make install
 
 If Rust is already managed with rustup or mise, keep that toolchain and omit
 `rust` from the package command. Use a current stable compiler.
+
+`gsfonts` supplies the Helvetica-compatible Nimbus Sans font. Keep it installed
+so added-text previews and saved PDFs use matching glyph widths.
 
 `make install` installs the binary, desktop entry, icon, and license below
 `~/.local`. It does not change your default PDF application. Make sure

@@ -27,7 +27,7 @@ jobs:
       - name: Install build and test dependencies
         run: >-
           pacman -Syu --noconfirm --needed git rust gtk4 poppler-glib
-          desktop-file-utils python xorg-server-xvfb dbus ttf-dejavu
+          desktop-file-utils python xorg-server-xvfb dbus ttf-dejavu gsfonts
           cargo-audit gitleaks actionlint
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:

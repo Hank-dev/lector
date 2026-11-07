@@ -6,7 +6,8 @@ same GPL-3.0-or-later license as Lector; no separate CLA is required.
 
 ## Build and test
 
-Follow the [README](README.md#install) for build dependencies. On Arch, add
+Follow the [README](README.md#install) for build dependencies, including
+`gsfonts` for Helvetica-compatible text rendering. On Arch, add
 the headless test tools:
 
 ```bash
