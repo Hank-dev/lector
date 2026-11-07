@@ -1,30 +1,52 @@
 PREFIX ?= $(HOME)/.local
-BIN := $(PREFIX)/bin/lector
+DESTDIR ?=
+CARGO ?= cargo
+CARGO_FLAGS ?= --locked
+CARGO_TARGET_DIR ?= target
+BIN := $(DESTDIR)$(PREFIX)/bin/lector
 DESKTOP_ID := org.omarchy.Lector.desktop
-DESKTOP := $(PREFIX)/share/applications/$(DESKTOP_ID)
-ICON := $(PREFIX)/share/icons/hicolor/scalable/apps/org.omarchy.Lector.svg
-LEGACY_BIN := $(PREFIX)/bin/omadoc
-LEGACY_DESKTOP := $(PREFIX)/share/applications/org.omarchy.Omdoc.desktop
-LEGACY_ICON := $(PREFIX)/share/icons/hicolor/scalable/apps/org.omarchy.Omdoc.svg
+DESKTOP := $(DESTDIR)$(PREFIX)/share/applications/$(DESKTOP_ID)
+ICON := $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/org.omarchy.Lector.svg
+LICENSE_DIR := $(DESTDIR)$(PREFIX)/share/licenses/lector
 
-.PHONY: build install uninstall default
+.PHONY: build check test-gtk install install-files uninstall default
 
 build:
-	cargo build --release
+	$(CARGO) build $(CARGO_FLAGS) --release --target-dir "$(CARGO_TARGET_DIR)"
+
+check:
+	$(CARGO) fmt --check
+	$(CARGO) test $(CARGO_FLAGS) --release --target-dir "$(CARGO_TARGET_DIR)"
+	$(CARGO) clippy $(CARGO_FLAGS) --release --target-dir "$(CARGO_TARGET_DIR)" --all-targets -- -D warnings
+	desktop-file-validate share/$(DESKTOP_ID)
+
+test-gtk:
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" ./scripts/test-gtk.py $(CARGO_FLAGS)
 
 install: build
-	install -Dm755 target/release/lector $(BIN)
-	install -Dm644 share/org.omarchy.Lector.desktop $(DESKTOP)
-	install -Dm644 share/org.omarchy.Lector.svg $(ICON)
-	rm -f $(LEGACY_BIN) $(LEGACY_DESKTOP) $(LEGACY_ICON)
-	-gtk-update-icon-cache -f $(PREFIX)/share/icons/hicolor >/dev/null 2>&1
-	-update-desktop-database $(PREFIX)/share/applications >/dev/null 2>&1
+	$(MAKE) install-files
+
+# Separate from compilation so packaging can stage an already-built binary.
+install-files:
+	install -Dm755 "$(CARGO_TARGET_DIR)/release/lector" "$(BIN)"
+	install -Dm644 share/$(DESKTOP_ID) "$(DESKTOP)"
+	install -Dm644 share/org.omarchy.Lector.svg "$(ICON)"
+	install -Dm644 LICENSE "$(LICENSE_DIR)/LICENSE"
+ifeq ($(DESTDIR),)
+	-gtk-update-icon-cache -q -t -f "$(PREFIX)/share/icons/hicolor" >/dev/null 2>&1
+	-update-desktop-database "$(PREFIX)/share/applications" >/dev/null 2>&1
+endif
 	@echo "Installed $(BIN)"
-	@echo "To make it the default PDF handler:"
-	@echo "  xdg-mime default $(DESKTOP_ID) application/pdf"
 
 uninstall:
-	rm -f $(BIN) $(DESKTOP) $(ICON)
+	rm -f "$(BIN)" "$(DESKTOP)" "$(ICON)" "$(LICENSE_DIR)/LICENSE"
+ifeq ($(DESTDIR),)
+	-gtk-update-icon-cache -q -t -f "$(PREFIX)/share/icons/hicolor" >/dev/null 2>&1
+	-update-desktop-database "$(PREFIX)/share/applications" >/dev/null 2>&1
+endif
 
-default: install
+# Changing the user's default is always an explicit, separate operation.
+default:
+	@test -z "$(DESTDIR)" || { echo "Cannot set a default in a staging directory"; exit 1; }
+	@test -f "$(DESKTOP)" || { echo "Run make install first"; exit 1; }
 	xdg-mime default $(DESKTOP_ID) application/pdf

@@ -2,9 +2,14 @@
 name = "lector"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.92"
 license = "GPL-3.0-or-later"
-description = "Native PDF viewer for Omarchy — Evince-class features, live theme follow"
+description = "A native GTK4 PDF reader and form filler with live Omarchy theming"
 repository = "https://github.com/Hank-dev/lector"
+readme = "README.md"
+keywords = ["pdf", "gtk4", "reader", "omarchy"]
+categories = ["gui"]
+publish = false
 authors = ["hanky"]
 
 [dependencies]

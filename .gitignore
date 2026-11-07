@@ -6,3 +6,13 @@ target/
 *.swp
 *.swo
 *~
+
+# Local state, credentials, and packaging output
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/dist/
+/pkg/
+*.pkg.tar.*

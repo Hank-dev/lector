@@ -37,13 +37,16 @@ cargo clippy --offline --release --all-targets -- -D warnings
 cargo build --offline --release
 ```
 
-GTK integration tests are `#[ignore]`d. They present windows, so `init_test_gtk`
-lets them run only on Broadway (`gtk4-broadwayd :7`, then
-`GDK_BACKEND=broadway BROADWAY_DISPLAY=:7`); `LECTOR_TEST_ON_DESKTOP=1` overrides
-that. Run each one in its own process (loop in README), for example:
+GTK integration tests are `#[ignore]`d. Run the complete suite with
+`make test-gtk CARGO_FLAGS='--offline --locked'`. The runner creates private
+Xvfb displays, D-Bus sessions, and state directories, one process per test.
+It uses `LECTOR_TEST_ON_DESKTOP=1` only inside that isolated display; never
+set that variable on the user's real desktop. Broadway remains available
+for individual tests (`gtk4-broadwayd :7`, then
+`GDK_BACKEND=broadway BROADWAY_DISPLAY=:7`), for example:
 
 ```bash
-cargo test --offline --release actual_window_navigation_presentation_search_and_reload -- --ignored --exact --test-threads=1
+cargo test --offline --locked --release window::ui_tests::actual_window_navigation_presentation_search_and_reload -- --ignored --exact --test-threads=1
 ```
 
 Add a regression test for every bug fix. Prefer headless tests for layout, session,

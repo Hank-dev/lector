@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 8 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Arch Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container: archlinux:base-devel
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Install build and test dependencies
+        run: >-
+          pacman -Syu --noconfirm --needed git rust gtk4 poppler-glib
+          desktop-file-utils python xorg-server-xvfb dbus ttf-dejavu
+          cargo-audit gitleaks actionlint
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check workflow syntax
+        run: actionlint -shellcheck=
+      - name: Scan Git history for secrets
+        run: gitleaks git --redact --log-opts=--all
+      - name: Audit locked Rust dependencies
+        run: cargo audit
+      - name: Format, regression tests, Clippy, and desktop entry
+        run: make check
+      - name: GTK integration tests on a private virtual display
+        run: make test-gtk
+      - name: Build release binary
+        run: make build
+      - name: Verify staged installation and removal
+        run: ./scripts/test-install.sh

@@ -1,6 +1,12 @@
 # Lector
 
-Native PDF viewer for [Omarchy](https://omarchy.org), written in Rust.
+Read, annotate, and fill PDFs in a native GTK4 app, built for
+[Omarchy](https://omarchy.org) and Arch Linux. Written in Rust and licensed
+under [GPL-3.0-or-later](LICENSE).
+
+Lector is under active development. Omarchy is the primary desktop; other
+Linux desktops can use the built-in dark theme, but are not the main test
+target. There are no bundled Windows/macOS builds.
 
 Same layout as GNOME Document Viewer (Evince): header bar, left side pane
 with thumbnails/outline, find bar, zoom drop-down, hamburger menu. Pages
@@ -84,51 +90,60 @@ sidecar marks.
 
 ## Install
 
-Needs `gtk4`, `poppler-glib`, and a Rust toolchain (all present on Omarchy).
+Build requirements: Rust **1.92+**, GTK **4.10+**, Poppler GLib **25.10+**,
+a C compiler, `pkg-config`, Git, and Make. The committed lockfile is used for
+builds. Current Arch packages provide the native dependencies; distributions
+with older Poppler packages need newer libraries before Lector can build.
+
+On Omarchy / Arch Linux:
 
 ```bash
-cd ~/Projects/omadoc
+sudo pacman -Syu --needed base-devel git rust gtk4 poppler-glib desktop-file-utils
+git clone https://github.com/Hank-dev/lector.git
+cd lector
 make install
-# optional: take over PDF files
-make default
+~/.local/bin/lector /path/to/document.pdf
 ```
 
-Installs `~/.local/bin/lector`, `org.omarchy.Lector.desktop`, and a matching icon.
+If Rust is already managed with rustup or mise, keep that toolchain and omit
+`rust` from the package command. Use a current stable compiler.
+
+`make install` installs the binary, desktop entry, icon, and license below
+`~/.local`. It does not change your default PDF application. Make sure
+`~/.local/bin` is on your `PATH` for the desktop launcher to find the binary.
+To choose Lector as the default, run `make default` after installation.
+
+To build without installing, run `make build`, then
+`./target/release/lector document.pdf`. To update a clean checkout, run
+`git pull --ff-only && make install`. Remove installed files with
+`make uninstall` (reading history and annotations are retained).
+
+Packagers can stage a build with
+`make install-files PREFIX=/usr DESTDIR="$pkgdir"` after `make build`.
+The executable links to system GTK/Poppler libraries; it is not a portable,
+self-contained binary. Custom install prefixes need their `bin` directory
+on `PATH`. Install and uninstall do not remove legacy Omadoc installations.
+
+The desktop launcher disables GTK DMA-BUF as a compatibility workaround for
+the GTK 4.22.4 issue documented in the desktop entry. It uses normal GTK
+rendering otherwise.
 
 ## Development checks
 
-Run the display-independent regression suite and strict checks:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for dependencies, architecture, and
+the full test workflow. The main checks are:
 
 ```bash
-cargo fmt --check
-cargo test --offline --release
-cargo clippy --offline --release --all-targets -- -D warnings
-cargo build --offline --release
+make check
+make test-gtk
+make build
+./scripts/test-install.sh
 ```
 
-The GTK integration tests are ignored by default because they need a display.
-They present windows and dialogs, so they run on GTK's headless Broadway backend
-and refuse a desktop display unless `LECTOR_TEST_ON_DESKTOP=1` is set. GTK binds
-to its first thread, so run each test in its own process:
-
-```bash
-gtk4-broadwayd :7 &   # once
-export GDK_BACKEND=broadway BROADWAY_DISPLAY=:7
-for t in $(cargo test --offline --release -- --ignored --list 2>/dev/null | sed -n 's/: test$//p' | grep -v visual_pdf); do
-  cargo test --offline --release "$t" -- --ignored --exact --test-threads=1 -q
-done
-```
-
-On Broadway, `actual_back_navigation_restores_single_page_viewport` and four
-viewport tests in `zoom_tests` also fail on unchanged code: they depend on the
-window size a desktop compositor gives.
-
-It creates an unpresented window and temporary PDFs, exercises the real navigation,
-presentation, search replacement, and reload paths, and never saves the user session.
-Session persistence tests use isolated temporary paths and cover concurrent writers,
-stale snapshots, reading-order retention, preference merging, and private file modes.
-Annotation tests likewise use temporary stores and cover corrupt-data protection,
-atomic/private persistence, stale-writer merging, deletion, and all page rotations.
+The GTK runner creates a private Xvfb display, D-Bus session, and temporary
+state directories for each test. It exercises windows without showing them
+on your desktop or using your reading history. CI also scans Git history for
+secrets and checks Rust dependencies against the RustSec advisory database.
 
 ## Shortcuts
 
@@ -162,9 +177,31 @@ Side Pane (Outline / Thumbnails / Marks), Continuous, Dual, Single page, PDF col
 or Inverted), Rotate, Fullscreen,
 Presentation, Reload, Reading History, Properties, Keyboard shortcuts, and About Lector.
 
+## Local data and privacy
+
+Lector has no accounts, analytics, or automatic document uploads. Opening an
+external link hands it to your system's default application.
+
+Reading history, document paths, and view preferences live in
+`$XDG_CONFIG_HOME/lector/session.toml` (default `~/.config/lector/session.toml`).
 Annotations are stored by Lector in `$XDG_CONFIG_HOME/lector/annotations.toml`
 (falling back to `~/.config/lector/annotations.toml`), never beside the PDF.
 Print includes the current rotation and marks; Save a Copy includes form values,
 embedded Add Text answers, and ink drawings, but not Lector sidecar highlights/notes or view rotation. Both annotation and reading-state files are atomically replaced and
 private to the user (`0600` on Unix). Clearing Reading History does not remove
 annotations.
+
+These files are private by file permissions, **not encrypted**. Back them up
+if you want to keep highlights and notes. Avoid attaching them to bug reports.
+
+## Contributing and support
+
+Bug reports and focused pull requests are welcome. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md), use the
+[issue templates](https://github.com/Hank-dev/lector/issues/new/choose), and
+see [SECURITY.md](SECURITY.md) for reporting vulnerabilities. Changes are
+tracked in [CHANGELOG.md](CHANGELOG.md).
+
+Lector uses GTK4, Poppler, and Cairo through their Rust bindings. Dependency
+licenses remain with their respective projects. Lector's source is distributed
+under the [GNU GPL, version 3 or later](LICENSE).
