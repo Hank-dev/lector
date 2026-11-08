@@ -16,19 +16,20 @@ reloads when you switch themes. PDF colors can remain normal, be inverted,
 or follow the active Omarchy background/foreground palette while preserving
 colored diagrams.
 
-## Layout
+## Screenshots
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ [side] [open] [‹] page / N [›]  title  [−] [zoom▾] [+] [find] [☰]       │
-├────────────┬─────────────────────────────────────────────────────────────┤
-│            │  Find: [        ]   2 of 14   [↑] [↓] [x]                  │
-│ outline    ├─────────────────────────────────────────────────────────────┤
-│            │                                                             │
-│ [Outline]  │              PDF pages                                      │
-│ [Thumbs]   │                                                             │
-└────────────┴─────────────────────────────────────────────────────────────┘
-```
+![Lector reading a PDF with the document outline open](docs/screenshots/reading.png)
+
+<details>
+<summary>Theme-following colors and search</summary>
+
+![PDF colors following the active Omarchy theme](docs/screenshots/theme-following.png)
+
+![Search results and highlighted matches in Lector](docs/screenshots/search.png)
+
+</details>
+
+Actual app captures using a fictional sample document.
 
 ## Features
 
