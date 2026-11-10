@@ -20,7 +20,7 @@ glib = "0.22"
 gio = "0.22"
 gdk = { package = "gdk4", version = "0.11" }
 pango = "0.22"
-toml = "0.8"
+toml = "1.1"
 serde = { version = "1", features = ["derive"] }
 
 [profile.release]
